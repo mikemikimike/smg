@@ -9,6 +9,7 @@ use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
 use crate::{
+    deadline::deadline_request,
     request_fields::{response_format_schema, stop_strings, PlainSampling},
     AbortOnDropClient, BoxedTraceInjector,
 };
@@ -67,7 +68,7 @@ impl TrtllmServiceClient {
     ) -> Result<AbortOnDropStream, tonic::Status> {
         let request_id = req.request_id.clone();
         let mut client = self.client.clone();
-        let mut request = Request::new(req);
+        let (deadline, mut request) = deadline_request(req);
 
         // Inject W3C trace context into gRPC metadata for distributed tracing
         if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
@@ -76,11 +77,10 @@ impl TrtllmServiceClient {
 
         let response = client.generate(request).await?;
 
-        Ok(AbortOnDropStream::new(
-            response.into_inner(),
-            request_id,
-            self.clone(),
-        ))
+        Ok(
+            AbortOnDropStream::new(response.into_inner(), request_id, self.clone())
+                .with_deadline(deadline),
+        )
     }
 
     /// Abort a request
