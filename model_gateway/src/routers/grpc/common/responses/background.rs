@@ -3507,7 +3507,7 @@ mod tests {
         let response = completed_after_queued("resp_1", &request);
         // Cancelled through another gateway; this gateway's reads fail from
         // here on.
-        set_stored_status(&direct, "resp_1", "cancelled", None, None)
+        set_stored_status(&direct, "resp_1", "cancelled", None, None, None)
             .await
             .unwrap();
         let writes = counting.stores();
@@ -3569,7 +3569,7 @@ mod tests {
         let storage: Arc<dyn ResponseStorage> = flaky.clone();
         let request = store_queued(&storage, "resp_1").await;
         let response = completed_after_queued("resp_1", &request);
-        set_stored_status(&storage, "resp_1", "cancelled", None, None)
+        set_stored_status(&storage, "resp_1", "cancelled", None, None, None)
             .await
             .unwrap();
         let landed_before = flaky.stores_landed();
