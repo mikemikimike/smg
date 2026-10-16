@@ -107,6 +107,78 @@ impl Default for ParserRegistry {
     }
 }
 
+/// The model-id patterns and the parser each names, in the order they are
+/// tried: a model id is matched by substring and the first row that matches
+/// wins, so the more specific spellings come before the family they are a
+/// substring of.
+const MODEL_PATTERNS: &[(&str, &str)] = &[
+    ("gemma-4", "gemma4"),
+    ("gemma4", "gemma4"),
+    ("hy4", "hy_v4"),
+    ("hy_v4", "hy_v4"),
+    ("deepseek-r1", "deepseek_r1"),
+    // V4.1 before V4: first substring hit wins and "deepseek-v4" is a
+    // substring of every V4.1 model id.
+    ("deepseek-v4.1", "deepseek_v41"),
+    ("deepseek_v41", "deepseek_v41"),
+    ("deepseek-v41", "deepseek_v41"),
+    ("deepseek-v4", "deepseek_v4"),
+    ("deepseek_v4", "deepseek_v4"),
+    ("deepseek-v3.1", "deepseek_v31"),
+    ("deepseek-v3-1", "deepseek_v31"),
+    ("qwen3-thinking", "qwen3_thinking"),
+    ("qwen-thinking", "qwen3_thinking"),
+    ("qwen3", "qwen3"),
+    ("qwen", "qwen3"),
+    ("glm45", "glm45"),
+    ("glm47", "glm45"), // glm47 uses same reasoning format as glm45
+    ("glm-5", "glm45"), // GLM-5.x reuse glm45 reasoning format
+    ("kimi-k2-thinking", "kimi_thinking"),
+    ("kimi-k2.5", "kimi_k25"),
+    // K3 patterns must precede the generic "kimi" pattern below, since
+    // "kimi-k3".contains("kimi") and first-substring-match wins.
+    ("kimi-k3", "kimi_k3"),
+    ("kimi_k3", "kimi_k3"),
+    ("kimi", "kimi"), // legacy: Kimi-K2-Instruct with unicode tokens
+    ("step3", "step3"),
+    // M3 patterns must precede the broad `minimax` pattern (first substring
+    // match wins), so M3 IDs are not captured by the M2 `minimax` parser.
+    ("minimax-m3", "minimax_m3"),
+    ("mm-m3", "minimax_m3"),
+    ("minimax", "minimax"),
+    ("minimax-m2", "minimax"),
+    ("mm-m2", "minimax"),
+    // Cohere Command models use <|START_THINKING|> / <|END_THINKING|>
+    ("command-r", "cohere_cmd"),
+    ("command-a", "cohere_cmd"),
+    ("c4ai-command", "cohere_cmd"),
+    ("cohere", "cohere_cmd"),
+    // Nano V3 / Nemotron (always_in_reasoning=false, uses enable_thinking toggle)
+    ("nemotron-nano", "nano_v3"),
+    ("nemotron-super", "nano_v3"),
+    ("nano-v3", "nano_v3"),
+    // Generation-qualified names (Nemotron-3-Super, Nemotron-3.5-Lightning)
+    // contain neither "nemotron-nano" nor "nemotron-super" — the `-3`/`-3.5`
+    // infix breaks the substring — so match the generation prefix directly.
+    ("nemotron-3", "nano_v3"),
+    // Inkling checkpoints use the model-family name in their ID or config.
+    ("inkling", "inkling"),
+];
+
+/// A parser over the standard `<think>` / `</think>` tags, streaming its
+/// reasoning, under `model_type`; `always_in_reasoning` for a model whose
+/// template opens the thought in the prompt.
+fn think_tags_parser(model_type: &str, always_in_reasoning: bool) -> Box<dyn ReasoningParser> {
+    let config = ParserConfig {
+        think_start_token: "<think>".to_string(),
+        think_end_token: "</think>".to_string(),
+        stream_reasoning: true,
+        max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
+        always_in_reasoning,
+    };
+    Box::new(BaseReasoningParser::new(config).with_model_type(model_type.to_string()))
+}
+
 /// Factory for creating reasoning parsers based on model type.
 #[derive(Clone)]
 pub struct ParserFactory {
@@ -158,16 +230,7 @@ impl ParserFactory {
         registry.register_parser("inkling", || Box::new(InklingParser::new()));
 
         // standard think tokens, always_in_reasoning=false
-        registry.register_parser("deepseek_v31", || {
-            let config = ParserConfig {
-                think_start_token: "<think>".to_string(),
-                think_end_token: "</think>".to_string(),
-                stream_reasoning: true,
-                max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
-                always_in_reasoning: false,
-            };
-            Box::new(BaseReasoningParser::new(config).with_model_type("deepseek_v31".to_string()))
-        });
+        registry.register_parser("deepseek_v31", || think_tags_parser("deepseek_v31", false));
 
         // V4 prefills <think>; request processing arms the parser via
         // mark_reasoning_started.
@@ -182,85 +245,15 @@ impl ParserFactory {
         // end reasoning implicitly: own state machine (parsers/deepseek_v41.rs).
         registry.register_parser("deepseek_v41", || Box::new(DeepSeekV41Parser::new()));
 
-        registry.register_parser("kimi_k25", || {
-            let config = ParserConfig {
-                think_start_token: "<think>".to_string(),
-                think_end_token: "</think>".to_string(),
-                stream_reasoning: true,
-                max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
-                always_in_reasoning: false,
-            };
-            Box::new(BaseReasoningParser::new(config).with_model_type("kimi_k25".to_string()))
-        });
-
-        registry.register_parser("kimi_thinking", || {
-            let config = ParserConfig {
-                think_start_token: "<think>".to_string(),
-                think_end_token: "</think>".to_string(),
-                stream_reasoning: true,
-                max_buffer_size: DEFAULT_MAX_BUFFER_SIZE,
-                always_in_reasoning: true,
-            };
-            Box::new(BaseReasoningParser::new(config).with_model_type("kimi_thinking".to_string()))
-        });
+        registry.register_parser("kimi_k25", || think_tags_parser("kimi_k25", false));
+        registry.register_parser("kimi_thinking", || think_tags_parser("kimi_thinking", true));
 
         // Kimi K3 XTML think channel (structural <|open|>/<|close|>/<|sep|> tokens).
         registry.register_parser("kimi_k3", || Box::new(KimiK3Parser::new()));
 
-        registry.register_pattern("gemma-4", "gemma4");
-        registry.register_pattern("gemma4", "gemma4");
-        registry.register_pattern("hy4", "hy_v4");
-        registry.register_pattern("hy_v4", "hy_v4");
-        registry.register_pattern("deepseek-r1", "deepseek_r1");
-        // V4.1 before V4: first substring hit wins and "deepseek-v4" is a
-        // substring of every V4.1 model id.
-        registry.register_pattern("deepseek-v4.1", "deepseek_v41");
-        registry.register_pattern("deepseek_v41", "deepseek_v41");
-        registry.register_pattern("deepseek-v41", "deepseek_v41");
-        registry.register_pattern("deepseek-v4", "deepseek_v4");
-        registry.register_pattern("deepseek_v4", "deepseek_v4");
-        registry.register_pattern("deepseek-v3.1", "deepseek_v31");
-        registry.register_pattern("deepseek-v3-1", "deepseek_v31");
-        registry.register_pattern("qwen3-thinking", "qwen3_thinking");
-        registry.register_pattern("qwen-thinking", "qwen3_thinking");
-        registry.register_pattern("qwen3", "qwen3");
-        registry.register_pattern("qwen", "qwen3");
-        registry.register_pattern("glm45", "glm45");
-        registry.register_pattern("glm47", "glm45"); // glm47 uses same reasoning format as glm45
-        registry.register_pattern("glm-5", "glm45"); // GLM-5.x reuse glm45 reasoning format
-        registry.register_pattern("kimi-k2-thinking", "kimi_thinking");
-        registry.register_pattern("kimi-k2.5", "kimi_k25");
-        // K3 patterns must precede the generic "kimi" pattern below, since
-        // "kimi-k3".contains("kimi") and first-substring-match wins.
-        registry.register_pattern("kimi-k3", "kimi_k3");
-        registry.register_pattern("kimi_k3", "kimi_k3");
-        registry.register_pattern("kimi", "kimi"); // legacy: Kimi-K2-Instruct with unicode tokens
-        registry.register_pattern("step3", "step3");
-        // M3 patterns must precede the broad `minimax` pattern (first substring
-        // match wins), so M3 IDs are not captured by the M2 `minimax` parser.
-        registry.register_pattern("minimax-m3", "minimax_m3");
-        registry.register_pattern("mm-m3", "minimax_m3");
-        registry.register_pattern("minimax", "minimax");
-        registry.register_pattern("minimax-m2", "minimax");
-        registry.register_pattern("mm-m2", "minimax");
-
-        // Cohere Command models use <|START_THINKING|> / <|END_THINKING|>
-        registry.register_pattern("command-r", "cohere_cmd");
-        registry.register_pattern("command-a", "cohere_cmd");
-        registry.register_pattern("c4ai-command", "cohere_cmd");
-        registry.register_pattern("cohere", "cohere_cmd");
-
-        // Nano V3 / Nemotron (always_in_reasoning=false, uses enable_thinking toggle)
-        registry.register_pattern("nemotron-nano", "nano_v3");
-        registry.register_pattern("nemotron-super", "nano_v3");
-        registry.register_pattern("nano-v3", "nano_v3");
-        // Generation-qualified names (Nemotron-3-Super, Nemotron-3.5-Lightning)
-        // contain neither "nemotron-nano" nor "nemotron-super" — the `-3`/`-3.5`
-        // infix breaks the substring — so match the generation prefix directly.
-        registry.register_pattern("nemotron-3", "nano_v3");
-
-        // Inkling checkpoints use the model-family name in their ID or config.
-        registry.register_pattern("inkling", "inkling");
+        for (pattern, parser) in MODEL_PATTERNS {
+            registry.register_pattern(pattern, parser);
+        }
 
         Self { registry }
     }
@@ -304,6 +297,38 @@ impl Default for ParserFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every pattern resolves to the parser its row names, and the rows that
+    /// must come before a family they are a substring of do.
+    #[test]
+    fn every_pattern_resolves_to_the_parser_its_row_names_in_order() {
+        let factory = ParserFactory::new();
+        for (pattern, parser) in MODEL_PATTERNS {
+            let by_pattern = factory
+                .registry()
+                .create_for_model(pattern)
+                .unwrap_or_else(|| panic!("{pattern}: no parser"));
+            let by_name = factory
+                .registry()
+                .create_parser(parser)
+                .unwrap_or_else(|| panic!("{parser}: not registered"));
+            assert_eq!(by_pattern.model_type(), by_name.model_type(), "{pattern}");
+        }
+        for (model_id, parser) in [
+            ("deepseek-ai/DeepSeek-V4.1-Flash", "deepseek_v41"),
+            ("deepseek-ai/DeepSeek-V4-Flash", "deepseek_v4"),
+            ("moonshotai/Kimi-K3", "kimi_k3"),
+            ("moonshotai/Kimi-K2.5", "kimi_k25"),
+            ("moonshotai/Kimi-K2-Thinking", "kimi_thinking"),
+            ("MiniMax-M3", "minimax_m3"),
+            ("MiniMax-M2", "minimax"),
+            ("Qwen3-Thinking-2507", "qwen_thinking"),
+            ("Qwen3-8B", "qwen3"),
+            ("nvidia/Nemotron-3-Super", "nano_v3"),
+        ] {
+            assert_eq!(factory.create(model_id).model_type(), parser, "{model_id}");
+        }
+    }
 
     #[test]
     fn test_factory_creates_deepseek_r1() {
