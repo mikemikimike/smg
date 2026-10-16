@@ -1486,8 +1486,8 @@ fn replay_model(
         if !case.details.is_empty() {
             report.push_str(&format!("    plans: {}\n", case.plans.join("; ")));
             report.push_str(&case.details);
-            shown.differs(whole_verdict, &line, &case.details);
         }
+        shown.case(whole_verdict, &line, &case.details);
     })
     .unwrap_or_else(|e| panic!("{e}"));
     counts.cases = cases;
@@ -1596,18 +1596,29 @@ impl Case<'_> {
     }
 }
 
-/// The first differences of each class a model has, as stdout shows them.
+/// What stdout shows of a model: the first [`SHOWN`] cases of each whole verdict that is a
+/// difference, with the details the report's budget still had for them, and how many more cases
+/// of the class there were.
 #[derive(Default)]
 struct Shown {
     lines: String,
-    by_class: BTreeMap<&'static str, usize>,
+    /// Every case by its whole verdict, a difference or not.
+    cases: BTreeMap<&'static str, usize>,
+    /// The cases of each verdict shown in full.
+    shown: BTreeMap<&'static str, usize>,
 }
 
 impl Shown {
-    fn differs(&mut self, verdict: Verdict, line: &str, details: &str) {
-        let count = self.by_class.entry(verdict.name()).or_default();
-        *count += 1;
-        if *count <= SHOWN {
+    /// Count one case by its whole `verdict`; show it with its `details` while the class has
+    /// fewer than [`SHOWN`] shown and the report's budget left it something to show.
+    fn case(&mut self, verdict: Verdict, line: &str, details: &str) {
+        *self.cases.entry(verdict.name()).or_default() += 1;
+        if !verdict.differs() || details.is_empty() {
+            return;
+        }
+        let shown = self.shown.entry(verdict.name()).or_default();
+        if *shown < SHOWN {
+            *shown += 1;
             self.lines.push_str(line);
             self.lines.push_str(details);
         }
@@ -1615,12 +1626,12 @@ impl Shown {
 
     fn text(self) -> String {
         let mut text = self.lines;
-        for (class, count) in self.by_class {
-            if count > SHOWN {
+        for (class, count) in self.cases {
+            let shown = self.shown.get(class).copied().unwrap_or(0);
+            if shown > 0 && count > shown {
                 text.push_str(&format!(
-                    "  ... and {} more {class} cases; the report shows the first {REPORTED} \
-                     replays of each class and kind of cut in full and counts the rest\n",
-                    count - SHOWN
+                    "  ... and {} more {class} cases; the summary below has every count\n",
+                    count - shown
                 ));
             }
         }
