@@ -5,10 +5,10 @@ use openai_protocol::{
     messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{AbortOnDropClient, BoxedTraceInjector, TapChannel};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -24,7 +24,7 @@ pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, M
 /// gRPC client for MLX engine
 #[derive(Clone)]
 pub struct MlxEngineClient {
-    client: proto::mlx_engine_client::MlxEngineClient<Channel>,
+    client: proto::mlx_engine_client::MlxEngineClient<TapChannel>,
     trace_injector: BoxedTraceInjector,
 }
 
@@ -41,7 +41,7 @@ impl AbortOnDropClient for MlxEngineClient {
 }
 
 impl MlxEngineClient {
-    crate::impl_engine_client_basics!(proto::mlx_engine_client::MlxEngineClient<Channel>, "MLX");
+    crate::impl_engine_client_basics!(proto::mlx_engine_client::MlxEngineClient<TapChannel>, "MLX");
 
     /// Submit a generation request (returns auto-aborting streaming response)
     pub async fn generate(
@@ -450,5 +450,23 @@ fn convert_logit_bias(bias: Option<&HashMap<String, f32>>) -> HashMap<i32, f32> 
             .filter_map(|(k, v)| k.parse::<i32>().ok().map(|id| (id, *v)))
             .collect(),
         None => HashMap::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channel::testing::refused_endpoint;
+
+    #[tokio::test]
+    async fn connect_fails_on_a_malformed_or_refused_endpoint() {
+        let malformed = MlxEngineClient::connect("not an endpoint").await;
+        assert!(
+            malformed.is_err(),
+            "a malformed endpoint fails before the dial"
+        );
+        let refused = refused_endpoint();
+        let result = MlxEngineClient::connect(&refused.url).await;
+        assert!(result.is_err(), "a refused dial fails the connect");
     }
 }

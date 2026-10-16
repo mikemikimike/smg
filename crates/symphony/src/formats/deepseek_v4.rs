@@ -195,7 +195,12 @@ mod tests {
                 )),
                 dropped("</think>"),
                 Event::ReasoningEnd,
-                Event::Content(Text::uncounted("\n\n")),
+                // The template's two newlines before the block: held until the block's opener
+                // said they were its spacing, not content.
+                Event::Dropped {
+                    text: Text::uncounted("\n\n"),
+                    why: DropReason::Whitespace,
+                },
                 dropped("<｜DSML｜tool_calls>"),
             ]
         );
@@ -377,7 +382,110 @@ mod tests {
         let events = run("<think>", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(arguments_of(&events, 0), r#"{"a": "x"}"#);
-        assert_eq!(content_of(&events), "\n\nThe weather is sunny.");
+        // The newline between `</think>` and the block is the template's spacing, dropped; the
+        // one after the block comes before text, so it is the text's.
+        assert_eq!(content_of(&events), "\nThe weather is sunny.");
+    }
+
+    /// The whitespace the engine dropped as the template's spacing, event by event.
+    fn spacing(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::Whitespace,
+                } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The content deltas a client of the stream receives when `pieces` arrive one by one after
+    /// `prompt`: the content of each feed's events, the end's included, empty ones left out.
+    fn content_deltas(prompt: &str, pieces: &[&str]) -> Vec<String> {
+        let mut parser = Engine::new(deepseek_v4(), Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        let mut deltas = Vec::new();
+        for piece in pieces {
+            parser
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text: piece,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("delta");
+            deltas.push(content_of(&out.drain()));
+        }
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        deltas.push(content_of(&out.drain()));
+        deltas.retain(|delta| !delta.is_empty());
+        deltas
+    }
+
+    #[test]
+    fn the_spacing_between_the_thought_and_the_block_is_not_content_whole_or_streamed() {
+        // The encoder's turn has nothing between `</think>` and the block but the template's two
+        // newlines: whole, byte by byte and in a tokenizer's pieces they are dropped as the
+        // spacing they are, and no feed's events carry content, so a client of the stream gets
+        // what the whole answer has: no content.
+        let prompt = "<｜Assistant｜><think>";
+        let whole = run(prompt, &[OUTPUT]);
+        assert_eq!(content_of(&whole), "");
+        assert_eq!(spacing(&whole), ["\n\n"]);
+        let per_char: Vec<&str> = OUTPUT
+            .char_indices()
+            .map(|(i, c)| &OUTPUT[i..i + c.len_utf8()])
+            .collect();
+        let (thought, block) = OUTPUT.split_once("</think>").expect("the thought's close");
+        let mut tokens = vec![thought, "</think>", "\n\n"];
+        tokens.extend(block["\n\n".len()..].split_inclusive('\n'));
+        assert_eq!(tokens.concat(), OUTPUT);
+        for pieces in [per_char, tokens] {
+            let events = run(prompt, &pieces);
+            assert_eq!(bytes(&events), OUTPUT, "{pieces:?}");
+            assert_eq!(content_of(&events), "", "{pieces:?}");
+            assert_eq!(spacing(&events), ["\n\n"], "{pieces:?}");
+            assert_eq!(
+                arguments_of(&events, 0),
+                r#"{"location": "Beijing", "unit": "celsius"}"#,
+                "{pieces:?}"
+            );
+            assert_eq!(
+                content_deltas(prompt, &pieces),
+                Vec::<String>::new(),
+                "{pieces:?}"
+            );
+        }
+        // Content before the block keeps its two newlines, whole and streamed: they follow text.
+        let (text, block) = ANSWER.split_once("\n\n").expect("the content's end");
+        let pieces = [text, "\n\n", block];
+        let events = run("<｜Assistant｜></think>", &pieces);
+        assert_eq!(content_of(&events), "Sure, adding them.\n\n");
+        assert_eq!(spacing(&events), Vec::<&str>::new());
+        assert_eq!(
+            content_deltas("<｜Assistant｜></think>", &pieces),
+            ["Sure, adding them.", "\n\n"]
+        );
     }
 
     #[test]
@@ -480,5 +588,192 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 0, .. })
         ));
+    }
+
+    /// A turn the family's reference encoder renders, with the reading its own parser gives it.
+    struct EncoderTurn {
+        /// What the prompt ends with after the turn opener: `<think>` in thinking mode,
+        /// `</think>` in chat mode.
+        tail: &'static str,
+        /// The turn as the model writes it, up to the end-of-turn token.
+        output: &'static str,
+        reasoning: &'static str,
+        content: &'static str,
+        /// Each call's name and its arguments as the encoder's parser serializes them.
+        calls: &'static [(&'static str, &'static str)],
+    }
+
+    /// The turns the family's reference encoder (the model repository's `encoding` module) renders
+    /// for the shapes a tool-calling conversation takes: two of the encoder's own test
+    /// conversations, then one call with a string, a number, a boolean, an array and an object,
+    /// two calls in one block, a call after content, a call with no parameters (the encoder writes
+    /// an empty line inside the invoke), and content alone, in thinking and in chat mode.
+    const ENCODER_TURNS: &[EncoderTurn] = &[
+        // vendor-test-1
+        EncoderTurn {
+            tail: "<think>",
+            output: "Got the weather data. Let me format a nice response.</think>The weather in Beijing is currently sunny with a temperature of 22°C and 45% humidity.",
+            reasoning: "Got the weather data. Let me format a nice response.",
+            content: "The weather in Beijing is currently sunny with a temperature of 22°C and 45% humidity.",
+            calls: &[],
+        },
+        // vendor-test-3
+        EncoderTurn {
+            tail: "<think>",
+            output: "用户想知道小柴胡冲剂和布洛芬能否一起服用。</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"search\">\n<｜DSML｜parameter name=\"queries\" string=\"true\">小柴胡冲剂 布洛芬 相互作用 一起吃</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            reasoning: "用户想知道小柴胡冲剂和布洛芬能否一起服用。",
+            content: "",
+            calls: &[("search", "{\"queries\": \"小柴胡冲剂 布洛芬 相互作用 一起吃\"}")],
+        },
+        // every-value-kind/thinking
+        EncoderTurn {
+            tail: "<think>",
+            output: "Call the tool with every kind of value.</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n<｜DSML｜parameter name=\"metric\" string=\"false\">true</｜DSML｜parameter>\n<｜DSML｜parameter name=\"hours\" string=\"false\">[9, 18]</｜DSML｜parameter>\n<｜DSML｜parameter name=\"options\" string=\"false\">{\"lang\": \"fr\", \"n\": 2}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            reasoning: "Call the tool with every kind of value.",
+            content: "",
+            calls: &[("get_weather", "{\"location\": \"Paris\", \"days\": 3, \"metric\": true, \"hours\": [9, 18], \"options\": {\"lang\": \"fr\", \"n\": 2}}")],
+        },
+        // every-value-kind/chat
+        EncoderTurn {
+            tail: "</think>",
+            output: "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n<｜DSML｜parameter name=\"metric\" string=\"false\">true</｜DSML｜parameter>\n<｜DSML｜parameter name=\"hours\" string=\"false\">[9, 18]</｜DSML｜parameter>\n<｜DSML｜parameter name=\"options\" string=\"false\">{\"lang\": \"fr\", \"n\": 2}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            reasoning: "",
+            content: "",
+            calls: &[("get_weather", "{\"location\": \"Paris\", \"days\": 3, \"metric\": true, \"hours\": [9, 18], \"options\": {\"lang\": \"fr\", \"n\": 2}}")],
+        },
+        // parallel-calls/thinking
+        EncoderTurn {
+            tail: "<think>",
+            output: "Two calls at once.</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"search\">\n<｜DSML｜parameter name=\"query\" string=\"true\">Paris weather</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            reasoning: "Two calls at once.",
+            content: "",
+            calls: &[("get_weather", "{\"location\": \"Paris\"}"), ("search", "{\"query\": \"Paris weather\"}")],
+        },
+        // call-after-content/thinking
+        EncoderTurn {
+            tail: "<think>",
+            output: "Say something first.</think>Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            reasoning: "Say something first.",
+            content: "Let me check.",
+            calls: &[("get_weather", "{\"location\": \"Paris\"}")],
+        },
+        // call-after-content/chat
+        EncoderTurn {
+            tail: "</think>",
+            output: "Let me check.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Paris</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            reasoning: "",
+            content: "Let me check.",
+            calls: &[("get_weather", "{\"location\": \"Paris\"}")],
+        },
+        // no-arguments/thinking
+        EncoderTurn {
+            tail: "<think>",
+            output: "A call with nothing in it.</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"noop\">\n\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            reasoning: "A call with nothing in it.",
+            content: "",
+            calls: &[("noop", "{}")],
+        },
+        // no-arguments/chat
+        EncoderTurn {
+            tail: "</think>",
+            output: "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"noop\">\n\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            reasoning: "",
+            content: "",
+            calls: &[("noop", "{}")],
+        },
+        // content-only/chat
+        EncoderTurn {
+            tail: "</think>",
+            output: "It is sunny in Paris.",
+            reasoning: "",
+            content: "It is sunny in Paris.",
+            calls: &[],
+        },
+    ];
+
+    #[test]
+    fn every_turn_the_encoder_renders_reads_as_its_own_parser_reads_it() {
+        for turn in ENCODER_TURNS {
+            let prompt = format!("<｜Assistant｜>{}", turn.tail);
+            let events = run(&prompt, &[turn.output]);
+            assert_eq!(bytes(&events), turn.output, "{:?}", turn.output);
+            assert_eq!(reasoning_of(&events), turn.reasoning, "{:?}", turn.output);
+            // The two newlines the template writes before a block follow the content here,
+            // exactly two of them, where there is content; the encoder's parser skips them
+            // (bellwether #17). Where the thought's close is all that comes before them, they
+            // are the template's spacing, dropped, as the encoder's parser has it.
+            let content = if turn.calls.is_empty() || turn.content.is_empty() {
+                turn.content.to_string()
+            } else {
+                format!("{}\n\n", turn.content)
+            };
+            assert_eq!(content_of(&events), content, "{:?}", turn.output);
+            let read: Vec<(String, serde_json::Value)> = calls_of(&events)
+                .into_iter()
+                .map(|(index, name)| {
+                    let arguments: serde_json::Value =
+                        serde_json::from_str(&arguments_of(&events, index)).expect("arguments");
+                    (name, arguments)
+                })
+                .collect();
+            let expected: Vec<(String, serde_json::Value)> = turn
+                .calls
+                .iter()
+                .map(|(name, arguments)| {
+                    (
+                        name.to_string(),
+                        serde_json::from_str(arguments).expect("the encoder's arguments"),
+                    )
+                })
+                .collect();
+            assert_eq!(read, expected, "{:?}", turn.output);
+            let count = turn.calls.len() as u32;
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls, .. }) if *tool_calls == count),
+                "{:?}",
+                turn.output
+            );
+        }
+    }
+
+    #[test]
+    fn an_invoke_with_no_parameters_reads_the_same_at_every_cut() {
+        let turn = ENCODER_TURNS
+            .iter()
+            .find(|turn| turn.output.contains("<｜DSML｜invoke name=\"noop\">"))
+            .expect("the shape");
+        let prompt = format!("<｜Assistant｜>{}", turn.tail);
+        let whole = run(&prompt, &[turn.output]);
+        assert!(
+            !whole
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "the whole turn reads with every wrapper byte dropped, none malformed"
+        );
+        for cut in 1..turn.output.len() {
+            if !turn.output.is_char_boundary(cut) {
+                continue;
+            }
+            let events = run(&prompt, &[&turn.output[..cut], &turn.output[cut..]]);
+            assert_eq!(bytes(&events), turn.output, "cut at {cut}");
+            assert_eq!(calls_of(&events), calls_of(&whole), "cut at {cut}");
+            assert_eq!(
+                arguments_of(&events, 0),
+                arguments_of(&whole, 0),
+                "cut at {cut}"
+            );
+            assert_eq!(content_of(&events), content_of(&whole), "cut at {cut}");
+            assert_eq!(reasoning_of(&events), reasoning_of(&whole), "cut at {cut}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })),
+                "cut at {cut}: a wrapper byte read as malformed text"
+            );
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+                "cut at {cut}"
+            );
+        }
     }
 }

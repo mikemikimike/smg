@@ -9,10 +9,10 @@ use openai_protocol::{
     responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::{transport::Channel, Request};
+use tonic::Request;
 use tracing::{debug, warn};
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::{AbortOnDropClient, BoxedTraceInjector, TapChannel};
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -28,7 +28,7 @@ pub type AbortOnDropStream = crate::AbortOnDropStream<proto::GenerateResponse, V
 /// gRPC client for vLLM scheduler
 #[derive(Clone)]
 pub struct VllmEngineClient {
-    client: proto::vllm_engine_client::VllmEngineClient<Channel>,
+    client: proto::vllm_engine_client::VllmEngineClient<TapChannel>,
     trace_injector: BoxedTraceInjector,
 }
 
@@ -45,7 +45,10 @@ impl AbortOnDropClient for VllmEngineClient {
 }
 
 impl VllmEngineClient {
-    crate::impl_engine_client_basics!(proto::vllm_engine_client::VllmEngineClient<Channel>, "vLLM");
+    crate::impl_engine_client_basics!(
+        proto::vllm_engine_client::VllmEngineClient<TapChannel>,
+        "vLLM"
+    );
 
     /// Submit a generation request (returns auto-aborting streaming response)
     ///
@@ -738,6 +741,7 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::testing::refused_endpoint;
 
     /// Minimal valid CompletionRequest for tests that only care about
     /// sampling-param passthrough. CompletionRequest doesn't derive Default,
@@ -1015,9 +1019,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_connect_invalid_endpoint() {
-        let result = VllmEngineClient::connect("invalid://endpoint").await;
-        assert!(result.is_err());
+    async fn connect_fails_on_a_malformed_or_refused_endpoint() {
+        let malformed = VllmEngineClient::connect("not an endpoint").await;
+        assert!(
+            malformed.is_err(),
+            "a malformed endpoint fails before the dial"
+        );
+        let refused = refused_endpoint();
+        let result = VllmEngineClient::connect(&refused.url).await;
+        assert!(result.is_err(), "a refused dial fails the connect");
     }
 
     #[test]

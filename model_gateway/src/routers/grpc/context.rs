@@ -38,7 +38,7 @@ use super::{
     },
     regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
     spec::ResponseSpec,
-    utils::ParserResolver,
+    utils::{ParserResolver, WorkerDecoding},
 };
 use crate::{
     config::ParserChoice,
@@ -48,7 +48,7 @@ use crate::{
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
         error::internal_error,
-        grpc::regular::symphony::template::Templates,
+        grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
     worker::{
         ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
@@ -248,6 +248,13 @@ pub(crate) struct ProcessingState {
     /// re-selection stays pinned to workers that accept them.
     pub media_refs_forwarded: bool,
 
+    /// The selected worker's constrained decoding, set when request building
+    /// let its policy choose the request's constraint
+    /// (`regular::symphony::WorkerConstraint::by_policy`), so retry
+    /// re-selection stays on workers that decide alike
+    /// (`utils::WorkerDecoding::decides_alike`).
+    pub constraint_decided_on: Option<WorkerDecoding>,
+
     /// `Some` iff the request is multimodal EPD and worker selection produced
     /// encode assignments. Request building injects the bootstrap info and drops
     /// prefill pixels; request execution `take()`s the dispatch plan.
@@ -287,6 +294,8 @@ pub(crate) struct ProcessingState {
 /// Worker-selection inputs that outlive the parsed request.
 #[derive(Default)]
 pub(crate) struct RoutingSnapshot {
+    /// Exact context checks retained for initial selection and retries.
+    pub context_requirements: super::common::stages::ContextRequirements,
     /// Captured only when a configured policy actually consumes request text.
     pub routing_text: Option<String>,
     /// Routing-affinity token proxy (first prompt for batched completions).
@@ -362,6 +371,9 @@ pub(crate) struct DispatchContext {
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
     pub routing: RoutingSnapshot,
     pub wire: WireConstraint,
+    /// The selected worker's constrained decoding, when its policy chose the
+    /// plan's constraint; a retry re-selects only workers that decide alike.
+    pub constraint_decided_on: Option<WorkerDecoding>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub workers: Option<WorkerSelection>,
     pub sticky_key: Option<String>,
@@ -571,12 +583,14 @@ pub(crate) enum PreparationOutput {
     Chat {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
-        tool_constraints: Option<(String, String)>,
+        /// Request building decides on the selected worker
+        /// (`regular::symphony::worker_constraint`).
+        tool_constraints: PreparedConstraint,
     },
     Messages {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
-        tool_constraints: Option<(String, String)>,
+        tool_constraints: PreparedConstraint,
         /// The response spec, built by preparation: the template rendered
         /// the view of its chat tools that `tool_choice` leaves (see
         /// `MessagesResponseSpec`).
@@ -1009,6 +1023,7 @@ impl RequestContext {
             rate_limit_cell,
             routing,
             wire,
+            constraint_decided_on: state.constraint_decided_on,
             tokenizer: state.tokenizer,
             workers: state.workers,
             sticky_key: state.sticky_key,

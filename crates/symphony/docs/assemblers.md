@@ -9,7 +9,12 @@ does with it, byte accounting included, and where a rule comes from.
 Every byte of the object lands in exactly one event: the head up to the arguments value is the
 `source` of `ToolCallStart`, the argument bytes are the `source` of their fragments, the tail after
 the value is the `source` of `ToolCallEnd`. When the arguments come before the name they are held
-until the name is whole, since a call starts before its arguments.
+until the name is whole, since a call starts before its arguments. An object that ends without an
+arguments member (its key never came) is a call with none: one fragment, `{}`, of no bytes goes
+before the end, so the call reads as one written `"arguments": {}` and as every other syntax's call
+with nothing in it, on every path that reads the fragments (a client of the stream, the message, a
+server call made from the arguments). A member whose key came and whose value never began is not
+one: the call ends with what arrived, and nothing is made up for a value the model botched.
 
 The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far always form a
 valid JSON prefix, as far as the prefix parser can tell: each new run of argument bytes is judged by
@@ -66,9 +71,10 @@ What the syntax says, and what the assembler does with it:
 - **The name is the text before the first `<arg_key>`**, or before the call's end when the call
   has no arguments, less the whitespace around it, which is the template's and goes into the
   next event's source. The name is known only when that tag arrives, so `ToolCallStart` waits
-  for it; names are short. A name holds no whitespace, quote, brace or angle bracket: any
-  other text there (the JSON of a `<tool_call>` block quoted inside a code fence, prose) is
-  reported, and no call starts, so a block that names no call writes no arguments either.
+  for it; names are short. A name holds no whitespace, quote, brace, bracket, parenthesis or
+  angle bracket: any other text there (the JSON of a `<tool_call>` block quoted inside a code
+  fence, prose, a call written as Python) is reported, and no call starts, so a block that names
+  no call writes no arguments either.
 - **A value's type comes from the request's tools**, as in the Qwen assembler: a declared string
   is its text, streamed as it arrives; every other value is written whole at `</arg_value>`
   through `json`, which reads the JSON the templates write for a number, a boolean, a list,

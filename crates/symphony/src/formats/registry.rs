@@ -18,6 +18,8 @@
 //! renamed checkpoint (`Qwen3-8B-FP8`) is not matched and gives `None`, so the gateway keeps its
 //! older parsers for it until its group lists the name under `also`.
 
+use std::sync::LazyLock;
+
 use super::{
     deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest,
     json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
@@ -186,8 +188,10 @@ impl Table {
     /// (`--tool-call-parser qwen_xml`) reads with the table (`qwen3_tagged`) when the gateway
     /// reads with Symphony. A parser that reads a format no table reads has no row and keeps its
     /// own parser; so does `passthrough`, which leaves its channel as written, which no table
-    /// reads for.
-    pub const ALIASES: [(&str, Table); 9] = [
+    /// reads for. A row may also be the name a downstream launcher passes for a model family
+    /// whose table has no older parser (`muse` for `muse_spark`), so that the launcher's flags
+    /// read with the table.
+    pub const ALIASES: [(&str, Table); 10] = [
         ("qwen", Table::Qwen3),
         ("qwen_xml", Table::Qwen3Tagged),
         ("qwen_coder", Table::Qwen3Tagged),
@@ -197,6 +201,7 @@ impl Table {
         ("hy_v4", Table::Hy4),
         ("deepseek_v41", Table::DeepSeekV4_1),
         ("minimax", Table::MinimaxM2),
+        ("muse", Table::MuseSpark),
     ];
 
     /// The table, built.
@@ -253,12 +258,6 @@ impl Group {
     /// The group's checkpoints, by repository name: the primary first.
     fn repositories(&self) -> impl Iterator<Item = &'static str> {
         std::iter::once(repository(self.model)).chain(self.also.iter().map(|also| repository(also)))
-    }
-
-    /// Whether `repository` names one of the group's checkpoints, in any case.
-    fn holds(&self, repository: &str) -> bool {
-        self.repositories()
-            .any(|own| own.eq_ignore_ascii_case(repository))
     }
 }
 
@@ -1190,13 +1189,26 @@ const GROUPS: &[Group] = &[
     },
 ];
 
-/// The group that holds `model`, by its repository name.
+/// Every group's checkpoints by repository name, each with its group, in the registry's order:
+/// worked out once, since a request looks its model up more than once.
+static REPOSITORIES: LazyLock<Vec<(&'static str, &'static Group)>> = LazyLock::new(|| {
+    GROUPS
+        .iter()
+        .flat_map(|group| group.repositories().map(move |own| (own, group)))
+        .collect()
+});
+
+/// The group that holds `model`, by its repository name in any case: the first in the
+/// registry's order.
 fn group_for(model: &str) -> Option<&'static Group> {
     let repository = repository(model);
     if repository.is_empty() {
         return None;
     }
-    GROUPS.iter().find(|group| group.holds(repository))
+    REPOSITORIES
+        .iter()
+        .find(|(own, _)| own.eq_ignore_ascii_case(repository))
+        .map(|&(_, group)| group)
 }
 
 /// The table that reads `model`'s output, with the model's own turn opener where its template has
@@ -1309,6 +1321,9 @@ mod tests {
         }
         assert_eq!(Table::answering_to("llama"), None);
         assert_eq!(Table::answering_to("passthrough"), None);
+        // A launcher's name for a family whose table has no older parser answers for the table.
+        assert_eq!(Table::answering_to("muse"), Some(Table::MuseSpark));
+        assert_eq!(Table::named("muse"), None);
     }
 
     #[test]

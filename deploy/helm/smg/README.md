@@ -108,6 +108,23 @@ helm install smg deploy/helm/smg \
 
 The token is stored in a Kubernetes Secret and injected as `HF_TOKEN` env var into both the router and worker pods.
 
+#### API Key
+
+The shared API key the serving routes require (`auth.apiKey`) is written into a chart-managed Secret and mounted into the router pod as a file the gateway reads with `--api-key-file`; the key is never in the pod's arguments, so it is not in the Deployment object, the process listing or `/proc`. A key managed outside the chart's values is mounted the same way from an existing Secret:
+
+```bash
+kubectl create secret generic smg-auth --from-literal=api-key='<key>'
+helm install smg deploy/helm/smg \
+  --set auth.existingSecret=smg-auth \
+  --set auth.apiKeySecretKey=api-key   # the default
+```
+
+The gateway also reads its other secrets from the environment or from files, which `router.extraEnv` can feed from Secrets: `SMG_TENANT_API_KEYS` (or `SMG_TENANT_API_KEYS_FILE`) for per-tenant keys, `SMG_POSTGRES_DB_URL` / `SMG_REDIS_URL` (or the `_FILE` variants) for the store URLs. On the command line a flag beats the environment, and a value together with a file for the same secret is refused at start-up. The launcher's reference in [the Python package's README](../../../bindings/python/README.md#secrets-from-the-environment-or-files) lists every name.
+
+The gateway reads the key file once, at start-up, so a rotated key reaches a pod when the pod restarts. A rotated `auth.apiKey` rolls the router pods by itself: the pod template carries a `checksum/auth` annotation over the chart-managed Secret, so `helm upgrade` with a new key is a rolling update. A rotated `auth.existingSecret` is not seen by the chart; roll the pods by hand after updating it, or the running pods keep accepting the old key until they restart. By label, which covers both workload kinds and every release name: `kubectl rollout restart deployment,statefulset -l app.kubernetes.io/instance=<release>,app.kubernetes.io/component=router` (the workload is `<fullname>-router`, where `<fullname>` is `<release>-smg` unless the release name contains `smg` or `fullnameOverride` is set).
+
+An older gateway image does not know `--api-key-file`; a chart of this version with such an image refuses to start rather than starting without the key.
+
 #### Router Probes and Shutdown
 
 The router's liveness probe is `httpGet /health`, which answers 200 while the process serves. Its readiness probe is `httpGet /readiness`, which answers 503 while the gateway has no healthy worker, while a tokenizer is not yet registered and while the gateway drains after SIGTERM, so the Service stops sending new connections to a pod that cannot take them (`router.livenessProbe.path` and `router.readinessProbe.path` override the routes).

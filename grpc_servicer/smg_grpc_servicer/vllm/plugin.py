@@ -5,10 +5,15 @@ vLLM loads ``vllm.general_plugins`` entry points while it builds the engine
 CLI (``AsyncEngineArgs.add_cli_args``), for plugins that extend the parser.
 Which implementation serves the gRPC contract is this package's decision, so
 the flag is this package's too: :func:`register` makes every
-``FlexibleArgumentParser`` that defines ``--grpc`` (the ``vllm serve``
-parser) grow ``--servicer-impl {python,rust}`` as it parses, and
+``FlexibleArgumentParser`` that serves gRPC (the ``vllm serve`` parser, which
+defines ``--grpc``, and the stock gRPC launcher's own) grow
+``--servicer-impl {python,rust}`` as it parses, and
 :func:`smg_grpc_servicer.vllm.rust.resolve_servicer_impl` reads it from the
-parsed namespace ahead of the environment. The worker-side media settings
+parsed namespace ahead of the environment. The plugin's load and its parse
+step are also the two moments inside the launcher's ``main()`` where a
+launcher running as ``__main__`` (``python -m`` on the launcher module) is
+bound to the servicer switch (:mod:`smg_grpc_servicer.vllm.launcher_switch`).
+The worker-side media settings
 (``--mm-processor`` and the other flags :class:`MmSettings.from_args` reads)
 join every parser that serves gRPC and lacks them: the ``vllm serve`` parser,
 and the stock ``python -m vllm.entrypoints.grpc_server`` launcher's, which
@@ -17,6 +22,12 @@ Their parsed values are carried into the environment as well, for a launcher
 that builds the servicer without its namespace. Parsers of other commands
 are untouched. A ``VLLM_PLUGINS`` setting that leaves this plugin out only
 removes the flags; the environment variables work regardless.
+
+The parse step is also where a launch that builds an engine for gRPC gets
+its CUDA-graph capture cap derived from the admission step when the operator
+set none (:mod:`smg_grpc_servicer.vllm.capture_cap`): the value joins the
+parsed namespace the launcher builds the engine from, for both servicer
+implementations and for the engine-only ranks of a multi-node engine.
 """
 
 from __future__ import annotations
@@ -37,10 +48,11 @@ _FLAG_MARK = "_smg_servicer_impl_flag"
 
 
 def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
-    """Add ``--servicer-impl`` to a parser that serves gRPC (defines
-    ``--grpc``) and lacks it; returns whether it was added."""
+    """Add ``--servicer-impl`` to a parser that serves gRPC (``vllm serve``'s,
+    which defines ``--grpc``, or the stock gRPC launcher's own, see
+    :func:`serves_grpc`) and lacks it; returns whether it was added."""
     actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
-    if "--grpc" not in actions or SERVICER_IMPL_FLAG in actions:
+    if SERVICER_IMPL_FLAG in actions or not serves_grpc(parser):
         return False
     parser.add_argument(
         SERVICER_IMPL_FLAG,
@@ -91,6 +103,39 @@ def handoff_mm_flags(parser: argparse.ArgumentParser, parsed: Any) -> Any | None
     return carry_mm_flags(parsed)
 
 
+def launches_engine(parser: argparse.ArgumentParser, parsed: Any) -> bool:
+    """Whether a parse builds an engine this package serves: the stock gRPC
+    launcher's (gRPC is all it serves), ``vllm serve --grpc``, and ``vllm
+    serve --headless`` (the engine-only ranks of a multi-node engine, started
+    with the leader's flags). An HTTP ``vllm serve`` is not this package's
+    launch and keeps the engine's own defaults."""
+    if not serves_grpc(parser):
+        return False
+    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
+    if "--grpc" not in actions:
+        return True
+    return bool(getattr(parsed, "grpc", False) or getattr(parsed, "headless", False))
+
+
+def handoff_capture_cap(parser: argparse.ArgumentParser, parsed: Any) -> Any | None:
+    """After a parse that launches an engine for gRPC: the CUDA-graph capture
+    cap derived from the admission step joins the namespace where the
+    operator set none, and one line says what applies. A knob value the
+    derivation does not take is a usage error (exit code 2, the variable and
+    the value named), as a bad flag value would be. Returns the decision,
+    ``None`` for any other parse."""
+    if not launches_engine(parser, parsed):
+        return None
+    from smg_grpc_servicer.vllm.capture_cap import apply_capture_cap, log_capture_cap
+
+    try:
+        cap = apply_capture_cap(parsed)
+    except ValueError as error:
+        parser.error(str(error))
+    log_capture_cap(cap)
+    return cap
+
+
 def register() -> None:
     """The ``vllm.general_plugins`` entry point. Idempotent, and loaded in
     every vLLM process: it wraps the parser class's parse step and installs
@@ -103,6 +148,12 @@ def register() -> None:
 
     @functools.wraps(original)
     def parse_known_args(self: Any, args: Any = None, namespace: Any = None) -> Any:
+        # The launcher's own parse runs inside its main(), after its body
+        # defined serve_grpc: a launcher running as __main__ (python -m on the
+        # launcher module) is bound here when register() ran before that
+        # definition existed (vLLM loaded the plugins during the launcher's
+        # own imports). Idempotent and cheap on every other parse.
+        install_launcher_switch()
         # The option joins right before parsing, after the launcher finished
         # building the parser, so it is there for `--help` and for the
         # subcommand parse `vllm serve` dispatches to.
@@ -119,9 +170,15 @@ def register() -> None:
         # process (so a flag stays `source=flag`), and the set values go into
         # the environment too; on every gRPC parse, the flags' origin aside.
         handoff_mm_flags(self, parsed)
+        # A launch that builds an engine for gRPC: the capture cap the
+        # engine would default below the admission step is derived here.
+        handoff_capture_cap(self, parsed)
         return parsed, extras
 
     FlexibleArgumentParser.parse_known_args = parse_known_args  # type: ignore[method-assign]
     setattr(FlexibleArgumentParser, _FLAG_MARK, True)
-    # The launcher is imported after the parse; the finder binds the switch as it loads.
+    # `vllm serve` imports the launcher after the parse; the finder binds the
+    # switch as it loads. A launcher running as __main__ has defined
+    # serve_grpc by the time vLLM loads the plugins from its main(), and is
+    # bound in its namespace now.
     install_launcher_switch()

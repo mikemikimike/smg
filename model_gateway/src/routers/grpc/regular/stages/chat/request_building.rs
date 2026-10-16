@@ -2,7 +2,6 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use openai_protocol::worker::ConstrainedDecoding;
 use tracing::error;
 
 use crate::{
@@ -302,17 +301,33 @@ impl BuildStage for ChatRequestBuildingStage {
         // the one that reads the response is Symphony only when a table takes
         // the request, so the state records that for the response's header.
         let names = ctx.components.parser_resolver.names(&chat_request.model);
-        // A worker whose engine takes a grammar on every turn gets the table's
-        // tag for the calls the request allows under `auto`, when the request
-        // asked for no constraint of its own (`regular::symphony::auto_constraint`),
-        // built on the reasoning state the plan takes (`reasoning_decision`).
-        // The policy is read once, for the first attempt's worker: the attempt
-        // stamp carries the tag unshaped like a forced call's, so a retry's
-        // worker shapes it again but is not asked for its own policy.
-        let tool_constraints = match tool_constraints {
-            None if utils::constrained_decoding_for(ctx.state.workers.as_ref())
-                == ConstrainedDecoding::Always =>
-            {
+        let parser = ctx.state.parser.unwrap_or_default();
+        // What constrains the output is decided here, on the worker selected
+        // for the request (`regular::symphony::worker_constraint`): the whole
+        // turn's grammar on a worker whose engine takes one on every turn from
+        // its first token; else what preparation found, and on a worker that
+        // takes a grammar on every turn the table's tag for the calls the
+        // request allows under `auto`, built on the reasoning state the plan
+        // takes (`reasoning_decision`). When the worker's policy chose the
+        // constraint, a retry re-selects only workers that decide alike
+        // (`utils::WorkerDecoding::decides_alike`); what the request asked for
+        // suits any worker. The attempt stamp carries the tag unshaped like a
+        // forced call's, so the retry's worker shapes it for where its engine
+        // starts the grammar.
+        let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
+        let decided = symphony::worker_constraint(
+            decoding,
+            tool_constraints,
+            || {
+                symphony::turn_constraint(
+                    parser,
+                    &names,
+                    &chat_request,
+                    &processed_messages.text,
+                    &ctx.components.templates,
+                )
+            },
+            || {
                 let reasoning = reasoning_decision(
                     ctx,
                     &chat_request,
@@ -320,20 +335,22 @@ impl BuildStage for ChatRequestBuildingStage {
                     processed_messages.continued_final_message,
                 );
                 symphony::auto_constraint(
-                    ctx.state.parser.unwrap_or_default(),
+                    parser,
                     &names,
-                    chat_request.as_ref(),
+                    &chat_request,
                     &chat_request.callable_tools(),
                     reasoning,
                     &ctx.components.templates,
                 )
-                .map_err(|why| error::bad_request("invalid_parser_configuration", why))?
-                .map(|constraint| constraint.to_tuple())
-            }
-            other => other,
-        };
+            },
+        )
+        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        if decided.by_policy {
+            ctx.state.constraint_decided_on = Some(decoding);
+        }
+        let tool_constraints = decided.constraint.map(|constraint| constraint.to_tuple());
         let assignment = symphony::assign(
-            ctx.state.parser.unwrap_or_default(),
+            parser,
             &names,
             chat_request.as_ref(),
             tool_constraints.as_ref(),
@@ -346,16 +363,22 @@ impl BuildStage for ChatRequestBuildingStage {
             None => ParserChoice::Legacy,
         });
         // The table's structural tag stands in for a JSON response_format (see
-        // `regular::symphony::constraint`): the engine's request carries the tag
-        // alone, so no client reads the two as competing constraints.
+        // `regular::symphony::constraint`), and the whole turn's grammar for a
+        // regex or an ebnf too: the engine's request carries the tag alone, so
+        // no client reads the two as competing constraints.
         let answered = assignment.is_some()
             && chat_request.response_format.is_some()
             && tool_constraints
                 .as_ref()
                 .is_some_and(|(kind, _)| kind == "structural_tag");
-        let engine_request = answered.then(|| openai_protocol::chat::ChatCompletionRequest {
-            response_format: None,
-            ..chat_request.as_ref().clone()
+        let engine_request = (answered || decided.whole_turn).then(|| {
+            let mut request = chat_request.as_ref().clone();
+            request.response_format = None;
+            if decided.whole_turn {
+                request.regex = None;
+                request.ebnf = None;
+            }
+            request
         });
         let engine_request = match &engine_request {
             Some(request) => request,

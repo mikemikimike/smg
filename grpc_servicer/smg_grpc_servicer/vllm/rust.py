@@ -59,11 +59,17 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     EngineProcess,
     EngineProcessGroup,
     RustLauncher,
+    ServicerConfigError,
     apply_kv_events_default,
     resolve_tokenizer_dir,
     servicer_switch,
 )
-from smg_grpc_servicer.vllm.config_view import EngineConfigView
+from smg_grpc_servicer.vllm.config_view import (
+    EngineConfigView,
+    mm_processor_kwargs,
+    multimodal_config,
+)
+from smg_grpc_servicer.vllm.launcher_switch import SUPPORTED_VLLM_RELEASES
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
     constrained_decoding_start,
@@ -179,8 +185,11 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
     would normalize anything else twice; the pipeline writes raw pixels then.
     The engine's ``mm_processor_kwargs`` go along as overrides of the
     preprocessor config (less ``device``, which only says where vLLM's own
-    processor would run); a knob the pipeline has no field for is refused
-    at launch rather than silently ignored. The engine's own per-prompt media
+    processor would run), read from its multimodal config, where the engine
+    moves them at construction (:func:`.config_view.mm_processor_kwargs`; the
+    model config's own attribute is init-only and reads ``None`` on every
+    engine); a knob the pipeline has no field for is refused at launch rather
+    than silently ignored. The engine's own per-prompt media
     limits (``--limit-mm-per-prompt``) go along too: the pipeline refuses
     above them as the engine's own server does, whatever its own caps say. So
     does the engine's video frame budget (``--media-io-kwargs``
@@ -207,9 +216,7 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
     )
     dtype = str(getattr(model_config, "dtype", "") or "").removeprefix("torch.")
     processor_kwargs = {
-        key: value
-        for key, value in (getattr(model_config, "mm_processor_kwargs", None) or {}).items()
-        if key != "device"
+        key: value for key, value in mm_processor_kwargs(model_config).items() if key != "device"
     }
     return {
         "model_dir": model_dir,
@@ -234,7 +241,7 @@ def engine_item_limits(model_config) -> dict[str, int] | None:
     fetches, as vLLM resolved ``--limit-mm-per-prompt`` (its own server refuses
     a prompt above them); ``None`` on a config that does not carry them, which
     leaves the pipeline to its own caps."""
-    mm_config = getattr(model_config, "multimodal_config", None)
+    mm_config = multimodal_config(model_config)
     get_limit = getattr(mm_config, "get_limit_per_prompt", None)
     if not callable(get_limit):
         return None
@@ -258,7 +265,7 @@ def video_frame_budget(model_config, environ: Mapping[str, str] | None = None) -
     )
 
     source = os.environ if environ is None else environ
-    mm_config = getattr(model_config, "multimodal_config", None)
+    mm_config = multimodal_config(model_config)
     kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
     if not isinstance(kwargs, Mapping):
         kwargs = {}
@@ -286,7 +293,7 @@ def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) ->
     rate-based sampler of their own never followed the loader and start as
     before, so a fleet-wide loader setting does not block them."""
     source = os.environ if environ is None else environ
-    mm_config = getattr(model_config, "multimodal_config", None)
+    mm_config = multimodal_config(model_config)
     kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
     video = kwargs.get("video") if isinstance(kwargs, Mapping) else None
     video = video if isinstance(video, Mapping) else {}
@@ -584,11 +591,33 @@ def require_python_impl(environ: Mapping[str, str] | None = None) -> None:
         raise RuntimeError(
             f"{SERVICER_IMPL_ENV}={impl}, but this process is starting the Python "
             "servicer: the switch this package installs over vLLM's gRPC launcher "
-            "never ran (a launcher executed directly as __main__, or one that did "
-            "not import smg_grpc_servicer.vllm.servicer before defining serve_grpc). "
-            "Start through `vllm serve <model> --grpc`, or unset the flag; a silent "
+            "never ran (a launcher run as a file path or with this package's plugin "
+            "left out of VLLM_PLUGINS, or one that did not import "
+            "smg_grpc_servicer.vllm.servicer before defining serve_grpc). Start "
+            "through `vllm serve <model> --grpc` or `python -m` on the launcher "
+            f"module (vLLM {SUPPORTED_VLLM_RELEASES}), or unset the flag; a silent "
             "Python fallback would report Rust coverage that never ran."
         )
+
+
+def require_python_media_mode(
+    args: argparse.Namespace | None = None, environ: Mapping[str, str] | None = None
+) -> str:
+    """The ``--mm-processor`` mode the Python servicer will serve, checked
+    before the launcher builds the engine: ``smg`` is the Rust servicer's own
+    pipeline, and the Python servicer's own refusal of it comes only once the
+    engine exists, after the whole model loaded (under a restart policy a
+    crash loop that pays a full load per turn). The mode is known from the
+    flags and the environment here, so the switch refuses it now, as a
+    :class:`~smg_grpc_servicer.rust_lifecycle.ServicerConfigError` with the
+    servicer's own message."""
+    from smg_grpc_servicer.vllm.mm_processor import MmSettings, require_python_servicer_mode
+
+    settings = MmSettings.from_args(args) if args is not None else MmSettings()
+    try:
+        return require_python_servicer_mode(settings, os.environ if environ is None else environ)
+    except ValueError as error:
+        raise ServicerConfigError(str(error)) from None
 
 
 def upstream_hook_installed(vllm_root: str | None = None) -> bool:

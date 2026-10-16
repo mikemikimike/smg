@@ -27,6 +27,13 @@ spec:
         {{- if .Values.router.mesh.enabled }}
         sglang.ai/mesh-port: {{ .Values.router.mesh.port | quote }}
         {{- end }}
+        {{- /* The key is read from a file at start-up, so a rotated auth.apiKey
+             must roll the pods: the chart-managed Secret's content is on the pod
+             template. An existingSecret the chart does not see needs a rollout
+             restart. */}}
+        {{- if and .Values.auth.apiKey (not .Values.auth.existingSecret) }}
+        checksum/auth: {{ .Values.auth.apiKey | sha256sum }}
+        {{- end }}
         {{- with .Values.router.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -107,9 +114,22 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if include "smg.authSecretName" . }}
+            - name: auth
+              mountPath: /etc/smg/auth
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if include "smg.authSecretName" . }}
+        - name: auth
+          secret:
+            secretName: {{ include "smg.authSecretName" . }}
+            items:
+              - key: {{ include "smg.authSecretKey" . }}
+                path: {{ include "smg.authSecretKey" . }}
+        {{- end }}
       {{- with .Values.router.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

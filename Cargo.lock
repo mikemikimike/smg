@@ -3899,7 +3899,7 @@ dependencies = [
 
 [[package]]
 name = "kv-index"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -4064,6 +4064,7 @@ dependencies = [
  "rayon",
  "reqwest 0.13.4",
  "rustfft",
+ "rustix",
  "rustls",
  "serde",
  "serde_bytes",
@@ -4089,6 +4090,7 @@ dependencies = [
  "chrono",
  "criterion",
  "dashmap",
+ "foldhash 0.2.0",
  "futures",
  "hf-hub",
  "minijinja",
@@ -4495,6 +4497,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "clap",
  "engine-servicer",
  "engine-zmq-client",
@@ -7960,6 +7963,7 @@ dependencies = [
  "once_cell",
  "openai-protocol",
  "reqwest 0.13.4",
+ "serde",
  "serde_json",
  "smg",
  "smg-grpc-client",
@@ -8151,6 +8155,7 @@ name = "smg-symphony"
 version = "0.1.0"
 dependencies = [
  "openai-protocol",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

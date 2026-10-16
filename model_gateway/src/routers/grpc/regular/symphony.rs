@@ -7,8 +7,9 @@
 //! `tool_parser` and `reasoning_parser` of the model's card (worker labels), else the
 //! `--tool-call-parser` and `--reasoning-parser` flags, resolved as the legacy path resolves them
 //! (`ParserResolver`). A name a table answers to (`symphony::formats::Table::answering_to`: its
-//! own name, or a legacy parser's that reads its format, `qwen` for `qwen3`, `qwen_xml` for
-//! `qwen3_tagged`) reads every request for the model with that table, whatever the model is, the
+//! own name, a legacy parser's that reads its format, `qwen` for `qwen3`, `qwen_xml` for
+//! `qwen3_tagged`, or a launcher's name for a family whose table has no older parser, `muse` for
+//! `muse_spark`) reads every request for the model with that table, whatever the model is, the
 //! tool-call name deciding; [`TEMPLATE_PARSER`] reads it with the table its tokenizer's
 //! `response_template` compiles into ([`template`]), and refuses the request when the model has
 //! none; any other legacy tool-call parser's name keeps the legacy parsers, which is the way back
@@ -19,8 +20,9 @@
 //! ([`check_names`]). Every request read with `legacy` keeps the older parsers. The response names
 //! the parser that read it in `x-smg-parser`, legacy when the choice was Symphony but no table
 //! took the request, so a client comparing the two can tell which one read each answer. What a
-//! request asks of the channels takes a variant of the table rather than another reader: with no
-//! tools declared, or `tool_choice: none`, the table without its calls; with
+//! request asks of the channels takes a variant of the table rather than another reader: where the
+//! legacy path would run no tool parser (`tool_choice: none`; no tools declared, for a provider
+//! that reads calls only with them), the table without its calls; with
 //! `separate_reasoning: false`, the table without its thought ([`assign`]).
 //!
 //! Request building assigns Symphony to a request ([`assign`], [`assign_messages`]) and stores
@@ -29,7 +31,11 @@
 //! structural tag of a forced or required call, or of a JSON `response_format` ([`constraint`],
 //! [`constraint_messages`]) before the older registry. Both decide with one predicate, so the
 //! output a table's tag constrains is read by that table and never by the older parsers, which
-//! expect another syntax. The streaming and non-streaming drivers run one [`Reader`] per choice
+//! expect another syntax. Request building decides what constrains the output on the worker
+//! selected for the request ([`worker_constraint`]): a worker whose engine takes a grammar on every
+//! turn from its first token gets the whole turn's grammar where the response template's table
+//! spells one ([`turn_constraint`]); a table's refusal in preparation waits for that decision. The
+//! streaming and non-streaming drivers run one [`Reader`] per choice
 //! over the stop decoder's output and render its events with `symphony::adapt::chat` or
 //! `symphony::adapt::messages`, so the client sees the deltas and the message it saw before.
 
@@ -44,12 +50,14 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
     messages::{CreateMessageRequest, ToolChoice as MessagesToolChoice},
+    worker::ConstrainedDecoding,
 };
 use serde_json::{json, Value};
 use symphony::{
     formats::{for_model, table_for, Table},
     grammar::Options,
-    Declared, Engine, EngineFinish, Event, Events, Format, Grammar, Input, Parser as _, TokenSpan,
+    Declared, Engine, EngineFinish, Event, Events, Format, Grammar, Input, OutputAnswer,
+    OutputChoice, Parser as _, TokenSpan, Turn,
 };
 use tool_parser::ToolConstraint;
 use tracing::debug;
@@ -57,7 +65,10 @@ use tracing::debug;
 use self::template::Templates;
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
-    routers::grpc::utils::Names,
+    routers::grpc::{
+        spec::scans_for_tool_calls,
+        utils::{Names, WorkerDecoding},
+    },
 };
 
 /// The request header that names the parser for one request, `legacy` or `symphony`, over the
@@ -99,9 +110,10 @@ fn names_template(names: &Names) -> bool {
 }
 
 /// The table the parser names set for a model select, when they do: the tool-call name's, else
-/// the reasoning name's when no tool-call name is set. A name is a table's own or a legacy
-/// parser's that reads its format ([`Table::answering_to`]); any other name selects none,
-/// `passthrough` and [`TEMPLATE_PARSER`] among them, and so do no names at all.
+/// the reasoning name's when no tool-call name is set. A name is one a table answers to
+/// ([`Table::answering_to`]): its own, a legacy parser's that reads its format, or a launcher's
+/// for a family whose table has no older parser; any other name selects none, `passthrough` and
+/// [`TEMPLATE_PARSER`] among them, and so do no names at all.
 pub(crate) fn named_table(names: &Names) -> Option<Table> {
     names
         .tool
@@ -148,21 +160,49 @@ pub(crate) fn reads(
 
 /// Whether the parser names set for a model (the flags, or one worker's labels) are names the
 /// gateway reads with under `parser`: a legacy parser's, or, with Symphony on, a table's or
-/// [`TEMPLATE_PARSER`]. `legacy_tool` and `legacy_reasoning` say whether the legacy registries have each
-/// name. A table no legacy parser shares, and [`TEMPLATE_PARSER`], bind the other name to the same or to
-/// nothing: the legacy parsers read a forced call the table has no tag for by the names they are
-/// given, and have no parser of that name. The
-/// error says what is wrong with which name, for the startup or registration failure.
+/// [`TEMPLATE_PARSER`]. `tools` and `reasoning` are the legacy registries; a name whose registry
+/// is absent is not checked (its parsers are unused in that configuration). A name no legacy
+/// parser has that a table answers to (the table's own name, or a launcher's name for a family
+/// whose table has no older parser), and [`TEMPLATE_PARSER`], bind the other name to the same or
+/// to nothing: the legacy parsers read a forced call the table has no tag for by the names they
+/// are given, and have no parser of that name. A legacy parser's name a table answers to is
+/// checked as the legacy name it is, in its own kind. The error says what is wrong with which
+/// name, for the startup or registration failure.
 pub(crate) fn check_names(
     parser: ParserChoice,
     names: &Names,
-    legacy_tool: bool,
-    legacy_reasoning: bool,
+    tools: Option<&tool_parser::ParserFactory>,
+    reasoning: Option<&reasoning_parser::ParserFactory>,
 ) -> Result<(), String> {
     let symphony = parser == ParserChoice::Symphony;
+    let legacy_tool = |name: &str| tools.is_some_and(|factory| factory.has_parser(name));
+    let legacy_reasoning =
+        |name: &str| reasoning.is_some_and(|factory| factory.registry().has_parser(name));
+    // The table a name selects when no legacy parser of its kind has it: the table named so,
+    // else the one that answers to it when no legacy parser of either kind has the name as the
+    // registries spell it (a table answers in any case, the registries in theirs); a legacy
+    // parser's name of the other kind selects none, whatever table answers to it.
+    let table = |name: &str| {
+        Table::named(name).or_else(|| {
+            let spelled = name.trim().to_ascii_lowercase();
+            (!legacy_tool(&spelled) && !legacy_reasoning(&spelled))
+                .then(|| Table::answering_to(name))
+                .flatten()
+        })
+    };
     let kinds = [
-        ("tool-call", &names.tool, legacy_tool, &names.reasoning),
-        ("reasoning", &names.reasoning, legacy_reasoning, &names.tool),
+        (
+            "tool-call",
+            names.tool.as_deref(),
+            tools.is_none() || names.tool.as_deref().is_some_and(legacy_tool),
+            names.reasoning.as_deref(),
+        ),
+        (
+            "reasoning",
+            names.reasoning.as_deref(),
+            reasoning.is_none() || names.reasoning.as_deref().is_some_and(legacy_reasoning),
+            names.tool.as_deref(),
+        ),
     ];
     for (kind, name, legacy, other) in kinds {
         let Some(name) = name else {
@@ -175,10 +215,7 @@ pub(crate) fn check_names(
                      --parser symphony reads with"
                 ));
             }
-            if let Some(other) = other
-                .as_deref()
-                .filter(|other| !is_named(Some(other), TEMPLATE_PARSER))
-            {
+            if let Some(other) = other.filter(|other| !is_named(Some(other), TEMPLATE_PARSER)) {
                 return Err(format!(
                     "{kind} parser '{name}' reads with the model's response template, so the \
                      other parser must name '{TEMPLATE_PARSER}' or nothing, not '{other}'"
@@ -189,14 +226,15 @@ pub(crate) fn check_names(
         if legacy {
             continue;
         }
-        match (symphony, Table::named(name)) {
-            (true, Some(table)) => {
+        match (symphony, table(name)) {
+            (true, Some(selected)) => {
                 if let Some(other) = other {
-                    if Table::named(other) != Some(table) {
+                    if table(other) != Some(selected) {
                         return Err(format!(
-                            "{kind} parser '{name}' is a Symphony table's name and no legacy \
-                             parser's, so the other parser must name the same table or \
-                             nothing, not '{other}'"
+                            "{kind} parser '{name}' selects the Symphony table '{}' and is no \
+                             legacy parser's name, so the other parser must name the same \
+                             table or nothing, not '{other}'",
+                            selected.name()
                         ));
                     }
                 }
@@ -206,10 +244,11 @@ pub(crate) fn check_names(
                     "unknown {kind} parser '{name}': neither a legacy parser nor a Symphony table"
                 ));
             }
-            (false, Some(_)) => {
+            (false, Some(selected)) => {
                 return Err(format!(
-                    "unknown {kind} parser '{name}': a Symphony table's name, which --parser \
-                     symphony reads with"
+                    "unknown {kind} parser '{name}': the Symphony table '{}', which --parser \
+                     symphony reads with",
+                    selected.name()
                 ));
             }
             (false, None) => return Err(format!("unknown {kind} parser '{name}'")),
@@ -278,14 +317,15 @@ fn calls_tag(
 }
 
 /// The tag of a JSON answer following `schema`, with `reasoning_open` when the prompt leaves the
-/// model inside its thought ([`Format::answer_grammar`], [`tagged`]): the answer written where
-/// the table reads one, which the engine's own schema constraint is not for a table whose answer
-/// is a message (the bare JSON lands outside every message and the table drops it); where the
-/// output starts in content the tag is the schema alone, after the prefix a forced call takes
-/// when the prompt leaves the thought open, so the model closes its thought first. A registry
-/// table leaves the engine's schema, as before, when it has no tag or when the prompt `continues`
-/// the assistant's message, since the tag writes a turn from its start; the template's table
-/// refuses both.
+/// model inside its thought ([`Format::answer_grammar`]): the answer written where the table
+/// reads one, which the engine's own schema constraint is not for a table whose answer is a
+/// message (the bare JSON lands outside every message and the table drops it), nor with the
+/// thought open for an engine that runs the grammar from the first token (the JSON lands inside
+/// the thought), nor for a table that admits a thought before its answer. A registry table whose
+/// tag is the schema alone, the engine's own constraint, leaves it to the engine as before, and
+/// so does one with no tag, or a prompt that `continues` the assistant's message, since the tag
+/// writes a turn from its start; the template's table takes its tag either way and refuses what
+/// it cannot constrain ([`tagged`]).
 fn answer_tag(
     format: &Format,
     compiled: bool,
@@ -294,10 +334,10 @@ fn answer_tag(
     reasoning_open: bool,
     continues: bool,
 ) -> Result<Option<ToolConstraint>, String> {
-    if continues && !compiled {
+    let grammar = format.answer_grammar(schema, reasoning_open);
+    if !compiled && (continues || matches!(grammar, Some(Grammar::JsonSchema { .. }))) {
         return Ok(None);
     }
-    let grammar = format.answer_grammar(schema, reasoning_open);
     tagged(grammar, compiled, model, "a JSON answer", continues)
 }
 
@@ -516,6 +556,186 @@ pub(crate) fn auto_constraint_messages(
     Ok(auto_tag(&format, tools, reasoning_open, one_call))
 }
 
+/// The constraint preparation finds for what a request asks, before its worker is known: the
+/// table's tag for a forced call or a JSON answer, else the registry's; or why the table cannot
+/// constrain the request ([`constraint`], [`constraint_messages`]). Request building decides on the
+/// selected worker ([`worker_constraint`]).
+pub(crate) type PreparedConstraint = Result<Option<ToolConstraint>, String>;
+
+/// What constrains a request's output on the worker selected for it.
+pub(crate) struct WorkerConstraint {
+    pub constraint: Option<ToolConstraint>,
+    /// The constraint is the whole turn's grammar, which holds the request's own format: the
+    /// engine's request carries none beside it.
+    pub whole_turn: bool,
+    /// The worker's policy chose the constraint (the whole turn's grammar or the `auto` tag), not
+    /// the request: a worker of another policy would not send it.
+    pub by_policy: bool,
+}
+
+/// What constrains a request's output on the worker selected for it, whose engine takes a grammar
+/// on every turn or only when the request asks and starts it where its label says (`decoding`,
+/// under PD the decode worker's). The one place a worker's policy decides:
+///
+/// - `requested`, the default: what preparation found (`prepared`), its refusal included.
+/// - `always`, on an engine that starts the grammar at the first token: the whole turn's grammar
+///   (`turn`, [`turn_constraint`]) where it starts; its refusal refuses the request.
+/// - `always` otherwise, or where the whole turn's grammar does not start: what preparation found,
+///   and when that is nothing, the table's tag for the calls `auto` allows (`auto`,
+///   [`auto_constraint`]).
+///
+/// When the policy chose the constraint, a retry re-selects only workers that decide alike
+/// ([`WorkerDecoding::decides_alike`]).
+pub(crate) fn worker_constraint(
+    decoding: WorkerDecoding,
+    prepared: PreparedConstraint,
+    turn: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
+    auto: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
+) -> Result<WorkerConstraint, String> {
+    let always = decoding.policy == ConstrainedDecoding::Always;
+    if decoding.takes_the_whole_turn() {
+        if let Some(constraint) = turn()? {
+            return Ok(WorkerConstraint {
+                constraint: Some(constraint),
+                whole_turn: true,
+                by_policy: true,
+            });
+        }
+    }
+    let (constraint, by_policy) = match prepared? {
+        None if always => {
+            let tag = auto()?;
+            let by_policy = tag.is_some();
+            (tag, by_policy)
+        }
+        prepared => (prepared, false),
+    };
+    Ok(WorkerConstraint {
+        constraint,
+        whole_turn: false,
+        by_policy,
+    })
+}
+
+/// The whole turn's grammar for a chat request ([`Format::turn_grammar`]), where the response
+/// template's table reads the response ([`TEMPLATE_PARSER`]); `prompt` is the rendered prompt.
+/// `Ok(None)` for any other table, and where the turn's grammar does not start; an error refuses
+/// what it cannot hold.
+pub(crate) fn turn_constraint(
+    parser: ParserChoice,
+    names: &Names,
+    request: &ChatCompletionRequest,
+    prompt: &str,
+    templates: &Templates,
+) -> Result<Option<ToolConstraint>, String> {
+    if !names_template(names) {
+        return Ok(None);
+    }
+    match reads(parser, names, &request.model, templates)? {
+        Some(format) => chat_turn(&format, request, prompt),
+        None => Ok(None),
+    }
+}
+
+/// [`turn_constraint`] over `format`: the request's tools and choice, and its `response_format`,
+/// `regex` or `ebnf` as the answer's (the protocol refuses more than one).
+fn chat_turn(
+    format: &Format,
+    request: &ChatCompletionRequest,
+    prompt: &str,
+) -> Result<Option<ToolConstraint>, String> {
+    let declared: Vec<Tool> = request.effective_tools().cloned().collect();
+    let callable = match request.tool_choice {
+        Some(ToolChoice::Value(ToolChoiceValue::None)) => Vec::new(),
+        _ => request.callable_tools(),
+    };
+    let schema = answer_schema(request.response_format.as_ref());
+    let answer = schema
+        .as_ref()
+        .map(OutputAnswer::Json)
+        .or_else(|| request.regex.as_deref().map(OutputAnswer::Regex))
+        .or_else(|| request.ebnf.as_deref().map(OutputAnswer::Ebnf));
+    whole_turn(
+        format,
+        &Turn {
+            prompt,
+            continued: request.continues_final_assistant(),
+            declared: &declared,
+            callable: &callable,
+            choice: output_choice(request.tool_choice.as_ref()),
+            parallel: !request.disables_parallel_tool_calls(),
+            answer,
+        },
+    )
+}
+
+/// [`turn_constraint`] for a Messages request whose tools are `tools` (its chat tools): its
+/// `tool_choice` as a Chat one, one call at most when parallel use is disabled; `continues` says
+/// whether the prompt continues the assistant's message. A Messages request carries no answer
+/// format (an `output_format` is refused before this).
+pub(crate) fn turn_constraint_messages(
+    parser: ParserChoice,
+    names: &Names,
+    request: &CreateMessageRequest,
+    tools: &[Tool],
+    prompt: &str,
+    continues: bool,
+    templates: &Templates,
+) -> Result<Option<ToolConstraint>, String> {
+    if !names_template(names) {
+        return Ok(None);
+    }
+    match reads(parser, names, &request.model, templates)? {
+        Some(format) => messages_turn(&format, request, tools, prompt, continues),
+        None => Ok(None),
+    }
+}
+
+/// [`turn_constraint_messages`] over `format`.
+fn messages_turn(
+    format: &Format,
+    request: &CreateMessageRequest,
+    tools: &[Tool],
+    prompt: &str,
+    continues: bool,
+) -> Result<Option<ToolConstraint>, String> {
+    let choice = request.tool_choice.as_ref().map(ToolChoice::from);
+    let callable = match &choice {
+        Some(ToolChoice::Value(ToolChoiceValue::None)) => Vec::new(),
+        Some(choice) => choice.narrow_tools(tools).unwrap_or_else(|| tools.to_vec()),
+        None => tools.to_vec(),
+    };
+    whole_turn(
+        format,
+        &Turn {
+            prompt,
+            continued: continues,
+            declared: tools,
+            callable: &callable,
+            choice: output_choice(choice.as_ref()),
+            parallel: !request.disables_parallel_tool_use(),
+            answer: None,
+        },
+    )
+}
+
+/// How a tool choice shapes a turn: one call for a named function, one or more where the choice
+/// forces a call, an answer or calls otherwise.
+fn output_choice(choice: Option<&ToolChoice>) -> OutputChoice {
+    match choice {
+        Some(ToolChoice::Function { .. }) => OutputChoice::One,
+        Some(choice) if choice.forces_call() => OutputChoice::Required,
+        _ => OutputChoice::Auto,
+    }
+}
+
+/// `format`'s grammar for `turn` as the engine's structural tag.
+fn whole_turn(format: &Format, turn: &Turn<'_>) -> Result<Option<ToolConstraint>, String> {
+    Ok(format
+        .turn_grammar(turn)?
+        .map(|grammar| ToolConstraint::StructuralTag(grammar.payload_text())))
+}
+
 /// Symphony's assignment to a response: the table that reads it, as the request's asks make it
 /// ([`assign`]), and the part of the rendered prompt the engine replays.
 #[derive(Clone, Debug)]
@@ -542,10 +762,11 @@ fn assignment(
     Some(Assignment { format, prompt })
 }
 
-/// The table as the request's asks make it: without its calls when the request declares no tools
-/// or asks for none, as the legacy path runs no tool parser then, and a table that reads calls
-/// from the output's first byte (`json`, `xlam`) is content from it; without its thought when the
-/// request keeps the reasoning in the content, as the legacy path runs no reasoning parser then.
+/// The table as the request's asks make it: without its calls when the legacy path would run no
+/// tool parser (the request asks for none, or its response is not scanned for calls:
+/// [`scans_for_tool_calls`]), so a table that reads calls from the output's first byte (`json`,
+/// `xlam`) is content from it; without its thought when the request keeps the reasoning in the
+/// content, as the legacy path runs no reasoning parser then.
 fn asked(format: Format, no_calls: bool, no_reasoning: bool) -> Format {
     let format = if no_calls {
         format.without_calls()
@@ -560,8 +781,11 @@ fn asked(format: Format, no_calls: bool, no_reasoning: bool) -> Format {
 }
 
 /// Symphony's assignment to a chat `request`, if a table reads the response ([`reads`]) and the
-/// constraint is not a JSON schema ([`assignment`]): the table without its calls for no tools or
-/// a `tool_choice` of `none`, without its thought for `separate_reasoning: false` ([`asked`]).
+/// constraint is not a JSON schema ([`assignment`]): the table without its calls for a
+/// `tool_choice` of `none` or a response the legacy path would not scan for calls (no tools
+/// declared anywhere, for a provider that reads calls only with them: [`scans_for_tool_calls`]),
+/// without its thought for `separate_reasoning: false` ([`asked`]). A call the conversation
+/// established without a tool inventory comes back as a call under either parser.
 pub(crate) fn assign(
     parser: ParserChoice,
     names: &Names,
@@ -574,13 +798,14 @@ pub(crate) fn assign(
     let no_calls = matches!(
         request.tool_choice,
         Some(ToolChoice::Value(ToolChoiceValue::None))
-    ) || request.effective_tools().next().is_none();
+    ) || !scans_for_tool_calls(request);
     let format = format.map(|format| asked(format, no_calls, !request.separate_reasoning));
     Ok(assignment(format, &request.model, constraint, prompt))
 }
 
 /// [`assign`] for a Messages request: its thinking blocks are always its own, so only the
-/// calls' ask takes a variant.
+/// calls' ask takes a variant; the legacy path runs its tool parser for a Messages request that
+/// declares tools, an empty list included, and for no other, so the calls stay exactly then.
 pub(crate) fn assign_messages(
     parser: ParserChoice,
     names: &Names,
@@ -590,8 +815,8 @@ pub(crate) fn assign_messages(
     templates: &Templates,
 ) -> Result<Option<Assignment>, String> {
     let format = reads(parser, names, &request.model, templates)?;
-    let no_calls = matches!(request.tool_choice, Some(MessagesToolChoice::None))
-        || request.tools.as_deref().is_none_or(<[_]>::is_empty);
+    let no_calls =
+        matches!(request.tool_choice, Some(MessagesToolChoice::None)) || request.tools.is_none();
     let format = format.map(|format| asked(format, no_calls, false));
     Ok(assignment(format, &request.model, constraint, prompt))
 }
@@ -844,6 +1069,7 @@ mod tests {
     use llm_tokenizer::registry::TokenizerRegistry;
     use serde_json::{json, Value};
     use symphony::{formats::qwen3, CallSyntax};
+    use tool_parser::GrammarStart;
 
     use super::*;
 
@@ -876,6 +1102,13 @@ mod tests {
     /// No tokenizer registered: the response template's table is never there.
     fn templates() -> Templates {
         Templates::new(Arc::new(TokenizerRegistry::new()))
+    }
+
+    /// [`super::check_names`] against the legacy registries as the gateway builds them.
+    fn check(parser: ParserChoice, names: &Names) -> Result<(), String> {
+        let tools = tool_parser::ParserFactory::new();
+        let reasoning = reasoning_parser::ParserFactory::new();
+        check_names(parser, names, Some(&tools), Some(&reasoning))
     }
 
     /// [`super::assign`] with no templates: the names never say `hf`, so nothing is refused.
@@ -938,6 +1171,20 @@ mod tests {
             Some(Table::MinimaxM2)
         );
         assert_eq!(named_table(&names(None, Some("deepseek_r1"))), None);
+        // A launcher's name for a family whose table has no older parser reads with the table:
+        // in both flags, in the reasoning flag alone, or as the tool-call name beside another.
+        assert_eq!(
+            named_table(&names(Some("muse"), Some("muse"))),
+            Some(Table::MuseSpark)
+        );
+        assert_eq!(
+            named_table(&names(None, Some("muse"))),
+            Some(Table::MuseSpark)
+        );
+        assert_eq!(
+            named_table(&names(Some("muse"), Some("passthrough"))),
+            Some(Table::MuseSpark)
+        );
         // The tool-call name decides; a legacy name with no alias selects none.
         assert_eq!(
             named_table(&names(Some("kimi_k3"), Some("qwen3"))),
@@ -960,15 +1207,46 @@ mod tests {
     }
 
     #[test]
-    fn every_name_a_table_answers_to_besides_its_own_is_a_legacy_parsers() {
+    fn every_name_a_table_answers_to_besides_its_own_is_a_legacy_parsers_or_a_launchers() {
         let tools = tool_parser::ParserFactory::new();
         let reasoning = reasoning_parser::ParserFactory::new();
-        for (alias, _) in Table::ALIASES {
-            assert!(
-                tools.has_parser(alias) || reasoning.registry().has_parser(alias),
-                "{alias} is no legacy parser's name"
+        let symphony = ParserChoice::Symphony;
+        let mut launchers = Vec::new();
+        for (alias, table) in Table::ALIASES {
+            if tools.has_parser(alias) || reasoning.registry().has_parser(alias) {
+                // A legacy parser's name is checked as the legacy name it is
+                // (`names_are_checked_against_both_registries_by_the_parser_in_force`).
+                continue;
+            }
+            // A launcher's name for a family whose table has no older parser passes under
+            // Symphony in both flags, in either alone, and beside the table's own name.
+            launchers.push(alias);
+            let doubled = names(Some(alias), Some(alias));
+            assert_eq!(named_table(&doubled), Some(table), "{alias}");
+            assert_eq!(check(symphony, &doubled), Ok(()), "{alias}");
+            assert_eq!(
+                check(symphony, &names(Some(alias), None)),
+                Ok(()),
+                "{alias}"
+            );
+            assert_eq!(
+                check(symphony, &names(None, Some(alias))),
+                Ok(()),
+                "{alias}"
+            );
+            let own = table.name();
+            assert_eq!(
+                check(symphony, &names(Some(alias), Some(own))),
+                Ok(()),
+                "{alias}"
+            );
+            assert_eq!(
+                check(symphony, &names(Some(own), Some(alias))),
+                Ok(()),
+                "{alias}"
             );
         }
+        assert_eq!(launchers, ["muse"]);
     }
 
     #[test]
@@ -1131,57 +1409,102 @@ mod tests {
     fn names_are_checked_against_both_registries_by_the_parser_in_force() {
         let legacy = ParserChoice::Legacy;
         let symphony = ParserChoice::Symphony;
-        assert_eq!(check_names(legacy, &Names::default(), true, true), Ok(()));
-        assert_eq!(
-            check_names(legacy, &names(Some("qwen"), Some("qwen3")), true, true),
-            Ok(())
-        );
-        let why = check_names(legacy, &names(Some("nonsense"), None), false, true);
+        assert_eq!(check(legacy, &Names::default()), Ok(()));
+        assert_eq!(check(legacy, &names(Some("qwen"), Some("qwen3"))), Ok(()));
+        let why = check(legacy, &names(Some("nonsense"), None));
         assert_eq!(
             why.expect_err("unknown"),
             "unknown tool-call parser 'nonsense'"
         );
-        let why = check_names(legacy, &names(None, Some("ling")), true, false);
+        let why = check(legacy, &names(None, Some("ling")));
         assert_eq!(
             why.expect_err("a table under legacy"),
-            "unknown reasoning parser 'ling': a Symphony table's name, which --parser symphony \
+            "unknown reasoning parser 'ling': the Symphony table 'ling', which --parser symphony \
              reads with"
         );
         // Under Symphony a table's name passes alone or doubled, and binds the other name.
+        assert_eq!(check(symphony, &names(Some("ling"), None)), Ok(()));
+        assert_eq!(check(symphony, &names(Some("ling"), Some("LING"))), Ok(()));
+        // Legacy names pass as the legacy names they are, one a table's own name as well.
         assert_eq!(
-            check_names(symphony, &names(Some("ling"), None), false, true),
+            check(symphony, &names(Some("qwen"), Some("kimi_k3"))),
             Ok(())
         );
-        assert_eq!(
-            check_names(symphony, &names(Some("ling"), Some("LING")), false, false),
-            Ok(())
-        );
-        assert_eq!(
-            check_names(symphony, &names(Some("kimi_k3"), Some("qwen3")), true, true),
-            Ok(())
-        );
-        let why = check_names(symphony, &names(Some("ling"), Some("qwen3")), false, true);
+        let why = check(symphony, &names(Some("ling"), Some("qwen3")));
         assert_eq!(
             why.expect_err("bound to the table"),
-            "tool-call parser 'ling' is a Symphony table's name and no legacy parser's, so the \
-             other parser must name the same table or nothing, not 'qwen3'"
+            "tool-call parser 'ling' selects the Symphony table 'ling' and is no legacy parser's \
+             name, so the other parser must name the same table or nothing, not 'qwen3'"
         );
-        let why = check_names(symphony, &names(None, Some("nonsense")), true, false);
+        let why = check(symphony, &names(None, Some("nonsense")));
         assert_eq!(
             why.expect_err("unknown"),
             "unknown reasoning parser 'nonsense': neither a legacy parser nor a Symphony table"
         );
         // A legacy name a table answers to is checked as the legacy name it is: a tool parser's
         // given as the reasoning parser is unknown there, under either parser.
-        let why = check_names(symphony, &names(None, Some("qwen_xml")), true, false);
+        let why = check(symphony, &names(None, Some("qwen_xml")));
         assert_eq!(
             why.expect_err("wrong kind"),
             "unknown reasoning parser 'qwen_xml': neither a legacy parser nor a Symphony table"
         );
-        let why = check_names(legacy, &names(None, Some("qwen_xml")), true, false);
+        let why = check(legacy, &names(None, Some("qwen_xml")));
         assert_eq!(
             why.expect_err("wrong kind"),
             "unknown reasoning parser 'qwen_xml'"
+        );
+        // The legacy registries spell their names one way: a legacy parser's name in another
+        // case or with spaces around it is no legacy parser's, and selects no table either
+        // (a table's own name, which reads in any case, excepted).
+        let why = check(symphony, &names(Some("QWEN_XML"), None));
+        assert_eq!(
+            why.expect_err("not as spelled"),
+            "unknown tool-call parser 'QWEN_XML': neither a legacy parser nor a Symphony table"
+        );
+        let why = check(symphony, &names(None, Some(" hy_v4 ")));
+        assert_eq!(
+            why.expect_err("not as spelled"),
+            "unknown reasoning parser ' hy_v4 ': neither a legacy parser nor a Symphony table"
+        );
+        // A launcher's name for a family whose table has no older parser (`muse`) passes in
+        // either flag and binds the other name as the table's own name does; under `legacy` it
+        // is unknown, as the table's own name is.
+        assert_eq!(check(symphony, &names(Some("muse"), Some("muse"))), Ok(()));
+        assert_eq!(
+            check(symphony, &names(Some("MUSE"), Some("muse_spark"))),
+            Ok(())
+        );
+        assert_eq!(
+            check(symphony, &names(Some("muse_spark"), Some("muse"))),
+            Ok(())
+        );
+        let why = check(symphony, &names(Some("muse"), Some("qwen3")));
+        assert_eq!(
+            why.expect_err("bound to the table"),
+            "tool-call parser 'muse' selects the Symphony table 'muse_spark' and is no legacy \
+             parser's name, so the other parser must name the same table or nothing, not 'qwen3'"
+        );
+        let why = check(symphony, &names(Some("muse"), Some("passthrough")));
+        assert_eq!(
+            why.expect_err("bound to the table"),
+            "tool-call parser 'muse' selects the Symphony table 'muse_spark' and is no legacy \
+             parser's name, so the other parser must name the same table or nothing, not \
+             'passthrough'"
+        );
+        let why = check(legacy, &names(None, Some("muse")));
+        assert_eq!(
+            why.expect_err("a table under legacy"),
+            "unknown reasoning parser 'muse': the Symphony table 'muse_spark', which --parser \
+             symphony reads with"
+        );
+        // A registry that is absent checks nothing, as before.
+        assert_eq!(
+            check_names(symphony, &names(Some("nonsense"), Some("muse")), None, None),
+            Ok(())
+        );
+        assert_eq!(
+            check_names(legacy, &names(Some("muse"), Some("nonsense")), None, None),
+            Ok(())
         );
     }
 
@@ -1286,6 +1609,93 @@ mod tests {
         assert_eq!(assigned(&both), table(&both));
     }
 
+    /// The conversation of a retry: the user asked for `list_skills`, the assistant called it,
+    /// the tool was unavailable, the user asks again.
+    fn retry_messages() -> Value {
+        json!([
+            {"role": "user", "content": "Call the `list_skills` tool once to see what we can do, \
+                                         and reply with nothing else."},
+            {"role": "assistant", "content": null, "tool_calls": [{
+                "id": "call_0", "type": "function",
+                "function": {"name": "list_skills", "arguments": "{}"}
+            }]},
+            {"role": "tool", "tool_call_id": "call_0",
+             "content": "`list_skills` is unavailable for now; call it again later."},
+            {"role": "user", "content": "The cooldown is over. Try again."}
+        ])
+    }
+
+    #[test]
+    fn the_calls_stay_wherever_the_legacy_path_runs_a_tool_parser() {
+        // The legacy path scans a response for calls when the request declares tools, an empty
+        // list included, or when the model's provider reads calls without any; the table keeps
+        // its calls exactly then, so a call the conversation established comes back as a call
+        // under either parser, and a `tool_choice` of `none` drops them under either.
+        let table = |request: &ChatCompletionRequest| {
+            reads(
+                ParserChoice::Symphony,
+                &Names::default(),
+                &request.model,
+                &templates(),
+            )
+            .expect("read")
+            .expect("a table")
+        };
+        let assigned = |request: &ChatCompletionRequest| {
+            assign(
+                ParserChoice::Symphony,
+                &Names::default(),
+                request,
+                None,
+                PROMPT,
+            )
+            .expect("assigned")
+            .format
+        };
+        let retry = request(json!({"model": "MiniMax-M3", "messages": retry_messages()}));
+        assert!(scans_for_tool_calls(&retry));
+        assert_eq!(
+            assigned(&retry),
+            table(&retry),
+            "the provider reads calls without tools"
+        );
+        let refused = request(json!({
+            "model": "MiniMax-M3", "messages": retry_messages(), "tool_choice": "none"
+        }));
+        assert_eq!(assigned(&refused), table(&refused).without_calls());
+        let declared_none = request(json!({"tools": []}));
+        assert!(scans_for_tool_calls(&declared_none));
+        assert_eq!(
+            assigned(&declared_none),
+            table(&declared_none),
+            "an empty list is a declaration"
+        );
+        let undeclared = request(json!({"messages": retry_messages()}));
+        assert!(!scans_for_tool_calls(&undeclared));
+        assert_eq!(
+            assigned(&undeclared),
+            table(&undeclared).without_calls(),
+            "a provider that reads calls only with tools"
+        );
+        // A Messages request: declared tools, an empty list included, keep the calls; none
+        // declared drops them, as the legacy path runs its tool parser on `tools` alone.
+        let messages = |extra: Value| {
+            assign_messages(
+                ParserChoice::Symphony,
+                &Names::default(),
+                &message_request(extra),
+                None,
+                PROMPT,
+                &templates(),
+            )
+            .expect("read")
+            .expect("assigned")
+            .format
+        };
+        assert!(messages(json!({"tools": []})).call_syntax().is_some());
+        assert_eq!(messages(json!({})).call_syntax(), None);
+    }
+
     #[test]
     fn a_known_model_is_assigned_its_table_and_the_prompts_replay() {
         let assignment = assign(
@@ -1364,15 +1774,17 @@ mod tests {
         .is_none());
     }
 
-    /// A JSON `response_format` takes the table's answer tag whatever names select the table. The
-    /// engine's own schema constraint writes bare JSON from the turn's own state, which a table
-    /// whose answer is a message (Muse Spark's, Kimi K3's, Inkling's) drops as framing, so the
-    /// content came back empty; the tag writes the answer where the table reads one. Where the
-    /// output starts in content the tag is the schema alone, after the thought's prefix when the
-    /// prompt leaves the thought open. A table with no answer state, and a prompt that continues
-    /// the assistant's message, leave the engine's schema as before.
+    /// A JSON `response_format` takes the table's answer tag whatever names select the table,
+    /// unless the tag is the schema alone, the engine's own constraint, which the engine keeps as
+    /// before. A table whose answer is written inside a message (Muse Spark's, Kimi K3's,
+    /// Inkling's) takes its tag: the engine's schema writes bare JSON from the turn's own state,
+    /// which such a table drops as framing, so the content came back empty. A table whose output
+    /// starts in content takes the tag with the thought's close before the schema when the prompt
+    /// leaves the thought open, and with the thought the model may write first where its table
+    /// admits one (MiniMax M3's); a table with no answer state and a prompt that continues the
+    /// assistant's message keep the engine's schema.
     #[test]
-    fn a_json_response_format_takes_the_tables_answer_tag_for_every_table() {
+    fn a_json_response_format_takes_the_tables_answer_tag_unless_it_is_the_schema_alone() {
         let schema = json!({
             "type": "object",
             "properties": {
@@ -1427,6 +1839,11 @@ mod tests {
         // With the prompt inside the thought, the tag closes it before the message.
         let open = tag_of(answer(&muse, any_object.clone(), true));
         assert_ne!(open, tag, "{open}");
+        let begin = open["format"]["begin"].as_str().unwrap_or_default();
+        assert!(
+            begin.ends_with(" to=user<|message|>") && begin.len() > " to=user<|message|>".len(),
+            "{open}"
+        );
         // The registry's tables whose answer is a message take theirs too.
         for model in ["moonshotai/Kimi-K3", "thinkingmachines/Inkling"] {
             let tag = tag_of(answer(
@@ -1440,31 +1857,41 @@ mod tests {
                 "{model}: {tag}"
             );
         }
-        // A table whose output starts in content (the registry's Qwen3 table) writes the schema
-        // alone: the engine's own constraint, as a tag.
-        let alone = tag_of(answer(
-            &Names::default(),
-            json!({"response_format": {"type": "json_object"}}),
-            false,
-        ));
-        assert_eq!(
-            alone,
-            json!({"format": {"type": "json_schema", "json_schema": {"type": "object"}}}),
-            "{alone}"
-        );
-        // With the prompt inside the thought, the schema follows the prefix a forced call takes:
-        // free text that closes the thought.
-        let led = tag_of(answer(
-            &Names::default(),
-            json!({"response_format": {"type": "json_object"}}),
-            true,
-        ));
+        // A table whose output starts in content (the registry's Qwen3 table) has the schema
+        // alone for its tag with the thought closed: the engine's own constraint, which stands.
+        let content_first = json!({"response_format": {"type": "json_object"}});
+        assert!(answer(&Names::default(), content_first.clone(), false)
+            .expect("read")
+            .is_none());
+        // With the prompt inside the thought, the schema follows the prefix a forced call takes,
+        // free text that closes the thought, so the JSON is not written inside it.
+        let led = tag_of(answer(&Names::default(), content_first, true));
         assert_eq!(led["format"]["type"], "sequence", "{led}");
         assert_eq!(led["format"]["elements"][0]["type"], "any_text", "{led}");
         assert_eq!(
             led["format"]["elements"][1],
             json!({"type": "json_schema", "json_schema": {"type": "object"}}),
             "{led}"
+        );
+        // A table that admits a thought before its answer (MiniMax M3's) keeps that tag with the
+        // thought closed: the thought the model may write first, then the schema.
+        let thought_first = tag_of(answer(
+            &Names::default(),
+            json!({"model": "MiniMaxAI/MiniMax-M3", "response_format": {"type": "json_object"}}),
+            false,
+        ));
+        assert_eq!(
+            thought_first["format"]["type"], "sequence",
+            "{thought_first}"
+        );
+        assert_eq!(
+            thought_first["format"]["elements"][0]["type"], "optional",
+            "{thought_first}"
+        );
+        assert_eq!(
+            thought_first["format"]["elements"][1],
+            json!({"type": "json_schema", "json_schema": {"type": "object"}}),
+            "{thought_first}"
         );
         // No answer state (xLAM's list), a continued assistant message, or no JSON asked: the
         // engine's schema, or nothing.
@@ -1807,31 +2234,22 @@ mod tests {
     #[test]
     fn hf_is_a_name_under_symphony_alone_and_binds_the_other_name() {
         let symphony = ParserChoice::Symphony;
-        assert_eq!(
-            check_names(symphony, &names(Some("hf"), None), false, false),
-            Ok(())
-        );
-        assert_eq!(
-            check_names(symphony, &names(None, Some("hf")), false, false),
-            Ok(())
-        );
-        assert_eq!(
-            check_names(symphony, &names(Some("HF"), Some(" hf ")), false, false),
-            Ok(())
-        );
-        let why = check_names(symphony, &names(Some("hf"), Some("qwen3")), false, true);
+        assert_eq!(check(symphony, &names(Some("hf"), None)), Ok(()));
+        assert_eq!(check(symphony, &names(None, Some("hf"))), Ok(()));
+        assert_eq!(check(symphony, &names(Some("HF"), Some(" hf "))), Ok(()));
+        let why = check(symphony, &names(Some("hf"), Some("qwen3")));
         assert_eq!(
             why.expect_err("bound"),
             "tool-call parser 'hf' reads with the model's response template, so the other \
              parser must name 'hf' or nothing, not 'qwen3'"
         );
-        let why = check_names(symphony, &names(Some("qwen"), Some("hf")), true, false);
+        let why = check(symphony, &names(Some("qwen"), Some("hf")));
         assert_eq!(
             why.expect_err("bound"),
             "reasoning parser 'hf' reads with the model's response template, so the other \
              parser must name 'hf' or nothing, not 'qwen'"
         );
-        let why = check_names(ParserChoice::Legacy, &names(Some("hf"), None), false, true);
+        let why = check(ParserChoice::Legacy, &names(Some("hf"), None));
         assert_eq!(
             why.expect_err("legacy"),
             "unknown tool-call parser 'hf': the model's response template, which --parser \
@@ -1890,18 +2308,21 @@ mod tests {
             json!({"response_format": {"type": "json_object"}}),
         ));
         assert_eq!(answer["format"]["type"], "json_schema", "{answer}");
-        // The registry's table for the model answers the same: its content opens with no marker,
-        // so its tag is the schema alone.
         let plain = names(None, None);
-        let answer = tag_of(super::constraint(
-            ParserChoice::Symphony,
-            &plain,
-            &request(json!({"response_format": {"type": "json_object"}})),
-            &tools(),
-            false,
-            &templates(),
-        ));
-        assert_eq!(answer["format"]["type"], "json_schema", "{answer}");
+        assert!(
+            super::constraint(
+                ParserChoice::Symphony,
+                &plain,
+                &request(json!({"response_format": {"type": "json_object"}})),
+                &tools(),
+                false,
+                &templates(),
+            )
+            .expect("read")
+            .is_none(),
+            "the Qwen3 table's answer tag is the schema alone, the engine's own constraint, so the \
+             older registry's JSON schema stands"
+        );
         // A regex or ebnf constraint would apply outside the template's format.
         let why = constrain(
             &with_layout,
@@ -2140,5 +2561,383 @@ mod tests {
             panic!("a finish");
         };
         assert_eq!(*reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn the_selected_workers_policy_decides_once() {
+        use ConstrainedDecoding::{Always, Requested};
+        use GrammarStart::{AfterReasoning, FirstToken, Unknown};
+
+        let tag = |text: &str| ToolConstraint::StructuralTag(text.to_string());
+        let refused = |why: &str| Err::<Option<ToolConstraint>, String>(why.to_string());
+        // What one decision gives (the tag's text, and whether it is the whole turn's), and which
+        // of the whole turn's grammar and the `auto` tag it built.
+        let decide = |policy, start, prepared: PreparedConstraint, turn: PreparedConstraint| {
+            let built = std::cell::RefCell::new(Vec::new());
+            let decided = worker_constraint(
+                WorkerDecoding { policy, start },
+                prepared,
+                || {
+                    built.borrow_mut().push("turn");
+                    turn
+                },
+                || {
+                    built.borrow_mut().push("auto");
+                    Ok(Some(tag("auto")))
+                },
+            )
+            .map(|decided| {
+                let text = decided.constraint.map(|constraint| constraint.to_tuple().1);
+                (text, decided.whole_turn, decided.by_policy)
+            });
+            (decided, built.into_inner())
+        };
+        // The `auto` tag is the policy's choice; what preparation found is the request's.
+        let found = |text: &str| Ok((Some(text.to_string()), false, text == "auto"));
+
+        // `requested`: what preparation found, its refusal included; nothing else is built.
+        for start in [FirstToken, AfterReasoning, Unknown] {
+            assert_eq!(
+                decide(
+                    Requested,
+                    start,
+                    Ok(Some(tag("prepared"))),
+                    Ok(Some(tag("turn")))
+                ),
+                (found("prepared"), vec![])
+            );
+            assert_eq!(
+                decide(Requested, start, refused("no tag"), Ok(Some(tag("turn")))),
+                (Err("no tag".to_string()), vec![])
+            );
+            assert_eq!(
+                decide(Requested, start, Ok(None), Ok(Some(tag("turn")))),
+                (Ok((None, false, false)), vec![])
+            );
+        }
+        // `always` from the first token: the whole turn's grammar stands over what preparation
+        // found or refused, and its refusal refuses the request.
+        assert_eq!(
+            decide(Always, FirstToken, refused("no tag"), Ok(Some(tag("turn")))),
+            (Ok((Some("turn".to_string()), true, true)), vec!["turn"])
+        );
+        assert_eq!(
+            decide(Always, FirstToken, Ok(None), refused("cannot hold")),
+            (Err("cannot hold".to_string()), vec!["turn"])
+        );
+        // Where the whole turn's grammar does not start, and on an engine that starts the grammar
+        // later or does not say: what preparation found or refused, else the `auto` tag.
+        assert_eq!(
+            decide(Always, FirstToken, Ok(Some(tag("prepared"))), Ok(None)),
+            (found("prepared"), vec!["turn"])
+        );
+        assert_eq!(
+            decide(Always, FirstToken, refused("no tag"), Ok(None)),
+            (Err("no tag".to_string()), vec!["turn"])
+        );
+        assert_eq!(
+            decide(Always, FirstToken, Ok(None), Ok(None)),
+            (found("auto"), vec!["turn", "auto"])
+        );
+        for start in [AfterReasoning, Unknown] {
+            assert_eq!(
+                decide(Always, start, refused("no tag"), Ok(Some(tag("turn")))),
+                (Err("no tag".to_string()), vec![])
+            );
+            assert_eq!(
+                decide(
+                    Always,
+                    start,
+                    Ok(Some(tag("prepared"))),
+                    Ok(Some(tag("turn")))
+                ),
+                (found("prepared"), vec![])
+            );
+            assert_eq!(
+                decide(Always, start, Ok(None), Ok(Some(tag("turn")))),
+                (found("auto"), vec!["auto"])
+            );
+        }
+        // Where the table gives no `auto` tag, the policy chose nothing.
+        let nothing = worker_constraint(
+            WorkerDecoding {
+                policy: Always,
+                start: AfterReasoning,
+            },
+            Ok(None),
+            || Ok(None),
+            || Ok(None),
+        )
+        .unwrap();
+        assert!(nothing.constraint.is_none() && !nothing.by_policy);
+    }
+
+    /// A table whose calls spell a whole turn: a call's header names the tool, its parameters
+    /// are tags around raw text, and a row out of a call goes on to the next or stops.
+    fn turn_table() -> Format {
+        let source = json!({
+          "start_anchor_pattern": "<\\|head\\|>assistant",
+          "fields": {
+            "thinking": {"open": "<|via|>notes<|body|>", "close": "<|stop|><|head|>assistant",
+                         "content": "text"},
+            "content": {"open": "<|via|>reply<|body|>", "close": ["<|done|>", "<|stop|>", "<eos>"],
+                        "content": "text"},
+            "tool_calls": {
+              "open_pattern": " to=(?P<name>[^\\s<]+)<\\|via\\|>notes <\\|as\\|>xml<\\|body\\|>",
+              "close": ["<|stop|><|head|>assistant", "<eos>"], "repeats": true,
+              "content": "xml-inline",
+              "content_args": {
+                "tag_pattern":
+                  "<arg name=\"(?P<key>[^\"]+)\">\\n(?P<value>.*?)\\n(?:</arg>|(?=<arg name=\"))",
+                "value_parser": {"name": "text", "args": {"strip": false}}
+              },
+              "transform": {"type": "function",
+                            "function": {"name": "{name}", "arguments": "{content}"}}
+            }
+          }
+        });
+        let template = smg_response_template::load_response_template(&source).expect("template");
+        smg_response_template::to_symphony::compile(&template, &["<|done|>", "<eos>"])
+            .expect("compiled")
+            .format
+    }
+
+    fn weather() -> Value {
+        json!([{"type": "function", "function": {"name": "get_weather", "parameters": {
+            "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}])
+    }
+
+    /// The format of the whole turn's grammar a chat request takes over [`turn_table`], the prompt
+    /// ending at the turn's opener, then at `continued` when the request continues an assistant
+    /// message; the error is the refusal.
+    fn turn(mut extra: Value, continued: Option<&str>) -> Result<Option<Value>, String> {
+        if continued.is_some() {
+            extra["continue_final_message"] = json!(true);
+            extra["messages"] = json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "partial"}
+            ]);
+        }
+        let prompt = format!("user<|head|>assistant{}", continued.unwrap_or(""));
+        let constraint = chat_turn(&turn_table(), &request(extra), &prompt)?;
+        Ok(constraint.map(|constraint| tag_of(Ok(Some(constraint)))["format"].clone()))
+    }
+
+    fn whole(extra: Value, continued: Option<&str>) -> Value {
+        turn(extra, continued).expect("held").expect("a grammar")
+    }
+
+    /// The part of a turn's format after its thought: the answer, the calls, or either.
+    fn after_thought(format: &Value) -> &Value {
+        &format["elements"][1]
+    }
+
+    #[test]
+    fn the_whole_turn_holds_the_answer_and_the_calls() {
+        let free = whole(json!({}), None);
+        assert_eq!(
+            after_thought(&free)["elements"][1],
+            json!({"type": "any_text", "excludes": ["<|done|>", "<|stop|>"]})
+        );
+        assert_eq!(
+            after_thought(&whole(json!({"tools": weather()}), None))["type"],
+            "or"
+        );
+        let required = whole(json!({"tools": weather(), "tool_choice": "required"}), None);
+        assert_eq!(after_thought(&required)["type"], "sequence");
+        let json_answer = whole(json!({"response_format": {"type": "json_object"}}), None);
+        assert_eq!(
+            after_thought(&json_answer)["elements"][1],
+            json!({"type": "json_schema", "json_schema": {"type": "object"}})
+        );
+        let regex = whole(json!({"regex": "(yes|no)"}), None);
+        assert_eq!(
+            after_thought(&regex)["elements"][1],
+            json!({"type": "regex", "pattern": "(yes|no)"})
+        );
+        let ebnf = whole(json!({"ebnf": "root ::= \"y\""}), None);
+        assert_eq!(after_thought(&ebnf)["elements"][1]["type"], "grammar");
+        // A forced call writes no answer, so it leaves the answer's format out, Lark's included.
+        assert_eq!(
+            turn(
+                json!({"tools": weather(), "tool_choice": "required", "ebnf": "start: \"y\""}),
+                None
+            ),
+            Ok(Some(required))
+        );
+    }
+
+    #[test]
+    fn the_prompt_says_where_the_turn_starts() {
+        let thinking = whole(json!({}), Some("<|via|>notes<|body|>Let me"));
+        assert_eq!(thinking["elements"][0]["begin"], "");
+        let after = whole(
+            json!({}),
+            Some("<|via|>notes<|body|>Plan.<|stop|><|head|>assistant"),
+        );
+        assert_eq!(after["elements"][0]["value"], "<|via|>reply<|body|>");
+
+        // Inside an answer: the rest of a free one; a forced call or an answer's format starts
+        // no grammar there, and the table's tags decide (`worker_constraint`).
+        let answering = Some("<|via|>reply<|body|>The answer");
+        assert_eq!(
+            whole(json!({}), answering)["elements"][0]["type"],
+            "any_text"
+        );
+        for extra in [
+            json!({"tools": weather(), "tool_choice": "required"}),
+            json!({"tools": weather(), "tool_choice": {"type": "allowed_tools",
+                "mode": "required", "tools": [{"type": "function", "name": "get_weather"}]}}),
+            json!({"response_format": {"type": "json_object"}}),
+        ] {
+            assert_eq!(turn(extra, answering), Ok(None));
+        }
+        // Past text no field holds, no grammar starts.
+        assert_eq!(turn(json!({"tools": weather()}), Some("Hello")), Ok(None));
+        // Inside a call: the rest of it is free.
+        let calling = " to=get_weather<|via|>notes <|as|>xml<|body|><arg name=\"city\">\nPa";
+        assert_eq!(
+            whole(json!({"tools": weather()}), Some(calling))["elements"][0]["type"],
+            "any_text"
+        );
+    }
+
+    #[test]
+    fn the_whole_turn_refuses_what_it_cannot_hold() {
+        let refused = |extra: Value| turn(extra, None).is_err();
+        let served = |extra: Value| turn(extra, None).expect("held").is_some();
+        let named = |name: &str| {
+            json!([{"type": "function", "function": {"name": name, "parameters": {
+                "type": "object", "properties": {"city": {"type": "string"}}}}}])
+        };
+        // A name a call cannot carry, whatever the choice.
+        for choice in [json!("auto"), json!("none"), json!("required")] {
+            assert!(refused(
+                json!({"tools": named("get weather"), "tool_choice": choice})
+            ));
+        }
+        let key = json!([{"type": "function", "function": {"name": "f", "parameters": {
+            "type": "object", "properties": {"say \"hi\"": {"type": "string"}}}}}]);
+        assert!(refused(json!({"tools": key})));
+
+        // A strict tool whose calls the grammar would hold more loosely, while it is callable.
+        let tuple = |strict: bool| {
+            json!([{"type": "function", "function": {"name": "f", "strict": strict,
+                "parameters": {"type": "object", "properties": {"p": {"type": "tuple"}},
+                    "required": ["p"]}}}])
+        };
+        assert!(refused(json!({"tools": tuple(true)})));
+        assert!(served(json!({"tools": tuple(false)})));
+        assert!(served(json!({"tools": tuple(true), "tool_choice": "none"})));
+
+        // Under `auto`, a strict tool or one call at most beside the request's own grammar; and
+        // an ebnf in Lark's syntax.
+        let strict = json!([{"type": "function", "function": {"name": "f", "strict": true,
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]);
+        for extra in [
+            json!({"tools": strict, "regex": "(a|b)"}),
+            json!({"tools": strict, "ebnf": "root ::= \"y\""}),
+            json!({"tools": weather(), "parallel_tool_calls": false, "regex": "(a|b)"}),
+            json!({"ebnf": "start: \"y\""}),
+            json!({"tools": weather(), "ebnf": "start: \"y\""}),
+        ] {
+            assert!(refused(extra.clone()), "{extra}");
+        }
+        for extra in [
+            json!({"tools": strict}),
+            json!({"tools": strict, "response_format": {"type": "json_object"}}),
+            json!({"tools": strict, "tool_choice": "required", "regex": "(a|b)"}),
+            json!({"tools": weather(), "regex": "(a|b)"}),
+            json!({"tools": weather(), "parallel_tool_calls": false}),
+            json!({"regex": "(a|b)", "parallel_tool_calls": false}),
+        ] {
+            assert!(served(extra.clone()), "{extra}");
+        }
+        let why = turn(json!({"ebnf": "start: \"y\""}), None).expect_err("refused");
+        assert!(why.contains("Lark"), "{why}");
+    }
+
+    #[test]
+    fn over_its_limits_the_whole_turn_leaves_the_tags_to_decide() {
+        let properties: serde_json::Map<String, Value> = (0
+            ..=symphony::OutputSpelling::MAX_TOOL_PARAMETERS)
+            .map(|i| (format!("p{i}"), json!({"type": "string"})))
+            .collect();
+        let wide = json!([{"type": "function", "function": {"name": "wide",
+            "parameters": {"type": "object", "properties": properties}}}]);
+        assert_eq!(turn(json!({"tools": wide}), None), Ok(None));
+
+        let huge = "x".repeat(symphony::OutputSpelling::MAX_TAG_BYTES);
+        let large = json!([{"type": "function", "function": {"name": "large",
+        "parameters": {"type": "object", "properties": {
+            "p": {"type": "string", "enum": [huge]}
+        }}}}]);
+        assert_eq!(turn(json!({"tools": large}), None), Ok(None));
+    }
+
+    #[test]
+    fn a_messages_choice_takes_the_turn_its_chat_twin_takes() {
+        let tools = json!([{"name": "get_weather", "input_schema": {
+            "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]);
+        let prompt = "user<|head|>assistant";
+        for (choice, chat) in [
+            (json!({"type": "auto"}), json!({})),
+            (json!({"type": "any"}), json!({"tool_choice": "required"})),
+            (
+                json!({"type": "any", "disable_parallel_tool_use": true}),
+                json!({"tool_choice": "required", "parallel_tool_calls": false}),
+            ),
+            (
+                json!({"type": "tool", "name": "get_weather"}),
+                json!({"tool_choice": {"type": "function", "function": {"name": "get_weather"}}}),
+            ),
+            (json!({"type": "none"}), json!({"tool_choice": "none"})),
+        ] {
+            let messages = message_request(json!({"tools": tools, "tool_choice": choice}));
+            let mut chat = chat;
+            chat["tools"] = weather();
+            let tag = |constraint: Result<Option<ToolConstraint>, String>| {
+                tag_of(constraint)["format"].clone()
+            };
+            assert_eq!(
+                tag(messages_turn(
+                    &turn_table(),
+                    &messages,
+                    &messages.chat_tools(),
+                    prompt,
+                    false
+                )),
+                tag(chat_turn(&turn_table(), &request(chat), prompt)),
+                "{choice}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_response_templates_table_spells_a_whole_turn() {
+        // Any other name, and the legacy parsers, leave the turn to the table's tags without
+        // looking for a template.
+        let request = request(json!({"tools": weather(), "tool_choice": "required"}));
+        for (parser, names) in [
+            (ParserChoice::Symphony, names(Some("qwen"), None)),
+            (ParserChoice::Symphony, names(None, None)),
+            (ParserChoice::Legacy, names(Some("hf"), None)),
+        ] {
+            assert!(matches!(
+                turn_constraint(parser, &names, &request, PROMPT, &templates()),
+                Ok(None)
+            ));
+        }
+        // The template's names ask for the model's own template, and a model without one is
+        // refused, as the table's tags refuse it.
+        let why = turn_constraint(
+            ParserChoice::Symphony,
+            &names(Some("hf"), None),
+            &request,
+            PROMPT,
+            &templates(),
+        )
+        .expect_err("refused");
+        assert_eq!(why, "no tokenizer is registered for model 'Qwen/Qwen3-8B'");
     }
 }

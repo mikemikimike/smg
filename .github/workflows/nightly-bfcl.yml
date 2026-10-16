@@ -11,7 +11,7 @@
 # On PRs that touch this pipeline it runs a quick non-live sanity subset for
 # merge confidence. The A/B mechanics were validated manually on an H100 box
 # (see scripts/bfcl/README.md "Validation status").
-# AMD legs run the H100 legs' models on an AMD Instinct self-hosted runner; until
+# AMD legs run models from the H100 and Blackwell legs on an AMD Instinct self-hosted runner; until
 # one is registered and the repo variable SMG_RUN_AMD_LEGS is "true", only a
 # dispatch that asks for them (`only`, or `hardware: amd`) runs them.
 name: Nightly BFCL
@@ -29,7 +29,7 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash|gpt-oss-amd|qwen3.8-amd); empty = all"
+        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash|gpt-oss-amd|qwen3.8-amd|deepseek-v4.1-amd); empty = all"
         required: false
         default: ""
       hardware:
@@ -151,6 +151,11 @@ jobs:
           amd_runner = os.environ.get("AMD_RUNNER") or "8-gpu-mi300x"
           # vLLM's ROCm image of the CI pin (scripts/ci_install_vllm.sh).
           amd_image = "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+          # vLLM's ROCm nightlies, for the AMD legs whose models need ROCm fixes newer
+          # than the pin, each on the channel its model's vLLM recipe names; all are
+          # main at vllm-project/vllm@3f1bcfd8 (2026-10-15). The AMD legs cannot take
+          # a per-commit wheel (vllm_commit) — those are CUDA builds.
+          amd_nightly_rocm100_image = "vllm/vllm-openai-rocm:nightly-rocm100-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2@sha256:5b69e07038150da74968bf7755176f1ab9f5109f46634c166a91bfa355969549"
           # max_model_len "auto": largest window that fits in GPU memory (capped at
           # native max). A fixed 32768 400'd on multi_turn_long_context (>32k prompts).
           #
@@ -273,6 +278,28 @@ jobs:
                "smg_tool": "qwen_xml", "smg_reason": "qwen3",
                "vllm_extra": "", "gpu_mem": "0.85", "startup_timeout": "900",
                "run_timeout": "18000",
+               "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
+              # DeepSeek-V4.1-Flash with the Blackwell leg's parsers and tokenizer mode,
+              # in the configuration vLLM's recipe marks verified on MI300X
+              # (recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash): TP=4 with the
+              # Engram tables (~183 GiB per arm) in pinned host memory, ~81 GiB of
+              # weights per GPU, so unlike on Blackwell the arms fit half the node each
+              # and run concurrent. gfx942 workarounds from the recipe: piecewise graph
+              # capture segfaults every worker, so breakable CUDA graphs are off and
+              # only full decode graphs are captured; AITER on, MoE on AITER. The
+              # recipe serves from the ROCm 10.0 nightly channel (the AITER mHC path of
+              # vllm-project/vllm#56503); v0.31.0 has none of this.
+              {"name": "deepseek-v4.1-amd", "runner": amd_runner, "vendor": "amd", "tp": 4,
+               "image": amd_nightly_rocm100_image, "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
+               "model": "deepseek-ai/DeepSeek-V4.1-Flash", "bfcl_model": "deepseek-ai/DeepSeek-V4.1-Flash-FC",
+               "vllm_tool": "deepseek_v41", "vllm_reason": "deepseek_v41",
+               "smg_tool": "deepseek_v41", "smg_reason": "deepseek_v41",
+               "vllm_extra": '--tokenizer-mode deepseek_v41 --trust-remote-code --moe-backend aiter --engram-config {"cpu_offload":true} --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY"}',
+               "vllm_env": "VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MOE=1 AITER_TRITON_LOG_LEVEL=ERROR VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_ENGINE_READY_TIMEOUT_S=3600",
+               # 765GB load + first-run kernel JIT, as on the Blackwell leg.
+               "gpu_mem": "0.90", "startup_timeout": "3600",
+               # Per-arm cap: concurrent arms get the job's full budget after startup.
+               "run_timeout": "14400",
                "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
           ]
           only = os.environ.get("ONLY", "")
@@ -404,6 +431,8 @@ jobs:
           BFCL_VLLM_REASONING_PARSER: ${{ github.event.inputs.reasoning_parser || matrix.vllm_reason }}
           BFCL_SMG_REASONING_PARSER: ${{ github.event.inputs.reasoning_parser || matrix.smg_reason }}
           BFCL_VLLM_EXTRA: ${{ matrix.vllm_extra }}
+          # Engine env vars for both arms' vLLM processes (empty for most legs).
+          BFCL_VLLM_ENV: ${{ matrix.vllm_env }}
           BFCL_TP: ${{ matrix.tp }}
           BFCL_MAX_MODEL_LEN: ${{ matrix.max_model_len }}
           BFCL_GPU_MEM_UTIL: ${{ matrix.gpu_mem }}

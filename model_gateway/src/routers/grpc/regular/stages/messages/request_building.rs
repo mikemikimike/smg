@@ -2,7 +2,6 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
-use openai_protocol::worker::ConstrainedDecoding;
 use tracing::error;
 
 use crate::{
@@ -171,16 +170,38 @@ impl BuildStage for MessageRequestBuildingStage {
             .components
             .parser_resolver
             .tool_parser(&messages_request.model);
-        // A worker whose engine takes a grammar on every turn gets the table's
-        // tag for the calls the request allows under `auto`, when the request
-        // asked for no constraint of its own (`regular::symphony::auto_constraint_messages`).
-        // The policy is read once, for the first attempt's worker: the attempt
-        // stamp carries the tag unshaped like a forced call's, so a retry's
-        // worker shapes it again but is not asked for its own policy.
-        let tool_constraints = match tool_constraints {
-            None if utils::constrained_decoding_for(ctx.state.workers.as_ref())
-                == ConstrainedDecoding::Always =>
-            {
+        let names = ctx
+            .components
+            .parser_resolver
+            .names(&messages_request.model);
+        let parser = ctx.state.parser.unwrap_or_default();
+        // What constrains the output is decided here, on the worker selected
+        // for the request (`regular::symphony::worker_constraint`): the whole
+        // turn's grammar on a worker whose engine takes one on every turn from
+        // its first token; else what preparation found, and on a worker that
+        // takes a grammar on every turn the table's tag for the calls the
+        // request allows under `auto`. When the worker's policy chose the
+        // constraint, a retry re-selects only workers that decide alike
+        // (`utils::WorkerDecoding::decides_alike`); what the request asked for
+        // suits any worker. The attempt stamp carries the tag unshaped like a
+        // forced call's, so the retry's worker shapes it for where its engine
+        // starts the grammar.
+        let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
+        let decided = symphony::worker_constraint(
+            decoding,
+            tool_constraints,
+            || {
+                symphony::turn_constraint_messages(
+                    parser,
+                    &names,
+                    &messages_request,
+                    &spec.chat_tools,
+                    &processed_messages.text,
+                    messages_request.continues_final_assistant(),
+                    &ctx.components.templates,
+                )
+            },
+            || {
                 let tools = ctx
                     .tokenizer_arc()
                     .map(|tokenizer| {
@@ -192,21 +213,21 @@ impl BuildStage for MessageRequestBuildingStage {
                     })
                     .unwrap_or_default();
                 symphony::auto_constraint_messages(
-                    ctx.state.parser.unwrap_or_default(),
-                    &ctx.components
-                        .parser_resolver
-                        .names(&messages_request.model),
+                    parser,
+                    &names,
                     &messages_request,
                     &tools,
                     require_reasoning,
                     continued_final_message,
                     &ctx.components.templates,
                 )
-                .map_err(|why| error::bad_request("invalid_parser_configuration", why))?
-                .map(|constraint| constraint.to_tuple())
-            }
-            other => other,
-        };
+            },
+        )
+        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
+        if decided.by_policy {
+            ctx.state.constraint_decided_on = Some(decoding);
+        }
+        let tool_constraints = decided.constraint.map(|constraint| constraint.to_tuple());
         let unshaped_tool_constraints = tool_constraints.clone();
         let tool_constraints = utils::tool_constraints_for_worker(
             &ctx.components.tool_parser_factory,
@@ -224,12 +245,8 @@ impl BuildStage for MessageRequestBuildingStage {
         // Symphony's assignment, taken while the rendered prompt is still here (see
         // `regular::symphony`): the response spec carries it to the drivers, and the state
         // records which parser reads the message for the response's header.
-        let names = ctx
-            .components
-            .parser_resolver
-            .names(&messages_request.model);
         let assignment = symphony::assign_messages(
-            ctx.state.parser.unwrap_or_default(),
+            parser,
             &names,
             messages_request.as_ref(),
             tool_constraints.as_ref(),

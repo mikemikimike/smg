@@ -24,8 +24,8 @@ use engine_servicer::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia,
     ServicerError, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
     TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
-    VllmServicerConfig, VllmServicerServer, DEFAULT_ENGINE_STARTUP_CEILING,
-    DEFAULT_ENGINE_STARTUP_TIMEOUT,
+    VllmServicerConfig, VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_STARTUP_CEILING,
+    DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
 };
 use llm_multimodal::Modality;
 use prost::Message;
@@ -156,6 +156,13 @@ impl MediaProcessor for PythonMediaProcessor {
 
     fn max_inflight(&self) -> usize {
         self.max_inflight
+    }
+
+    /// The engine's own processors take what the model takes, audio
+    /// included, as they do on the Python servicer; the bridge hands the
+    /// item over under the same modality name.
+    fn modalities(&self) -> &'static [&'static str] {
+        ALL_MODALITIES
     }
 
     fn probe(&self) -> BoxFuture<bool> {
@@ -424,6 +431,12 @@ impl MediaProcessor for SmgMediaProcessor {
 
     fn max_inflight(&self) -> usize {
         self.max_inflight
+    }
+
+    /// The set `process` maps below: image and video, no audio (the
+    /// pipeline preprocesses no audio for this engine).
+    fn modalities(&self) -> &'static [&'static str] {
+        PIXEL_MODALITIES
     }
 
     fn probe(&self) -> BoxFuture<bool> {

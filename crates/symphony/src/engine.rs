@@ -7,7 +7,11 @@
 //! Every byte of the output lands in exactly one event: a terminal that moves the engine as
 //! `Dropped { Wrapper }`, the whitespace between a call and the terminal that closes it as
 //! `Dropped { Wrapper }` too, any other text there as `Malformed`, run by run so that where the
-//! chunks were cut changes nothing, and the rest as content, reasoning, or the call's events.
+//! chunks were cut changes nothing, the whitespace a content stay begins with as
+//! `Dropped { Whitespace }` when no text follows it in the stay (the template's spacing after a
+//! thought's close, between two calls, or after a thought nothing follows, held until what
+//! follows says whose it is) unless the table keeps the state's text as written, and the rest as
+//! content, reasoning, or the call's events.
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/engine.md`.
 
@@ -57,10 +61,29 @@ pub struct Engine {
     stage: Stage,
     /// Whether the turn's first piece is still to come, for a table with a start row.
     at_turn_start: bool,
-    /// The stay in the current state, as far as a trimmed state needs it.
+    /// The stay in the current state, as far as a trimmed state or a held lead needs it.
     stay: Stay,
     /// A shaped call whose terminal arrived and whose header is still being read.
     pending: Option<Pending>,
+    /// The bytes of the call being assembled, and the ignored terminals that arrived among them
+    /// while the assembler held bytes.
+    region: Region,
+}
+
+/// The bytes of the call region being assembled: how many the assembler took, how many its events
+/// have carried out, and the table's ignored terminals that arrived while it held bytes, each at
+/// the offset it arrived at. A syntax may hold bytes until it can place them (a header until its
+/// marker, a word until it is spelled), and an ignored terminal pushed at once would leave before
+/// them; so one that arrives while bytes are held is placed where it arrived once the event that
+/// carries the bytes around it comes: spliced into a call event's source, which no client reads,
+/// or split out of a text event as a `Dropped { Wrapper }` event of its own between the text's
+/// pieces ([`Engine::carried_into`]). The output's bytes leave in their order whatever the syntax
+/// holds. When nothing is held it is dropped where it stands.
+#[derive(Debug, Default)]
+struct Region {
+    fed: usize,
+    out: usize,
+    carried: Vec<(usize, String)>,
 }
 
 /// A terminal whose row enters a shaped call, pending the call's header: nothing the row does has
@@ -78,21 +101,50 @@ struct Pending {
     call: shape::Assembler,
 }
 
-/// The stay in a state, from the row that entered it to the row that leaves it, as trimming reads
-/// it: whether text other than whitespace has arrived, and the run held after the last of it.
+/// The stay in a state, from the row that entered it to the row that leaves it, as trimming and
+/// the held lead read it: whether text other than whitespace has arrived, and the run held. A
+/// trimmed stay holds the run after its last text that is not whitespace; a content stay holds
+/// the run before its first ([`Engine::lead`]).
 #[derive(Debug, Default)]
 struct Stay {
     begun: bool,
     held: Vec<Held>,
 }
 
-/// Bytes a trimmed stay holds after its last text that is not whitespace, in the output's order.
+/// Bytes a stay holds, in the output's order: a trimmed stay's run after its last text that is not
+/// whitespace, or a content stay's lead before its first.
 #[derive(Debug)]
 enum Held {
     /// Whitespace: the state's text if more text follows in the stay, dropped if the stay ends.
     Space(String),
     /// A terminal the table ignores, inside the run: dropped wherever it stands, in its place.
     Ignored(String),
+}
+
+/// A text event of `like`'s kind carrying `text`, uncounted: the piece of a split text event.
+fn text_event_like(like: &Event, text: &str) -> Event {
+    let text = Text::uncounted(text);
+    match like {
+        Event::Reasoning(_) => Event::Reasoning(text),
+        Event::Dropped { why, .. } => Event::Dropped { text, why: *why },
+        Event::Malformed { why, .. } => Event::Malformed {
+            text,
+            why: why.clone(),
+        },
+        _ => Event::Content(text),
+    }
+}
+
+/// The text an event carries, for the events that carry output bytes.
+fn event_text(event: &mut Event) -> Option<&mut Text> {
+    match event {
+        Event::Content(text) | Event::Reasoning(text) => Some(text),
+        Event::Dropped { text, .. } | Event::Malformed { text, .. } => Some(text),
+        Event::ToolCallStart { source, .. }
+        | Event::ToolCallArguments { source, .. }
+        | Event::ToolCallEnd { source, .. } => Some(source),
+        Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => None,
+    }
 }
 
 /// Whitespace as Python's `str.strip` removes it: Unicode's white space and the information
@@ -111,14 +163,13 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// reports it as text after the object; every other syntax takes every byte.
     fn feed(&mut self, text: &str, declared: &Declared, out: &mut Events) -> usize;
 
-    /// The table's ignored terminal arrived inside the call: dropped where it stands, unless the
-    /// syntax keeps its bytes in place among the bytes it holds (MiniMax M3's XML).
-    fn ignored(&mut self, text: &str, _declared: &Declared, out: &mut Events) {
-        out.push(Event::Dropped {
-            text: Text::uncounted(text),
-            why: DropReason::Wrapper,
-        });
-    }
+    /// The table's ignored terminal arrived inside the call. Its bytes are the engine's to place
+    /// ([`Region`]): dropped where it stands when the assembler holds nothing, else placed where
+    /// it arrived once the bytes around it leave, spliced into a call event's source or split out
+    /// of a text event as a `Dropped` event of its own. A syntax that reads the terminal as its
+    /// own separator does what it must here (MiniMax M3's XML releases a tag it holds at it) and
+    /// pushes nothing for its bytes.
+    fn ignored(&mut self, _text: &str, _declared: &Declared, _out: &mut Events) {}
 
     /// The call the engine entered through a matched header starts: the events of its start, and
     /// the bytes that followed the header, for the engine to read again inside the call. Every
@@ -267,6 +318,7 @@ impl Engine {
             at_turn_start,
             stay: Stay::default(),
             pending: None,
+            region: Region::default(),
         };
         // A table whose output starts inside a call (a bare list of calls, with no marker before
         // it) opens the call here, since no terminal will.
@@ -477,6 +529,9 @@ impl Engine {
             .as_mut()
             .map_or_else(String::new, |call| call.start(&mut started));
         self.push_call_events(started, out);
+        // The header's bytes went to the shape, not through `feed`: the start's events carried
+        // them out, so the region counts them as taken too.
+        self.region.fed = self.region.fed.max(self.region.out);
         again
     }
 
@@ -508,6 +563,9 @@ impl Engine {
             Emits::Content | Emits::Reasoning if self.format.is_trimmed(self.state) => {
                 self.trimmed(text, out);
             }
+            Emits::Content if !self.stay.begun && !self.format.is_kept(self.state) => {
+                self.lead(text, out);
+            }
             Emits::Content | Emits::Reasoning => self.show(text, out),
             Emits::Arguments => {
                 let Some(call) = &mut self.call else {
@@ -517,6 +575,7 @@ impl Engine {
                 };
                 let mut assembled = Events::new();
                 let taken = call.feed(text, &self.declared, &mut assembled);
+                self.region.fed += taken;
                 self.push_call_events(assembled, out);
                 self.wrapping(&text[taken..], TEXT_AFTER_THE_OBJECT, out);
             }
@@ -557,27 +616,57 @@ impl Engine {
         }
         let body = rest.trim_end_matches(is_strip_space);
         if !body.is_empty() {
-            for held in std::mem::take(&mut self.stay.held) {
-                match held {
-                    Held::Space(space) => self.show(&space, out),
-                    Held::Ignored(terminal) => out.push(Event::Dropped {
-                        text: self.tokens.text(&terminal),
-                        why: DropReason::Wrapper,
-                    }),
-                }
-            }
+            self.release_stay(out);
             self.show(body, out);
         }
-        let tail = &rest[body.len()..];
-        if !tail.is_empty() {
-            match self.stay.held.last_mut() {
-                Some(Held::Space(space)) => space.push_str(tail),
-                _ => self.stay.held.push(Held::Space(tail.to_string())),
+        self.hold(&rest[body.len()..]);
+    }
+
+    /// Text at the start of a content stay, before the stay's first character that is not
+    /// whitespace: the whitespace is held, since what follows says whose it is. Text makes it
+    /// the text's, released as content before it; the stay ending without text makes it the
+    /// template's spacing (between a thought's close and the first call, between two calls,
+    /// after a thought nothing follows), dropped. The whole answer's message shows no content
+    /// for whitespace alone, and a stream that showed it as it arrived carried what the whole
+    /// answer does not.
+    fn lead(&mut self, text: &str, out: &mut Events) {
+        let body = text.trim_start_matches(is_strip_space);
+        self.hold(&text[..text.len() - body.len()]);
+        if body.is_empty() {
+            return;
+        }
+        self.stay.begun = true;
+        self.release_stay(out);
+        self.show(body, out);
+    }
+
+    /// Holds `space`, a run of whitespace, after what the stay holds.
+    fn hold(&mut self, space: &str) {
+        if space.is_empty() {
+            return;
+        }
+        match self.stay.held.last_mut() {
+            Some(Held::Space(held)) => held.push_str(space),
+            _ => self.stay.held.push(Held::Space(space.to_string())),
+        }
+    }
+
+    /// The run the stay held is the state's text: the whitespace is shown, and an ignored
+    /// terminal among it is dropped in its place.
+    fn release_stay(&mut self, out: &mut Events) {
+        for held in std::mem::take(&mut self.stay.held) {
+            match held {
+                Held::Space(space) => self.show(&space, out),
+                Held::Ignored(terminal) => out.push(Event::Dropped {
+                    text: self.tokens.text(&terminal),
+                    why: DropReason::Wrapper,
+                }),
             }
         }
     }
 
-    /// The stay ends: the run it held after its last text is the template's, and is dropped.
+    /// The stay ends: the run it held is the template's and is dropped, a trimmed stay's run
+    /// after its last text as much as a lead no text followed.
     fn end_stay(&mut self, out: &mut Events) {
         for held in std::mem::take(&mut self.stay.held) {
             let (text, why) = match held {
@@ -620,7 +709,10 @@ impl Engine {
     }
 
     /// A terminal arrived: move where the table says, or keep it as text where the model put it.
-    /// A terminal the table ignores is dropped where it stands, and moves nothing.
+    /// A terminal the table ignores is dropped where it stands, and moves nothing: inside a call
+    /// whose assembler holds bytes it is placed where it arrived once the bytes around it leave
+    /// ([`Region`]), and in a stay's held run (a trimmed stay's tail, a content stay's lead) it
+    /// keeps its place among them.
     fn terminal(&mut self, index: usize, out: &mut Events) {
         if self.format.ignored(index) {
             let text = self.format.terminal_text(index).to_string();
@@ -629,10 +721,18 @@ impl Engine {
                     let mut events = Events::new();
                     call.ignored(&text, &self.declared, &mut events);
                     self.push_call_events(events, out);
+                    if self.region.out < self.region.fed {
+                        self.region.carried.push((self.region.fed, text));
+                        return;
+                    }
+                    out.push(Event::Dropped {
+                        text: self.tokens.text(&text),
+                        why: DropReason::Wrapper,
+                    });
                     return;
                 }
             }
-            // Inside a trimmed stay's held run, the terminal keeps its place among the bytes held.
+            // Inside a stay's held run, the terminal keeps its place among the bytes held.
             if !self.stay.held.is_empty() {
                 self.stay.held.push(Held::Ignored(text));
                 return;
@@ -664,12 +764,19 @@ impl Engine {
         out: &mut Events,
     ) {
         let terminal = self.format.terminal_text(index).to_string();
-        self.end_stay(out);
+        // A shown marker is text the client sees: a lead held before it is the text's. Any other
+        // row ends the stay without text after the held run, which is the template's.
+        if self.format.shown(index) && !self.format.is_trimmed(self.state) {
+            self.release_stay(out);
+        } else {
+            self.end_stay(out);
+        }
         let taken =
             self.emits() == Emits::Arguments && self.close_call(Closed::ByMarker, &terminal, out);
+        let shown = !taken && self.format.shown(index);
         if !taken {
             let text = self.tokens.text(&terminal);
-            if self.format.shown(index) {
+            if shown {
                 // A marker of a channel the request does not separate: the client sees it.
                 out.push_content(text);
             } else {
@@ -680,6 +787,11 @@ impl Engine {
             }
         }
         self.enter_with(next, call, out);
+        // The stay a shown marker begins has its text already: whitespace after it is content as
+        // it would be after any other text.
+        if shown && !self.format.is_trimmed(next) {
+            self.stay.begun = true;
+        }
     }
 
     /// Moves into state `next`, with the reasoning events and the call that come with the move.
@@ -698,6 +810,7 @@ impl Engine {
             out.push(Event::ReasoningStart);
         }
         if to == Emits::Arguments {
+            self.region = Region::default();
             self.call = Some(call.unwrap_or_else(|| self.new_call()));
         }
         self.state = next;
@@ -707,6 +820,7 @@ impl Engine {
     /// The next call takes the next free index; the index is spent only when a call starts, so a
     /// `<tool_call>` block that held no call does not count and does not leave a gap.
     fn open_call(&mut self) {
+        self.region = Region::default();
         self.call = Some(self.new_call());
     }
 
@@ -742,6 +856,9 @@ impl Engine {
                 false
             }
         };
+        if taken {
+            self.region.fed += terminal.len();
+        }
         if closed == Closed::ByMarker {
             let mut renamed = Events::new();
             for event in finished.drain() {
@@ -759,19 +876,104 @@ impl Engine {
             finished = renamed;
         }
         self.push_call_events(finished, out);
+        // An ignored terminal no event carried out leaves here, before the region's close.
+        for (_, marker) in std::mem::take(&mut self.region.carried) {
+            out.push(Event::Dropped {
+                text: self.tokens.text(&marker),
+                why: DropReason::Wrapper,
+            });
+        }
+        self.region = Region::default();
         taken
     }
 
     /// Pushes a call's events with their tokens counted, and counts each call that starts: the
     /// index the next call takes, and `Finish::tool_calls`. A syntax that writes several calls in
-    /// one region starts each of them here.
+    /// one region starts each of them here. An event's bytes are counted as carried out of the
+    /// region, with the ignored terminals that arrived among them placed where they arrived.
     fn push_call_events(&mut self, mut events: Events, out: &mut Events) {
         for event in events.drain() {
             if matches!(event, Event::ToolCallStart { .. }) {
                 self.calls += 1;
             }
-            out.push(self.tokens.relabel(event));
+            for event in self.carried_into(event) {
+                out.push(self.tokens.relabel(event));
+            }
         }
+    }
+
+    /// `event` with the ignored terminals that arrived among the bytes it carries placed where
+    /// they arrived, and its bytes counted as carried out of the region. A call's event has them
+    /// spliced into its source, which no client reads; a text event is split around them, each
+    /// terminal a `Dropped { Wrapper }` event of its own, so that none joins text a client reads
+    /// (a syntax that hands held bytes back as content, as the bare list does).
+    fn carried_into(&mut self, mut event: Event) -> Vec<Event> {
+        let Some(text) = event_text(&mut event) else {
+            return vec![event];
+        };
+        if text.text.is_empty() {
+            return vec![event];
+        }
+        let from = self.region.out;
+        let to = from + text.text.len();
+        self.region.out = to;
+        if self.region.carried.is_empty() {
+            return vec![event];
+        }
+        let (within, after): (Vec<_>, Vec<_>) = std::mem::take(&mut self.region.carried)
+            .into_iter()
+            .partition(|(at, _)| *at <= to);
+        self.region.carried = after;
+        if within.is_empty() {
+            return vec![event];
+        }
+        let bytes = std::mem::take(&mut text.text);
+        let mut cuts = Vec::with_capacity(within.len());
+        let mut done = 0;
+        for (at, marker) in within {
+            let mut cut = at.saturating_sub(from).clamp(done, bytes.len());
+            while !bytes.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            cuts.push((cut, marker));
+            done = cut;
+        }
+        let is_call = matches!(
+            event,
+            Event::ToolCallStart { .. }
+                | Event::ToolCallArguments { .. }
+                | Event::ToolCallEnd { .. }
+        );
+        if is_call {
+            let mut spliced = String::with_capacity(bytes.len());
+            let mut done = 0;
+            for (cut, marker) in cuts {
+                spliced.push_str(&bytes[done..cut]);
+                spliced.push_str(&marker);
+                done = cut;
+            }
+            spliced.push_str(&bytes[done..]);
+            if let Some(text) = event_text(&mut event) {
+                text.text = spliced;
+            }
+            return vec![event];
+        }
+        let mut events = Vec::with_capacity(cuts.len() * 2 + 1);
+        let mut done = 0;
+        for (cut, marker) in cuts {
+            if cut > done {
+                events.push(text_event_like(&event, &bytes[done..cut]));
+            }
+            events.push(Event::Dropped {
+                text: Text::uncounted(marker),
+                why: DropReason::Wrapper,
+            });
+            done = cut;
+        }
+        if done < bytes.len() {
+            events.push(text_event_like(&event, &bytes[done..]));
+        }
+        events
     }
 
     /// Where the prompt leaves the engine: the table's replay of it ([`Format::replayed`], which
@@ -903,7 +1105,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        formats::{glm, qwen3},
+        formats::{glm, inkling, qwen3, xlam},
+        input::TokenSpan,
         tagged::{Placement, Spelling},
     };
 
@@ -1646,6 +1849,339 @@ mod tests {
             );
             assert_eq!(bytes(&events), output);
         }
+    }
+
+    #[test]
+    fn a_content_stays_lead_is_content_before_text_and_the_templates_spacing_otherwise() {
+        let format = qwen3(CallSyntax::Json);
+        let call = |city: &str| {
+            format!(
+                "<tool_call>\n{{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"{city}\"}}}}\n\
+                 </tool_call>"
+            )
+        };
+        // The spacing between the thought's close and the first call, and between two calls,
+        // is the template's: dropped as whitespace, the same whole and at every cut.
+        let output = format!(
+            "<think>\nplan\n</think>\n\n{}\n{}",
+            call("Paris"),
+            call("Rome")
+        );
+        let [content, reasoning, ..] = same_at_every_cut(&format, "", &output);
+        assert_eq!([content.as_str(), reasoning.as_str()], ["", "\nplan\n"]);
+        assert_eq!(
+            trimmed_space(&run(format.clone(), &output, EngineFinish::Stop)),
+            "\n\n\n"
+        );
+        // Before text it is the text's, content with it; after text, whitespace is content as
+        // it arrives, the newline before the call included.
+        let output = format!(
+            "<think>\nplan\n</think>\n\nSure.\n{}\n Done.",
+            call("Paris")
+        );
+        let [content, ..] = same_at_every_cut(&format, "", &output);
+        assert_eq!(content, "\n\nSure.\n\n Done.");
+        assert_eq!(
+            trimmed_space(&run(format.clone(), &output, EngineFinish::Stop)),
+            ""
+        );
+        // A stay no text ends, at the end of the output or at a row that opens no call, showed
+        // nothing: its whitespace is the template's.
+        let output = "<think>\nplan\n</think>\n\n";
+        let [content, ..] = same_at_every_cut(&format, "", output);
+        assert_eq!(content, "");
+        assert_eq!(
+            trimmed_space(&run(format.clone(), output, EngineFinish::Stop)),
+            "\n\n"
+        );
+        let output = "<think>\na\n</think>\n\n<think>\nb\n</think>\n";
+        let [content, reasoning, ..] = same_at_every_cut(&format, "", output);
+        assert_eq!([content.as_str(), reasoning.as_str()], ["", "\na\n\nb\n"]);
+        assert_eq!(
+            trimmed_space(&run(format.clone(), output, EngineFinish::Stop)),
+            "\n\n\n"
+        );
+        // The stay the prompt began: text in the prompt's tail makes the whitespace content.
+        let output = format!("\n{}", call("Paris"));
+        let [content, ..] = same_at_every_cut(&format, "<|im_start|>assistant\n", &output);
+        assert_eq!(content, "");
+        let [content, ..] = same_at_every_cut(&format, "<|im_start|>assistant\nSure,", &output);
+        assert_eq!(content, "\n");
+    }
+
+    #[test]
+    fn a_kept_content_state_shows_whitespace_alone_as_written() {
+        // A response template's `strip: false` field keeps its value as written: the whitespace a
+        // stay holds alone is content, where the held lead drops it as the template's spacing.
+        let output = "<think>\nplan\n</think>\n\n";
+        let kept = qwen3(CallSyntax::Json).keeps("content");
+        let [content, reasoning, ..] = same_at_every_cut(&kept, "", output);
+        assert_eq!([content.as_str(), reasoning.as_str()], ["\n\n", "\nplan\n"]);
+        assert_eq!(trimmed_space(&run(kept, output, EngineFinish::Stop)), "");
+        let [content, ..] = same_at_every_cut(&qwen3(CallSyntax::Json), "", output);
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn a_held_lead_leaves_no_content_delta_before_a_call_and_leaves_with_the_text_after_it() {
+        let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {}}\n</tool_call>";
+        // The content of each feed's events, the end's included, empty ones left out: the
+        // content deltas a client of the stream receives.
+        let deltas = |pieces: &[&str]| -> Vec<String> {
+            let mut engine = Engine::new(qwen3(CallSyntax::Json), declared());
+            let mut out = Events::new();
+            let mut deltas = Vec::new();
+            for piece in pieces {
+                engine
+                    .feed(
+                        Input::Delta {
+                            token_ids: &[],
+                            text: piece,
+                            spans: &[],
+                        },
+                        &mut out,
+                    )
+                    .expect("delta");
+                let [content, ..] = kinds(&out.drain());
+                deltas.push(content);
+            }
+            engine
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("end");
+            let [content, ..] = kinds(&out.drain());
+            deltas.push(content);
+            deltas.retain(|delta| !delta.is_empty());
+            deltas
+        };
+        // Nothing before the first call, nothing between the calls.
+        assert_eq!(
+            deltas(&["<think>", "\nplan\n", "</think>", "\n", "\n", call, "\n", call]),
+            Vec::<String>::new()
+        );
+        // With text after the thought the spacing leaves with the text; after a call, the same.
+        assert_eq!(
+            deltas(&[
+                "<think>", "\nplan\n", "</think>", "\n\n", "Sure", ".\n", call, "\n", "Done."
+            ]),
+            ["\n\nSure", ".\n", "\nDone."]
+        );
+        // Nothing after a thought nothing follows: the whole answer has no content either.
+        assert_eq!(
+            deltas(&["<think>", "\nplan\n", "</think>", "\n\n"]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_shown_marker_is_text_the_lead_before_it_and_the_whitespace_after_it_belong_to() {
+        let call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {}}\n</tool_call>";
+        let output = format!("<think>\nplan\n</think>\n\n{call}");
+        // The variant that does not separate reasoning shows the thought's markers as content:
+        // the spacing after `</think>` follows text the client sees, so it is content, and the
+        // content is the model's bytes up to the call.
+        let format = qwen3(CallSyntax::Json).without_reasoning();
+        let [content, reasoning, ..] = same_at_every_cut(&format, "", &output);
+        assert_eq!(
+            [content.as_str(), reasoning.as_str()],
+            ["<think>\nplan\n</think>\n\n", ""]
+        );
+        assert_eq!(trimmed_space(&run(format, &output, EngineFinish::Stop)), "");
+        // The variant that reads no calls shows a call's markers: the lead held before
+        // `<tool_call>` is released as content with it, and the content is every byte after the
+        // thought.
+        let format = qwen3(CallSyntax::Json).without_calls();
+        let [content, reasoning, ..] = same_at_every_cut(&format, "", &output);
+        assert_eq!(
+            [content.as_str(), reasoning.as_str()],
+            [format!("\n\n{call}").as_str(), "\nplan\n"]
+        );
+        assert_eq!(trimmed_space(&run(format, &output, EngineFinish::Stop)), "");
+    }
+
+    #[test]
+    fn an_ignored_terminal_in_a_held_lead_keeps_its_place_and_the_leads_tokens_are_counted() {
+        let format = || {
+            Format::new("led")
+                .terminal("open", "<a>")
+                .terminal("close", "</a>")
+                .ignores("separator", "|")
+                .state("content", Emits::Content)
+                .state("call", Emits::Arguments)
+                .transition("content", "open", "call")
+                .transition("call", "close", "content")
+                .calls(CallSyntax::Json)
+        };
+        let call = "<a>{\"name\": \"get_weather\", \"arguments\": {}}</a>";
+        for (output, content, dropped) in [
+            (format!("\n|\n{call}"), "", "|<a></a>"),
+            (format!("\n|\nHi{call}"), "\n\nHi", "|<a></a>"),
+        ] {
+            let events = run(format(), &output, EngineFinish::Stop);
+            let [shown, _, wrapping, _] = kinds(&events);
+            assert_eq!(
+                [shown.as_str(), wrapping.as_str()],
+                [content, dropped],
+                "{output:?}"
+            );
+            assert_eq!(bytes(&events), output, "{output:?}");
+        }
+        // Each token of the lead is counted in the event that carries its first byte: the
+        // whitespace events the lead leaves as, the separator's in its own.
+        let tokens = [
+            "\n",
+            "|",
+            "\n",
+            "<a>",
+            "{\"name\": \"get_weather\", ",
+            "\"arguments\": {}}",
+            "</a>",
+        ];
+        let text: String = tokens.concat();
+        let mut at = 0;
+        let spans: Vec<TokenSpan> = tokens
+            .iter()
+            .map(|token| {
+                let span = TokenSpan {
+                    token_id: 0,
+                    start: at,
+                    end: at + token.len(),
+                    continued: false,
+                };
+                at += token.len();
+                span
+            })
+            .collect();
+        let mut engine = Engine::new(format(), declared());
+        let mut out = Events::new();
+        engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: &text,
+                    spans: &spans,
+                },
+                &mut out,
+            )
+            .expect("delta");
+        engine
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        let events = out.drain();
+        let lead: Vec<(String, Option<u32>)> = events
+            .iter()
+            .take(3)
+            .filter_map(|event| match event {
+                Event::Dropped { text, .. } => Some((text.text.clone(), text.tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lead,
+            [
+                ("\n".to_string(), Some(1)),
+                ("|".to_string(), Some(1)),
+                ("\n".to_string(), Some(1)),
+            ]
+        );
+        let counted: u32 = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) | Event::Reasoning(text) => text.tokens,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.tokens,
+                Event::ToolCallStart { source, .. }
+                | Event::ToolCallArguments { source, .. }
+                | Event::ToolCallEnd { source, .. } => source.tokens,
+                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => None,
+            })
+            .sum();
+        assert_eq!(counted, tokens.len() as u32, "{events:?}");
+    }
+
+    #[test]
+    fn an_ignored_terminal_inside_a_held_call_keeps_its_place() {
+        // Inkling holds a message's header until the marker says what the message is; the turn's
+        // end token inside the header leaves after the bytes before it, not before them, and
+        // the call still reads. Where nothing is held it is dropped where it stands.
+        let prompt = "<|message_model|>";
+        let held = concat!(
+            "get_<|content_model_end_sampling|>weather<|content_invoke_tool_json|>",
+            "{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>"
+        );
+        let whole = run_after(inkling(), prompt, held);
+        assert_eq!(bytes(&whole), held);
+        assert_eq!(
+            calls(&whole),
+            [(r#"{"city":"Paris"}"#.to_string(), Some("}".to_string()))]
+        );
+        let [_, _, wrapping, malformed] = kinds(&whole);
+        assert!(
+            wrapping.contains("<|content_model_end_sampling|>"),
+            "{whole:?}"
+        );
+        assert_eq!(malformed, "");
+        for cut in (1..held.len()).filter(|&cut| held.is_char_boundary(cut)) {
+            let mut engine = Engine::new(inkling(), declared());
+            let mut out = Events::new();
+            for input in [
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                Input::Delta {
+                    token_ids: &[],
+                    text: &held[..cut],
+                    spans: &[],
+                },
+                Input::Delta {
+                    token_ids: &[],
+                    text: &held[cut..],
+                    spans: &[],
+                },
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+            ] {
+                engine.feed(input, &mut out).expect("in order");
+            }
+            let events = out.drain();
+            assert_eq!(bytes(&events), held, "cut at {cut}");
+            assert_eq!(calls(&events), calls(&whole), "cut at {cut}");
+        }
+        let unheld = "<|content_text|>Hi<|content_model_end_sampling|> there<|end_message|>";
+        let events = run_after(inkling(), prompt, unheld);
+        assert_eq!(bytes(&events), unheld);
+        let [content, _, wrapping, _] = kinds(&events);
+        assert_eq!(content, "Hi there");
+        assert_eq!(
+            wrapping,
+            "<|content_text|><|content_model_end_sampling|><|end_message|>"
+        );
+        // A syntax that hands held bytes back as content (the bare list, which holds `[` until
+        // it knows whether a list follows) leaves the terminal in an event of its own, not in
+        // the text the client reads.
+        let list = xlam().ignores("sep", "|");
+        let events = run(list, "[|Sure, done", EngineFinish::Stop);
+        assert_eq!(bytes(&events), "[|Sure, done");
+        let [content, _, wrapping, _] = kinds(&events);
+        assert_eq!(content, "[Sure, done");
+        assert_eq!(wrapping, "|");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Dropped { text, why: DropReason::Wrapper } if text.text == "|"
+            )),
+            "{events:?}"
+        );
     }
 
     #[test]

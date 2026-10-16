@@ -49,6 +49,13 @@
 //!   held until more text in the stay shows it was inside the text, or the stay ends and drops it.
 //!   Whitespace is what Python's `str.strip` removes: Unicode's white space and the separators
 //!   U+001C to U+001F.
+//! - A **kept row** names a content state whose text stands as written, as Hugging Face's `text`
+//!   parser keeps a field's value under `strip: false`: whitespace alone in a stay is content. A
+//!   content state with neither a trim row nor a kept row holds the whitespace a stay begins with
+//!   until text follows it in the stay, which makes it content, and drops it as
+//!   `Dropped { Whitespace }` when the stay ends without any: a family's template writes that
+//!   spacing (after a thought's close, between two calls), and the whole answer's message shows no
+//!   content for whitespace alone.
 //! - The **stop tokens** are the terminals that are tokens the engine stops on (Harmony's
 //!   `<|call|>`): the stop decoder hides them, so the engine never reads one, and a constraint
 //!   derived from the table can end a region one of them closes with no text of its own, since
@@ -274,6 +281,8 @@ struct State {
     framing: bool,
     /// The state's text is trimmed stay by stay (the trim row).
     trimmed: bool,
+    /// The state's text stands as written, whitespace alone included (the kept row).
+    kept: bool,
     /// The stream's stop closes the call open in the state (the stop row).
     closes_at_stop: bool,
 }
@@ -287,7 +296,9 @@ pub(crate) struct Replay {
     pub(crate) state: usize,
     /// Whether the turn's first piece is still to come, for a table with a start row.
     pub(crate) at_turn_start: bool,
-    /// Whether the prompt wrote text other than whitespace in the stay the output continues.
+    /// Whether the prompt wrote text other than whitespace in the stay the output continues: a
+    /// prefill the output goes on with. The turn opener and the table's markers are the
+    /// template's framing, not the stay's text.
     pub(crate) begun: bool,
 }
 
@@ -383,6 +394,7 @@ impl Format {
             emits,
             framing: false,
             trimmed: false,
+            kept: false,
             closes_at_stop: false,
         });
         self
@@ -441,6 +453,15 @@ impl Format {
         self
     }
 
+    /// The text of `state`, a content state, stands as written: whitespace alone in a stay is
+    /// content (see the kept row in [`crate::format`]). The state must already be in the table.
+    #[must_use]
+    pub fn keeps(mut self, state: &str) -> Self {
+        let state = self.state_named(state);
+        self.states[state].kept = true;
+        self
+    }
+
     /// The texts among `stops` (the model's end-of-sequence and stop tokens) that are terminals of
     /// the table, each kept once in the order given; other texts are not kept. The terminals must
     /// already be in the table. Parsing does not change, since the stop decoder hides these
@@ -462,6 +483,11 @@ impl Format {
     /// end that region with no text of its own.
     pub fn is_stop_token(&self, text: &str) -> bool {
         self.stop_tokens.iter().any(|stop| stop == text)
+    }
+
+    /// The stop tokens the table keeps ([`Self::stop_tokens`]), in the order given.
+    pub(crate) fn stop_token_texts(&self) -> &[String] {
+        &self.stop_tokens
     }
 
     /// The table's shaped calls read their values with `reader`: a tagged value's text by the
@@ -704,6 +730,32 @@ impl Format {
         self.turn_opener.as_deref()
     }
 
+    /// The texts that start the model's turn: the turn opener, or the turn anchors in the table's
+    /// order; none for a table that names neither.
+    pub(crate) fn turn_texts(&self) -> Vec<&str> {
+        match self.turn_opener() {
+            Some(opener) => vec![opener],
+            None => self
+                .anchors
+                .iter()
+                .map(|anchor| anchor.text.as_str())
+                .collect(),
+        }
+    }
+
+    /// Where the model's turn starts in `prompt`: where the last turn anchor found
+    /// ([`Self::last_anchor`]), or else the last turn opener, starts, the text after it, and the
+    /// state the output starts in after it. `None` when the prompt holds neither.
+    pub(crate) fn turn_start<'p>(&self, prompt: &'p str) -> Option<(usize, &'p str, usize)> {
+        if !self.anchors.is_empty() {
+            let (at, anchor) = self.last_anchor(prompt)?;
+            return Some((at, &prompt[at + anchor.text.len()..], anchor.state));
+        }
+        let opener = self.turn_opener()?;
+        let at = prompt.rfind(opener)?;
+        Some((at, &prompt[at + opener.len()..], 0))
+    }
+
     /// The part of `prompt` the engine replays to find the state the generation starts in: from
     /// the last occurrence of the turn opener, or the whole prompt when the table names none or
     /// the prompt does not hold it; for a table with turn anchors, from the start of the last
@@ -717,6 +769,14 @@ impl Format {
         match self.turn_opener().and_then(|opener| prompt.rfind(opener)) {
             Some(at) => &prompt[at..],
             None => prompt,
+        }
+    }
+
+    /// The bytes a piece of the replay stands for.
+    fn piece_len(&self, piece: &Piece) -> usize {
+        match piece {
+            Piece::Text(text) => text.len(),
+            Piece::Marker(index) => self.terminal_text(*index).len(),
         }
     }
 
@@ -796,10 +856,18 @@ impl Format {
     /// where this leaves it, and [`Self::reasoning_open`] reads the same walk.
     pub(crate) fn replayed(&self, prompt: &str) -> Replay {
         let (turn, start) = self.turn(prompt);
+        // The turn opener's own bytes, where the replay begins with them: the template's framing,
+        // not text of the stay.
+        let framing = self
+            .turn_opener()
+            .filter(|opener| self.anchors.is_empty() && turn.starts_with(opener))
+            .map_or(0, str::len);
         let mut scanner = Scanner::new(self.terminal_texts());
         let (mut state, mut rest) = (start, start);
-        // Whether the prompt wrote text other than whitespace in the stay the output continues.
+        // Whether the prompt wrote text other than whitespace in the stay the output continues;
+        // a marker is the template's, whether or not a row reads it here.
         let mut begun = false;
+        let mut at = 0;
         // An anchor that names its own state leaves no start to choose.
         let mut at_turn_start = self.start.is_some() && start == 0;
         let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
@@ -813,18 +881,20 @@ impl Format {
                     (state, rest) = (opened, opened);
                 }
             }
-            let text = match piece {
-                Piece::Marker(index) if self.ignored(index) => continue,
-                Piece::Marker(index) => match self.next(state, index) {
-                    Some(to) => {
+            let from = at;
+            at += self.piece_len(&piece);
+            match piece {
+                Piece::Marker(index) if self.ignored(index) => {}
+                Piece::Marker(index) => {
+                    if let Some(to) = self.next(state, index) {
                         (state, begun) = (to, false);
-                        continue;
                     }
-                    None => self.terminal_text(index).to_string(),
-                },
-                Piece::Text(text) => text,
-            };
-            begun |= !text.chars().all(is_strip_space);
+                }
+                Piece::Text(text) => {
+                    let written = &text[framing.saturating_sub(from).min(text.len())..];
+                    begun |= !written.chars().all(is_strip_space);
+                }
+            }
         }
         if self.emits(state) == Emits::Arguments {
             (state, begun) = (rest, false);
@@ -972,6 +1042,11 @@ impl Format {
         self.states[index].trimmed
     }
 
+    /// Whether the text of state `index` stands as written, whitespace alone included.
+    pub(crate) fn is_kept(&self, index: usize) -> bool {
+        self.states[index].kept
+    }
+
     /// What every table must hold before an engine runs it: a state to start in, which does not
     /// emit reasoning (a thought the output starts inside is entered by the prompt's replay or by
     /// the start row, either of which pushes `ReasoningStart`; an arguments state at the start has
@@ -979,8 +1054,9 @@ impl Format {
     /// every terminal, a turn opener and turn anchors that are not empty and not both named, a
     /// start row only where a turn's first byte is read from the first state and no opener replays
     /// it, a stop row only for an arguments state, a framing row only for a state of content or
-    /// wrapping, a trim row only for a state of content or reasoning that is not framing,
-    /// a thought when the table thinks first, and, for a shaped call, a shape a stream can run,
+    /// wrapping, a trim row only for a state of content or reasoning that is not framing, a kept
+    /// row only for a content state that is neither framing nor trimmed, a thought when the table
+    /// thinks first, and, for a shaped call, a shape a stream can run,
     /// opened only through its terminal (the turn does not start in its state), no terminal the
     /// table ignores, and, when its header is not empty, no row into its state from a state that
     /// holds a call. The builder keeps a row from naming what the table lacks; this checks the
@@ -1074,6 +1150,33 @@ impl Format {
                 } else if state.framing {
                     Some(format!(
                         "format {}: state {:?} is trimmed, but its text is framing",
+                        self.name, state.name
+                    ))
+                } else {
+                    None
+                }
+            });
+        if let Some(why) = misfit {
+            return Err(why);
+        }
+        let misfit = self
+            .states
+            .iter()
+            .filter(|state| state.kept)
+            .find_map(|state| {
+                if state.emits != Emits::Content {
+                    Some(format!(
+                        "format {}: state {:?} is kept, but it emits {:?}",
+                        self.name, state.name, state.emits
+                    ))
+                } else if state.framing {
+                    Some(format!(
+                        "format {}: state {:?} is kept, but its text is framing",
+                        self.name, state.name
+                    ))
+                } else if state.trimmed {
+                    Some(format!(
+                        "format {}: state {:?} is kept, but it is trimmed",
                         self.name, state.name
                     ))
                 } else {
@@ -1810,6 +1913,43 @@ mod tests {
     #[should_panic(expected = "format t: no state named \"answer\"")]
     fn a_trim_row_for_a_state_the_table_lacks_is_a_programming_error() {
         let _ = two_states().trims("answer");
+    }
+
+    #[test]
+    fn a_kept_row_names_a_content_state_that_is_neither_framing_nor_trimmed() {
+        let format = Format::new("kept")
+            .terminal("open", "<c>")
+            .state("content", Emits::Content)
+            .state("thought", Emits::Reasoning)
+            .state("between", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .state("outside", Emits::Content)
+            .state("trimmed", Emits::Content)
+            .transition("content", "open", "call")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .trims("trimmed")
+            .keeps("content");
+        assert!(format.is_kept(0) && !format.is_kept(5));
+        assert!(format.validate().is_ok());
+        for (state, why) in [
+            ("thought", "it emits Reasoning"),
+            ("between", "it emits Wrapper"),
+            ("call", "it emits Arguments"),
+            ("outside", "its text is framing"),
+            ("trimmed", "it is trimmed"),
+        ] {
+            assert_eq!(
+                format.clone().keeps(state).validate(),
+                Err(format!("format kept: state {state:?} is kept, but {why}"))
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"answer\"")]
+    fn a_kept_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().keeps("answer");
     }
 
     #[test]
