@@ -17,12 +17,50 @@ use crate::{
 /// Type alias for parser creator functions.
 type ParserCreator = Arc<dyn Fn() -> Box<dyn ReasoningParser> + Send + Sync>;
 
+/// What a registered parser is, without building one: the facts a fresh
+/// instance of it reports, read once at registration. A request's yes/no
+/// questions about the parser its model would get (is there one, does it
+/// need the tokenizer's special tokens, does it read the rendered prompt)
+/// are answered from these instead of from a parser built and dropped on
+/// the spot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParserTraits {
+    model_type: Arc<str>,
+    requires_special_tokens: bool,
+}
+
+impl ParserTraits {
+    fn of(parser: &dyn ReasoningParser) -> Self {
+        Self {
+            model_type: Arc::from(parser.model_type()),
+            requires_special_tokens: parser.requires_special_tokens(),
+        }
+    }
+
+    /// [`ReasoningParser::model_type`] of the parser.
+    pub fn model_type(&self) -> &str {
+        &self.model_type
+    }
+
+    /// [`ReasoningParser::requires_special_tokens`] of the parser.
+    pub fn requires_special_tokens(&self) -> bool {
+        self.requires_special_tokens
+    }
+}
+
+/// A registered parser: how to build one, and what it is.
+struct RegisteredParser {
+    create: ParserCreator,
+    traits: ParserTraits,
+}
+
 /// Registry for model-specific parsers.
 #[derive(Clone)]
 pub struct ParserRegistry {
-    /// Creator functions for parsers
-    creators: Arc<RwLock<HashMap<String, ParserCreator>>>,
-    /// Model pattern to parser name mappings
+    /// The registered parsers by name
+    parsers: Arc<RwLock<HashMap<String, RegisteredParser>>>,
+    /// Model pattern to parser name mappings; the patterns are stored
+    /// lower-cased, so a lookup lower-cases the model id alone
     patterns: Arc<RwLock<Vec<(String, String)>>>, // (pattern, parser_name)
 }
 
@@ -30,72 +68,99 @@ impl ParserRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
         Self {
-            creators: Arc::new(RwLock::new(HashMap::new())),
+            parsers: Arc::new(RwLock::new(HashMap::new())),
             patterns: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
     /// Register a parser creator for a given parser type.
+    ///
+    /// One parser is built here, to record its [`ParserTraits`]: every
+    /// instance the creator builds reports the same model type and special
+    /// token requirement.
     pub fn register_parser<F>(&self, name: &str, creator: F)
     where
         F: Fn() -> Box<dyn ReasoningParser> + Send + Sync + 'static,
     {
-        let mut creators = self.creators.write();
-        creators.insert(name.to_string(), Arc::new(creator));
+        let traits = ParserTraits::of(creator().as_ref());
+        let mut parsers = self.parsers.write();
+        parsers.insert(
+            name.to_string(),
+            RegisteredParser {
+                create: Arc::new(creator),
+                traits,
+            },
+        );
     }
 
     /// Register a model pattern to parser mapping.
-    /// Patterns are checked in order, first match wins.
+    /// Patterns are checked in order, first match wins; a model id matches a
+    /// pattern case-insensitively.
     pub fn register_pattern(&self, pattern: &str, parser_name: &str) {
         let mut patterns = self.patterns.write();
-        patterns.push((pattern.to_string(), parser_name.to_string()));
+        patterns.push((pattern.to_lowercase(), parser_name.to_string()));
     }
 
     /// Check if a parser with the given name is registered.
     pub fn has_parser(&self, name: &str) -> bool {
-        let creators = self.creators.read();
-        creators.contains_key(name)
+        let parsers = self.parsers.read();
+        parsers.contains_key(name)
     }
 
     /// Create a fresh parser instance by exact name (not pooled).
     /// Returns a new parser instance for each call - useful for streaming where state isolation is needed.
     pub fn create_parser(&self, name: &str) -> Option<Box<dyn ReasoningParser>> {
-        let creators = self.creators.read();
-        creators.get(name).map(|creator| creator())
+        let parsers = self.parsers.read();
+        parsers.get(name).map(|parser| (parser.create)())
+    }
+
+    /// What the parser registered under `name` is, without building one.
+    pub fn parser_traits(&self, name: &str) -> Option<ParserTraits> {
+        let parsers = self.parsers.read();
+        parsers.get(name).map(|parser| parser.traits.clone())
+    }
+
+    /// `read` of the name the first matching pattern maps `model_id` to, the
+    /// way [`Self::create_for_model`] picks it: `None` when no pattern
+    /// matches.
+    fn with_parser_name_for_model<R>(
+        &self,
+        model_id: &str,
+        read: impl FnOnce(&str) -> R,
+    ) -> Option<R> {
+        let patterns = self.patterns.read();
+        let model_lower = model_id.to_lowercase();
+
+        patterns
+            .iter()
+            .find(|(pattern, _)| model_lower.contains(pattern.as_str()))
+            .map(|(_, parser_name)| read(parser_name))
     }
 
     /// Check if a parser can be created for a specific model without actually creating it.
     /// Returns true if a parser is available (registered) for this model.
     pub fn has_parser_for_model(&self, model_id: &str) -> bool {
-        let patterns = self.patterns.read();
-        let model_lower = model_id.to_lowercase();
-
-        for (pattern, parser_name) in patterns.iter() {
-            if model_lower.contains(&pattern.to_lowercase()) {
-                let creators = self.creators.read();
-                return creators.contains_key(parser_name);
-            }
-        }
-        false
+        self.with_parser_name_for_model(model_id, |parser_name| self.has_parser(parser_name))
+            .unwrap_or(false)
     }
 
     /// Create a fresh parser instance for a given model ID by pattern matching (not pooled).
     /// Returns a new parser instance for each call - useful for streaming where state isolation is needed.
     pub fn create_for_model(&self, model_id: &str) -> Option<Box<dyn ReasoningParser>> {
-        let patterns = self.patterns.read();
-        let model_lower = model_id.to_lowercase();
+        self.with_parser_name_for_model(model_id, |parser_name| self.create_parser(parser_name))
+            .flatten()
+    }
 
-        for (pattern, parser_name) in patterns.iter() {
-            if model_lower.contains(&pattern.to_lowercase()) {
-                return self.create_parser(parser_name);
-            }
-        }
-        None
+    /// What the parser [`Self::create_for_model`] would build for `model_id`
+    /// is, without building one: `None` where that would be `None`.
+    pub fn parser_traits_for_model(&self, model_id: &str) -> Option<ParserTraits> {
+        self.with_parser_name_for_model(model_id, |parser_name| self.parser_traits(parser_name))
+            .flatten()
     }
 
     /// List all registered parser names in sorted order.
     pub fn list_parsers(&self) -> Vec<String> {
-        let mut parsers: Vec<_> = self.creators.read().keys().cloned().collect();
+        let mut parsers: Vec<_> = self.parsers.read().keys().cloned().collect();
         parsers.sort_unstable();
         parsers
     }
@@ -383,6 +448,91 @@ mod tests {
         let factory = ParserFactory::new();
         let parser = factory.create("unknown-model");
         assert_eq!(parser.model_type(), "passthrough");
+    }
+
+    #[test]
+    fn parser_traits_match_a_built_parser_for_every_registered_name() {
+        let factory = ParserFactory::new();
+        let registry = factory.registry();
+        for name in factory.list_parsers() {
+            let built = registry
+                .create_parser(&name)
+                .expect("a listed parser builds");
+            let traits = registry
+                .parser_traits(&name)
+                .expect("a listed parser has traits");
+            assert_eq!(traits.model_type(), built.model_type(), "{name}");
+            assert_eq!(
+                traits.requires_special_tokens(),
+                built.requires_special_tokens(),
+                "{name}"
+            );
+        }
+        assert!(registry.parser_traits("no-such-parser").is_none());
+
+        // A parser registered later reports what its own instances report.
+        registry.register_parser("typed-output", || Box::new(InklingParser::new()));
+        let traits = registry.parser_traits("typed-output").expect("registered");
+        assert_eq!(traits.model_type(), "inkling");
+        assert!(traits.requires_special_tokens());
+    }
+
+    #[test]
+    fn parser_traits_for_model_follow_the_pattern_selection() {
+        let factory = ParserFactory::new();
+        let registry = factory.registry();
+        for model in [
+            "DeepSeek-R1",
+            "QWEN3",
+            "Kimi",
+            "moonshotai/Kimi-K3",
+            "google/gemma-4-serve",
+            "inkling-7b",
+            "unknown-model",
+        ] {
+            let built = registry.create_for_model(model);
+            let traits = registry.parser_traits_for_model(model);
+            assert_eq!(built.is_some(), traits.is_some(), "{model}");
+            assert_eq!(
+                registry.has_parser_for_model(model),
+                traits.is_some(),
+                "{model}"
+            );
+            if let (Some(built), Some(traits)) = (built, traits) {
+                assert_eq!(traits.model_type(), built.model_type(), "{model}");
+                assert_eq!(
+                    traits.requires_special_tokens(),
+                    built.requires_special_tokens(),
+                    "{model}"
+                );
+            }
+        }
+
+        // A pattern registered in any case matches a model id in any case.
+        registry.register_pattern("MyModel", "qwen3");
+        for model in ["org/mymodel-7b", "ORG/MYMODEL"] {
+            assert_eq!(
+                registry
+                    .parser_traits_for_model(model)
+                    .map(|traits| traits.model_type().to_owned()),
+                Some("qwen3".to_owned()),
+                "{model}"
+            );
+            assert_eq!(
+                registry
+                    .create_for_model(model)
+                    .map(|parser| parser.model_type().to_owned()),
+                Some("qwen3".to_owned()),
+                "{model}"
+            );
+        }
+
+        // The first matching pattern decides: one that names no registered
+        // parser yields nothing, for the traits as for a parser.
+        registry.register_pattern("ghost", "no-such-parser");
+        assert!(registry.create_for_model("ghost-1").is_none());
+        assert!(registry.parser_traits_for_model("ghost-1").is_none());
+        assert!(!registry.has_parser_for_model("ghost-1"));
     }
 
     #[test]

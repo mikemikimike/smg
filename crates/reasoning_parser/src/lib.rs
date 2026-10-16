@@ -2,7 +2,7 @@ pub mod factory;
 pub mod parsers;
 pub mod traits;
 
-pub use factory::{ParserFactory, ParserRegistry};
+pub use factory::{ParserFactory, ParserRegistry, ParserTraits};
 pub use parsers::{
     BaseReasoningParser, CohereCmdParser, DeepSeekR1Parser, DeepSeekV41Parser, Glm45Parser,
     HyV4Parser, InklingParser, KimiK3Parser, KimiParser, MiniMaxParser, MinimaxM3Parser,

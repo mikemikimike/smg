@@ -12,7 +12,7 @@ use openai_protocol::{
     profile::ProviderProfile,
     worker::ConstrainedDecoding,
 };
-use reasoning_parser::{ParserFactory as ReasoningParserFactory, ReasoningParser};
+use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserTraits, ReasoningParser};
 use serde_json::Value;
 use tool_parser::{
     GrammarStart, ParserFactory as ToolParserFactory, PooledParser as ToolPooledParser, ToolParser,
@@ -500,7 +500,30 @@ pub(crate) fn check_reasoning_parser_availability(
     configured_parser: Option<&str>,
     model: &str,
 ) -> bool {
-    create_reasoning_parser(reasoning_parser_factory, configured_parser, model).is_some()
+    reasoning_parser_traits(reasoning_parser_factory, configured_parser, model).is_some()
+}
+
+/// What the reasoning parser [`create_reasoning_parser`] would build is,
+/// without building one: the same explicit, automatic or fallback selection,
+/// for the yes/no questions a request asks of it before and after the engine
+/// call.
+fn reasoning_parser_traits(
+    reasoning_parser_factory: &ReasoningParserFactory,
+    configured_parser: Option<&str>,
+    model: &str,
+) -> Option<ParserTraits> {
+    let registry = reasoning_parser_factory.registry();
+    if let Some(parser_name) = configured_parser {
+        registry.parser_traits(parser_name).or_else(|| {
+            warn!(
+                "Configured reasoning parser '{}' not found, falling back to model-based selection",
+                parser_name
+            );
+            registry.parser_traits_for_model(model)
+        })
+    } else {
+        registry.parser_traits_for_model(model)
+    }
 }
 
 /// Check if a tool parser is available for the given model
@@ -551,8 +574,8 @@ pub(crate) fn rendered_prompt_reasoning_in_prefill(
     model: &str,
     prompt: &str,
 ) -> Option<bool> {
-    create_reasoning_parser(reasoning_parser_factory, configured_parser, model)
-        .filter(|parser| parser.model_type() == "gemma4")
+    reasoning_parser_traits(reasoning_parser_factory, configured_parser, model)
+        .filter(|traits| traits.model_type() == "gemma4")
         .map(|_| reasoning_parser::parsers::Gemma4Parser::prompt_ends_in_reasoning(prompt))
 }
 
@@ -563,12 +586,8 @@ pub(crate) fn reasoning_parser_requires_special_tokens(
     configured_parser: Option<&str>,
     model: &str,
 ) -> bool {
-    create_reasoning_parser(reasoning_parser_factory, configured_parser, model).is_some_and(
-        |parser| {
-            let parser_ref: &dyn ReasoningParser = parser.as_ref();
-            parser_ref.requires_special_tokens()
-        },
-    )
+    reasoning_parser_traits(reasoning_parser_factory, configured_parser, model)
+        .is_some_and(|traits| traits.requires_special_tokens())
 }
 
 /// Get the appropriate tool parser for a model
@@ -1713,6 +1732,47 @@ mod tests {
                     "<|channel>thought\n",
                 ),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn parser_answers_without_building_one_match_the_built_parser() {
+        let factory = ReasoningParserFactory::new();
+        factory.registry().register_parser("typed-output", || {
+            Box::new(reasoning_parser::parsers::InklingParser::new())
+        });
+        let prompt = "<|im_start|>model<|channel>thought\n";
+        for (configured, model) in [
+            (None, "qwen3"),
+            (None, "google/gemma-4-serve"),
+            (None, "inkling-7b"),
+            (None, "unknown-model"),
+            (Some("gemma4"), "unknown-model"),
+            (Some("typed-output"), "unknown-model"),
+            (Some("unknown-parser"), "google/gemma-4-serve"),
+            (Some("unknown-parser"), "unknown-model"),
+        ] {
+            let built = create_reasoning_parser(&factory, configured, model);
+            assert_eq!(
+                check_reasoning_parser_availability(&factory, configured, model),
+                built.is_some(),
+                "configured={configured:?}, model={model}"
+            );
+            assert_eq!(
+                reasoning_parser_requires_special_tokens(&factory, configured, model),
+                built
+                    .as_ref()
+                    .is_some_and(|parser| parser.requires_special_tokens()),
+                "configured={configured:?}, model={model}"
+            );
+            assert_eq!(
+                rendered_prompt_reasoning_in_prefill(&factory, configured, model, prompt),
+                built
+                    .as_ref()
+                    .filter(|parser| parser.model_type() == "gemma4")
+                    .map(|_| true),
+                "configured={configured:?}, model={model}"
             );
         }
     }
