@@ -13,9 +13,10 @@
 //! flush and the unstreamed text and arguments the gateway takes at the end of a stream. The
 //! legacy side runs as the gateway runs it: the reasoning parser first, armed when the prompt
 //! leaves the model inside its thought, then the tool parser on the text outside the thought when
-//! the request declares tools (a list, empty or not, as the gateway reads it; a request with a
-//! `tool_choice` is not routed and counted); whitespace-only content is absent, and `stop` after
-//! a call is `tool_calls`.
+//! the request declares tools (a non-empty list: the gateway's request normalization reads an
+//! empty one as `tool_choice: none`; a request with a `tool_choice` other than `auto` is not
+//! routed and counted); whitespace-only content is absent, and `stop` after a call is
+//! `tool_calls`.
 //!
 //! What the two say is compared at three strengths and every difference is classified against
 //! the template reference bellwether recorded with the case: `bitwise` (the same strings), `equal`
@@ -83,8 +84,12 @@ const COMMON_SET: &str = "common";
 /// Up to this many bytes an output is also streamed a character at a time; past it the two
 /// seeded plans alone keep a case's cost linear in its size.
 const CHARACTER_PLAN_UP_TO: usize = 512;
-/// How many differences of a class stdout shows per model; every one is in the report.
+/// How many differences of a class stdout shows per model.
 const SHOWN: usize = 5;
+/// How many differences of a class and kind of cut the report shows in full per model; the rest
+/// are counted in the model's summary (a whole run of a benchmark-scale set differs on more than
+/// a million character-plan replays, each a legacy stream that lost a marker cut in two).
+const REPORTED: usize = 100;
 
 /// The legacy parsers that read a table's family: the names the gateway's `--tool-call-parser`
 /// and `--reasoning-parser` take for it, each `None` where no parser of the tool or reasoning
@@ -335,18 +340,33 @@ struct Fixture {
 
 #[derive(Default, Deserialize)]
 struct Request {
-    /// The declared tools: the gateway runs its tool parser when the request declares a list,
-    /// an empty one included, and not when it declares none.
-    tools: Option<Vec<Tool>>,
-    /// A `tool_choice` takes the gateway's legacy path elsewhere (`none` runs no tool parser, a
-    /// forced or named choice reads with the JSON schema parser): a case that sets one is not
-    /// routed here, and counted. The recorded corpus sets none.
+    /// The declared tools. The gateway's request normalization sets `tool_choice` to `none` for
+    /// an empty list, so its tool parser runs only on a non-empty one ([`Request::declared`]).
+    #[serde(default)]
+    tools: Vec<Tool>,
+    /// A `tool_choice` other than `auto` takes the gateway's legacy path elsewhere (`none` runs no
+    /// tool parser, a forced or named choice reads with the JSON schema parser): a case that sets
+    /// one is not routed here, and counted. The recorded corpus sets none.
     tool_choice: Option<Value>,
     #[serde(default)]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
 
 impl Request {
+    /// The tools the gateway's tool parser is given: the declared list when it is not empty, as
+    /// the request normalization reads an empty one as `tool_choice: none`.
+    fn declared(&self) -> Option<&[Tool]> {
+        (!self.tools.is_empty()).then_some(self.tools.as_slice())
+    }
+
+    /// Whether the case takes the legacy path this test runs: no `tool_choice`, or `auto`, which
+    /// is what the normalization gives an absent one.
+    fn routed(&self) -> bool {
+        self.tool_choice
+            .as_ref()
+            .is_none_or(|choice| choice.as_str() == Some("auto"))
+    }
+
     fn thinking_off(&self) -> bool {
         self.enable_thinking() == Some(false)
     }
@@ -530,23 +550,34 @@ impl fmt::Display for Said {
 /// around it, so a report whose brief rendering shows the same prefix for both still says what
 /// tells them apart.
 fn located(symphony: &Said, legacy: &Said) -> String {
-    let mut fields: Vec<(String, &str, &str)> = vec![
+    let channel = |part: &Option<String>| part.clone().unwrap_or_default();
+    let mut fields: Vec<(String, String, String)> = vec![
         (
             "content".to_string(),
-            symphony.content.as_deref().unwrap_or(""),
-            legacy.content.as_deref().unwrap_or(""),
+            channel(&symphony.content),
+            channel(&legacy.content),
         ),
         (
             "reasoning".to_string(),
-            symphony.reasoning.as_deref().unwrap_or(""),
-            legacy.reasoning.as_deref().unwrap_or(""),
+            channel(&symphony.reasoning),
+            channel(&legacy.reasoning),
         ),
     ];
+    // The two sides spell the same JSON differently (the legacy parsers re-serialize it), so the
+    // arguments are located in one canonical spelling where both parse, key order kept.
+    let canonical = |text: &str| serde_json::from_str::<Value>(text).map(|value| value.to_string());
     for (at, (a, b)) in symphony.calls.iter().zip(&legacy.calls).enumerate() {
-        fields.push((format!("calls[{at}].name"), &a.0, &b.0));
-        fields.push((format!("calls[{at}].arguments"), &a.1, &b.1));
+        fields.push((format!("calls[{at}].name"), a.0.clone(), b.0.clone()));
+        match (canonical(&a.1), canonical(&b.1)) {
+            (Ok(x), Ok(y)) => fields.push((format!("calls[{at}].arguments (as JSON)"), x, y)),
+            _ => fields.push((format!("calls[{at}].arguments"), a.1.clone(), b.1.clone())),
+        }
     }
-    fields.push(("finish".to_string(), &symphony.finish, &legacy.finish));
+    fields.push((
+        "finish".to_string(),
+        symphony.finish.clone(),
+        legacy.finish.clone(),
+    ));
     let mut out = String::new();
     for (field, a, b) in fields {
         if a == b {
@@ -559,8 +590,8 @@ fn located(symphony: &Said, legacy: &Said) -> String {
             .unwrap_or_else(|| a.len().min(b.len()));
         out.push_str(&format!(
             "      {field} differs at byte {at}: symphony {} legacy {}\n",
-            window(a, at),
-            window(b, at)
+            window(&a, at),
+            window(&b, at)
         ));
     }
     if symphony.calls.len() != legacy.calls.len() {
@@ -610,7 +641,7 @@ fn calls_equal(a: &[(String, String)], b: &[(String, String)]) -> bool {
 }
 
 /// What one replay's comparison gave.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Verdict {
     /// Neither side could be compared: a side panicked.
     Panicked,
@@ -773,8 +804,8 @@ fn legacy_finish(finish: &str, calls: bool) -> String {
 
 /// The legacy path on a whole output, as the non-streaming gateway runs it: the reasoning parser
 /// first, armed when the prompt leaves the model inside its thought (`opened`), then the tool
-/// parser on the text outside the thought when the request declares `tools` (a list, empty or
-/// not; `None` declares none).
+/// parser on the text outside the thought when the request declares `tools`
+/// ([`Request::declared`]).
 fn legacy_whole(
     factories: &Factories,
     legacy: Legacy,
@@ -1056,9 +1087,10 @@ impl fmt::Display for Tally {
     }
 }
 
-/// The kinds of streamed replay: at the recorded tokens' boundaries, and at characters.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The kinds of replay: whole, at the recorded tokens' boundaries, and at characters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Cuts {
+    Whole,
     Token,
     Character,
 }
@@ -1074,6 +1106,7 @@ struct Drift {
 impl Drift {
     fn count(&mut self, cuts: Cuts) {
         match cuts {
+            Cuts::Whole => {}
             Cuts::Token => self.token += 1,
             Cuts::Character => self.character += 1,
         }
@@ -1117,6 +1150,7 @@ impl Counts {
 
     fn streamed(&mut self, cuts: Cuts) -> &mut Tally {
         match cuts {
+            Cuts::Whole => &mut self.whole,
             Cuts::Token => &mut self.token,
             Cuts::Character => &mut self.character,
         }
@@ -1323,17 +1357,17 @@ fn replay_model(
     let mut report = String::new();
     let mut shown = Shown::default();
     let mut failures = Vec::new();
-    let mut equivalents_shown = 0;
+    let mut reported = BTreeMap::new();
     let cases = each_fixture(&recorded.parse, every, &mut |fixture: Fixture| {
         let fixture = &fixture;
-        if fixture.request.tool_choice.is_some() {
+        if !fixture.request.routed() {
             counts.unrouted += 1;
             report.push_str(&format!("  {:16} {}\n", "not routed", fixture.id));
             return;
         }
         let text = fixture.reference.text.as_str();
-        let declared = fixture.request.tools.as_deref();
-        let tools = declared.unwrap_or_default();
+        let declared = fixture.request.declared();
+        let tools = fixture.request.tools.as_slice();
         let tail = prompt.tail(&fixture.request, markers);
         let opened = format.reasoning_open(&tail);
         let finish = engine_finish(&fixture.reference.finish_reason);
@@ -1350,12 +1384,13 @@ fn replay_model(
             reach,
             counts: &mut counts,
             failures: &mut failures,
-            equivalents_shown: &mut equivalents_shown,
+            reported: &mut reported,
             plans: Vec::new(),
             details: String::new(),
         };
         let (whole_verdict, symphony_whole, legacy_whole_said) = case.compare(
             "whole",
+            Cuts::Whole,
             caught("the table", || {
                 symphony_said(&format, tools, &tail, text, &[], &finish)
             }),
@@ -1379,6 +1414,7 @@ fn replay_model(
         for (kind, (plan, cuts)) in streamed {
             let (streamed_verdict, symphony_streamed, legacy_streamed_said) = case.compare(
                 &plan,
+                kind,
                 caught("the table", || {
                     symphony_said(&format, tools, &tail, text, &cuts, &finish)
                 }),
@@ -1445,9 +1481,10 @@ struct Case<'a> {
     reach: Reach,
     counts: &'a mut Counts,
     failures: &'a mut Vec<String>,
-    /// How many equivalent-only replays of the model the report has shown in full: the first
-    /// [`SHOWN`] say what the two paths keep differently at the channels' edges.
-    equivalents_shown: &'a mut usize,
+    /// How many replays of each verdict and kind of cut the model's report has shown in full:
+    /// the first [`REPORTED`] of a class say what it is, and the first [`SHOWN`] equivalent-only
+    /// replays say what the two paths keep differently at the channels' edges.
+    reported: &'a mut BTreeMap<(Verdict, Cuts), usize>,
     plans: Vec<String>,
     details: String,
 }
@@ -1458,6 +1495,7 @@ impl Case<'_> {
     fn compare(
         &mut self,
         plan: &str,
+        cuts: Cuts,
         symphony: Result<Said, String>,
         legacy: Result<Said, String>,
     ) -> (Verdict, Option<Said>, Option<Said>) {
@@ -1484,11 +1522,17 @@ impl Case<'_> {
                 (Verdict::Panicked, symphony.ok(), legacy.ok())
             }
         };
-        let show_equivalent = verdict == Verdict::Equivalent && *self.equivalents_shown < SHOWN;
-        if show_equivalent {
-            *self.equivalents_shown += 1;
+        let reported = self.reported.entry((verdict, cuts)).or_default();
+        let budget = if verdict == Verdict::Equivalent {
+            SHOWN
+        } else {
+            REPORTED
+        };
+        let shown = (verdict.differs() || verdict == Verdict::Equivalent) && *reported < budget;
+        if shown {
+            *reported += 1;
         }
-        if verdict.differs() || show_equivalent {
+        if shown {
             if let (Some(symphony), Some(legacy)) = (&symphony, &legacy) {
                 self.details.push_str(&format!(
                     "    {plan}: {}\n      symphony:  {symphony}\n      legacy:    {legacy}\n      \
@@ -1498,13 +1542,13 @@ impl Case<'_> {
                     located(symphony, legacy)
                 ));
             }
-            if verdict == Verdict::LegacyRight {
-                self.failures.push(format!(
-                    "{}: {plan}: the legacy parsers say what the reference says and the table \
-                     does not",
-                    self.id
-                ));
-            }
+        }
+        if verdict == Verdict::LegacyRight {
+            self.failures.push(format!(
+                "{}: {plan}: the legacy parsers say what the reference says and the table does \
+                 not",
+                self.id
+            ));
         }
         self.plans.push(format!("{plan} {}", verdict.name()));
         (verdict, symphony, legacy)
@@ -1791,6 +1835,15 @@ fn a_difference_past_the_shown_prefix_is_located_by_its_first_byte() {
         "{text}"
     );
     assert!(text.contains("\"\\n\""), "{text}");
+    // Arguments the two sides spell differently are located in one spelling.
+    let spaced = said("{\"patch\": \"line\\n\"}".to_string());
+    let compact = said("{\"patch\":\"line\"}".to_string());
+    let text = located(&spaced, &compact);
+    assert!(
+        text.contains("calls[0].arguments (as JSON) differs at byte 14"),
+        "{text}"
+    );
+    assert!(located(&spaced, &said("{\"patch\":\"line\\n\"}".to_string())).is_empty());
     assert_eq!(window("héllo", 1), "\"h\"|\"éllo\"");
     assert_eq!(window("héllo", 2), "\"h\"|\"éllo\"");
 }
