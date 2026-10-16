@@ -1,0 +1,349 @@
+name: Playground
+
+# Reserve a CI GPU runner for hands-on work and reach it over Tailscale SSH.
+# Usage and one-time setup: scripts/playground/README.md
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpus:
+        description: "H100 GPUs"
+        type: choice
+        options: ["1", "2", "4", "8"]
+        default: "1"
+      hours:
+        description: "Hours to keep the pod (1-24)"
+        type: number
+        default: 1
+      smg:
+        description: "SMG to install"
+        type: choice
+        options: [main, pr, release, skip]
+        default: main
+      smg_ref:
+        description: "PR number (for pr) or version such as 1.13.0 (for release)"
+        type: string
+        default: ""
+      engine:
+        description: "Engine to install"
+        type: choice
+        options: [skip, sglang, vllm, tokenspeed]
+        default: skip
+
+run-name: "Playground: ${{ inputs.gpus }} GPU × ${{ inputs.hours }}h by @${{ github.triggering_actor }}"
+
+permissions: {}
+
+jobs:
+  # Runs on a GitHub-hosted runner so a refused or malformed launch never
+  # claims a GPU.
+  gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      actor: ${{ steps.gate.outputs.actor }}
+      runner: ${{ steps.gate.outputs.runner }}
+      source_sha: ${{ steps.gate.outputs.source_sha }}
+      source_label: ${{ steps.gate.outputs.source_label }}
+      smg_version: ${{ steps.gate.outputs.smg_version }}
+      build_wheel: ${{ steps.gate.outputs.build_wheel }}
+      job_timeout_minutes: ${{ steps.gate.outputs.job_timeout_minutes }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/playground
+          persist-credentials: false
+
+      - name: Check access and inputs
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PG_ACTOR: ${{ github.triggering_actor }}
+          PG_REF: ${{ github.ref }}
+          PG_SHA: ${{ github.sha }}
+          PG_REPO: ${{ github.repository }}
+          PG_GPUS: ${{ inputs.gpus }}
+          PG_HOURS: ${{ inputs.hours }}
+          PG_SMG: ${{ inputs.smg }}
+          PG_SMG_REF: ${{ inputs.smg_ref }}
+          PG_ENGINE: ${{ inputs.engine }}
+          PG_RUNNER_1: ${{ vars.SMG_RUNNER_GPU_1 || '1-gpu-h100' }}
+          PG_RUNNER_2: ${{ vars.SMG_RUNNER_GPU_2 || '2-gpu-h100' }}
+          PG_RUNNER_4: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
+        run: bash scripts/playground/gate.sh
+
+  # Removes tailnet machines that earlier sessions left behind when their pod
+  # died before it could log out. Best effort; skipped until configured.
+  cleanup:
+    needs: gate
+    runs-on: ubuntu-latest
+    environment: playground
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/playground
+          persist-credentials: false
+
+      - name: Remove stale playground machines
+        env:
+          PG_TS_SWEEP_SECRET: ${{ secrets.PLAYGROUND_TS_SWEEP_SECRET }}
+        run: |
+          if [ -z "$PG_TS_SWEEP_SECRET" ]; then
+            echo "::warning::PLAYGROUND_TS_SWEEP_SECRET is not set; stale playground machines are not being removed (scripts/playground/README.md)."
+            exit 0
+          fi
+          bash scripts/playground/sweep.sh
+
+  # Mirrors build-wheel in pr-test-rust.yml, except that it never saves
+  # caches: the source may be a PR, and what it compiles in a run started from
+  # main must not flow into caches that main CI restores. For the same reason
+  # it compiles without sccache (its setup action exports a cache-write token
+  # to later steps). The job keeps main CI's RUSTC_WRAPPER value because
+  # rust-cache folds RUST* variables into its key; the compile steps override
+  # it.
+  build:
+    needs: gate
+    if: needs.gate.outputs.build_wheel == 'true'
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      RUSTC_WRAPPER: sccache
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.gate.outputs.source_sha }}
+          persist-credentials: false
+
+      - name: Install Rust
+        run: bash scripts/ci_install_rust.sh
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+          cache-directories: |
+            bindings/golang/target
+          shared-key: "rust-cache"
+          save-if: false
+
+      - name: Build Python wheel
+        env:
+          RUSTC_WRAPPER: env  # runs rustc as is
+        run: |
+          rm -rf bindings/python/dist/
+          bash scripts/ci_setup_python_venv.sh
+          bash scripts/ci_build_wheel.sh
+
+      - name: Generate Python client types
+        env:
+          RUSTC_WRAPPER: env
+        run: |
+          source "$HOME/.cargo/env"
+          mkdir -p clients/openapi
+          cargo run -p openapi-gen -- clients/openapi/smg-openapi.yaml
+          pip install 'datamodel-code-generator==0.54.0'
+          datamodel-codegen \
+            --input clients/openapi/smg-openapi.yaml \
+            --input-file-type openapi \
+            --output clients/python/smg_client/types/_generated.py \
+            --output-model-type pydantic_v2.BaseModel \
+            --use-annotated \
+            --field-constraints \
+            --target-python-version 3.10 \
+            --collapse-root-models \
+            --use-standard-collections \
+            --use-union-operator
+          sed -i 's/class \(.*\)(Enum):/class \1(str, Enum):/' clients/python/smg_client/types/_generated.py
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v7
+        with:
+          name: playground-smg-wheel
+          path: bindings/python/dist/*.whl
+          retention-days: 1
+
+      - name: Upload Python client types
+        uses: actions/upload-artifact@v7
+        with:
+          name: playground-python-client-types
+          path: clients/python/smg_client/types/_generated.py
+          retention-days: 1
+
+  session:
+    name: session (${{ inputs.gpus }}× H100, ${{ inputs.hours }}h)
+    needs: [gate, build]
+    # !cancelled() rather than always(): cancelling the run must end the
+    # session, queued or holding.
+    if: >-
+      !cancelled()
+      && needs.gate.result == 'success'
+      && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ${{ needs.gate.outputs.runner }}
+    environment: playground
+    timeout-minutes: ${{ fromJSON(needs.gate.outputs.job_timeout_minutes) }}
+    # One session per person at a time; a second launch waits for the first.
+    concurrency:
+      group: playground-${{ github.triggering_actor }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      # "Re-run failed jobs" reuses the gate's result from the first attempt,
+      # so the person re-running must be the person the gate checked.
+      - name: Check the launcher
+        env:
+          CHECKED: ${{ needs.gate.outputs.actor }}
+          RERUN_BY: ${{ github.triggering_actor }}
+        run: |
+          if [ "$RERUN_BY" != "$CHECKED" ]; then
+            echo "::error::This session was launched by @${CHECKED}. Start a new Playground run instead of re-running it."
+            exit 1
+          fi
+
+      - name: Check out SMG source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.gate.outputs.source_sha }}
+          persist-credentials: false
+
+      # Session plumbing always comes from main: it handles the tailnet secret,
+      # and a PR branched before this workflow existed has no copy of it.
+      - name: Check out playground tooling
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: .playground-tools
+          sparse-checkout: scripts/playground
+          persist-credentials: false
+
+      - name: Stage playground tooling
+        run: |
+          mkdir -p "$RUNNER_TEMP/playground-tools"
+          cp .playground-tools/scripts/playground/*.sh "$RUNNER_TEMP/playground-tools/"
+          rm -rf .playground-tools
+          echo "PG_TOOLS=$RUNNER_TEMP/playground-tools" >> "$GITHUB_ENV"
+
+      # Join before any code from the selected source runs (engine setup, the
+      # venv and test-dependency scripts): that code runs as the same user,
+      # so it must not get a chance at the join secret or the machine name.
+      - name: Join the tailnet
+        env:
+          PG_TS_AUTHKEY: ${{ secrets.PLAYGROUND_TS_AUTHKEY_SECRET }}
+          PG_HOSTNAME: smg-pg-${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash "$PG_TOOLS/session.sh" join
+
+      # The cluster runners share one NAT egress IP and GitHub intermittently
+      # 401s anonymous git from it (see e2e-gpu-job.yml). Carry the job token
+      # for setup only; it is removed before the session opens.
+      - name: Authenticate git for github.com
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+
+      # Install failures don't end the run: a half-set-up pod is still a place
+      # to debug the install. The summary reports what failed.
+      - name: Set up SGLang
+        id: engine_sglang
+        if: inputs.engine == 'sglang'
+        continue-on-error: true
+        uses: ./.github/actions/setup-sglang
+
+      - name: Set up vLLM
+        id: engine_vllm
+        if: inputs.engine == 'vllm'
+        continue-on-error: true
+        uses: ./.github/actions/setup-vllm
+
+      - name: Set up TokenSpeed
+        id: engine_tokenspeed
+        if: inputs.engine == 'tokenspeed'
+        continue-on-error: true
+        uses: ./.github/actions/setup-tokenspeed
+
+      - name: Download SMG wheel
+        if: needs.gate.outputs.build_wheel == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: playground-smg-wheel
+          path: ${{ runner.temp }}/smg-wheel
+
+      - name: Download Python client types
+        if: needs.gate.outputs.build_wheel == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: playground-python-client-types
+          path: clients/python/smg_client/types/
+
+      - name: Install SMG
+        id: smg
+        if: inputs.smg != 'skip'
+        continue-on-error: true
+        env:
+          SMG_VERSION: ${{ needs.gate.outputs.smg_version }}
+          WHEEL_DIR: ${{ runner.temp }}/smg-wheel
+        run: |
+          [ -x .venv/bin/python ] || bash scripts/ci_setup_python_venv.sh
+          export PATH="$PWD/.venv/bin:$PATH"
+          python3 -m pip uninstall -y smg || true
+          if [ -n "$SMG_VERSION" ]; then
+            python3 -m pip install "smg==${SMG_VERSION}"
+          else
+            python3 -m pip install "$WHEEL_DIR"/*.whl
+          fi
+          bash scripts/ci_install_e2e_deps.sh
+
+      - name: Remove git credentials
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: git config --global --remove-section "url.https://x-access-token:${GITHUB_TOKEN}@github.com/" || true
+
+      - name: Summarize setup
+        id: setup
+        env:
+          SMG: ${{ inputs.smg }}
+          SMG_OUTCOME: ${{ steps.smg.outcome }}
+          ENGINE_OUTCOME: ${{ steps.engine_sglang.outcome }}${{ steps.engine_vllm.outcome }}${{ steps.engine_tokenspeed.outcome }}
+        run: |
+          # Only the selected engine's step ran; the others report "skipped".
+          engine="${ENGINE_OUTCOME//skipped/}"
+          case "$SMG:$SMG_OUTCOME" in
+            skip:*) smg="not installed" ;;
+            *:success) smg="installed" ;;
+            *) smg="install failed (see the Install SMG step)" ;;
+          esac
+          case "$engine" in
+            "") engine="not installed" ;;
+            success) engine="installed" ;;
+            *) engine="install failed (see the setup step)" ;;
+          esac
+          echo "smg=$smg" >> "$GITHUB_OUTPUT"
+          echo "engine=$engine" >> "$GITHUB_OUTPUT"
+
+      - name: Get the session ready
+        env:
+          PG_HOURS: ${{ inputs.hours }}
+          PG_GPUS: ${{ inputs.gpus }}
+          PG_SOURCE_LABEL: ${{ needs.gate.outputs.source_label }}
+          PG_SMG_STATUS: ${{ steps.setup.outputs.smg }}
+          PG_ENGINE: ${{ inputs.engine }}
+          PG_ENGINE_STATUS: ${{ steps.setup.outputs.engine }}
+        run: bash "$PG_TOOLS/session.sh" ready
+
+      # Ends at the chosen time or on `playground-done`; the job timeout is the
+      # backstop. Cancelling the run also ends it.
+      - name: Hold the pod
+        run: bash "$PG_TOOLS/session.sh" hold
+
+      - name: Leave the tailnet
+        if: always() && env.PG_TOOLS != ''
+        run: bash "$PG_TOOLS/session.sh" down

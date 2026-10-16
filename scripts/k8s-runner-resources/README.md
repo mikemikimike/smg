@@ -148,6 +148,19 @@ helm upgrade --install 4-gpu-h100 \
   oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
 ```
 
+`8-gpu-h100` takes a whole `BM.GPU.H100.8` node and scales from zero (`minRunners: 0`), so an idle
+runner never pins a node. Only the Playground workflow uses it today (`scripts/playground/README.md`);
+a job waits until binpacking frees an entire node.
+
+```bash
+helm upgrade --install 8-gpu-h100 \
+  --namespace actions-runner-system \
+  --create-namespace \
+  --version 0.14.2 \
+  -f scripts/k8s-runner-resources/runner-values-8-gpu-h100.yaml \
+  oci://ghcr.io/actions/actions-runner-controller-charts/gha-runner-scale-set
+```
+
 `bellwether-record` runs bellwether's `record` workflow, one job per checkpoint group. It is registered to the
 `bellwether` repository alone, so no organization runner group is involved. Its pods have 8 CPU, 64 GiB and a
 40 GiB disk request, with no docker and no credentials, since the repository is public. They prefer CPU-only nodes
