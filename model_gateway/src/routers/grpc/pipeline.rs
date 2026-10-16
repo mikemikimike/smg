@@ -77,6 +77,7 @@ use crate::{
     observability::{
         cache_trace,
         metrics::{bool_to_static_str, metrics_labels, Metrics},
+        tenant_usage::{self, RequestUsage},
     },
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
@@ -594,6 +595,7 @@ impl RequestPipeline {
             &attempt_plan,
             &dctx.dispatch_model,
             dctx.workers.as_ref(),
+            dctx.tenant_key.clone(),
         ));
 
         execute_plan(dctx, attempt_plan, last_attempt).await?;
@@ -904,6 +906,28 @@ impl RequestPipeline {
         );
     }
 
+    /// Book a buffered response to its tenant's usage row, when accounting
+    /// is on: the token counts the response shows, the time since the
+    /// successful attempt's start. A stream books itself at its last token.
+    fn record_usage(
+        dctx: &DispatchContext,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        start: Instant,
+    ) {
+        if let Some(dispatch) = dctx.dispatch.as_ref() {
+            tenant_usage::record(
+                dispatch.usage_tenant(),
+                &dispatch.model,
+                RequestUsage {
+                    prompt_tokens: u64::from(prompt_tokens),
+                    completion_tokens: u64::from(completion_tokens),
+                    elapsed: start.elapsed(),
+                },
+            );
+        }
+    }
+
     fn wrong_response_type(
         &self,
         function: &'static str,
@@ -1097,6 +1121,13 @@ impl RequestPipeline {
                         Self::recorded_settlement(&dctx.response),
                     )
                     .await;
+                    let usage = response.usage.as_ref();
+                    Self::record_usage(
+                        &dctx,
+                        usage.map_or(0, |u| u.prompt_tokens),
+                        usage.map_or(0, |u| u.completion_tokens),
+                        start,
+                    );
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1139,6 +1170,11 @@ impl RequestPipeline {
                         Self::generate_settlement(&response),
                     )
                     .await;
+                    let actual_input_tokens =
+                        response.first().map_or(0, |r| r.meta_info.prompt_tokens);
+                    let completion_tokens =
+                        response.iter().map(|r| r.meta_info.completion_tokens).sum();
+                    Self::record_usage(&dctx, actual_input_tokens, completion_tokens, start);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1181,6 +1217,13 @@ impl RequestPipeline {
                         Self::completion_settlement(response.usage.as_ref()),
                     )
                     .await;
+                    let usage = response.usage.as_ref();
+                    Self::record_usage(
+                        &dctx,
+                        usage.map_or(0, |u| u.prompt_tokens),
+                        usage.map_or(0, |u| u.completion_tokens),
+                        start,
+                    );
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1226,6 +1269,12 @@ impl RequestPipeline {
                         Self::recorded_settlement(&dctx.response),
                     )
                     .await;
+                    Self::record_usage(
+                        &dctx,
+                        response.usage.input_tokens,
+                        response.usage.output_tokens,
+                        start,
+                    );
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1270,6 +1319,9 @@ impl RequestPipeline {
                         Self::decisions_settlement(&response.usage),
                     )
                     .await;
+                    let input_tokens =
+                        u32::try_from(response.usage.input_tokens).unwrap_or(u32::MAX);
+                    Self::record_usage(&dctx, input_tokens, 0, start);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1303,6 +1355,7 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Embedding(response)) => {
+                    Self::record_usage(&dctx, response.usage.prompt_tokens, 0, start);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1340,6 +1393,7 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Transcription { text, format }) => {
+                    Self::record_usage(&dctx, 0, 0, start);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(
                         &dctx,
@@ -1378,6 +1432,7 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Classify(response)) => {
+                    Self::record_usage(&dctx, response.usage.prompt_tokens, 0, start);
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
