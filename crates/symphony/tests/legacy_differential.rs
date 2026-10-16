@@ -21,8 +21,9 @@
 //! What the two say is compared at three strengths and every difference is classified against
 //! the template reference bellwether recorded with the case: `bitwise` (the same strings), `equal`
 //! (the same channels, the arguments equal as JSON values: the legacy parsers re-serialize them),
-//! `equivalent` (the same once whitespace at the edges of the content and the reasoning is
-//! trimmed: the template's separators, which the two paths keep differently); past that,
+//! `equivalent` (the same once the newlines at the edges of the content and the reasoning are
+//! trimmed: the template's separators, which the two paths keep differently, the one difference
+//! allowed by contract, [`EQUIVALENT_BY_CONTRACT`]; any other whitespace counts); past that,
 //! `symphony right` when the table says what the reference says and the legacy parsers do not,
 //! `legacy right` the other way round, and `both wrong` when neither does. A case whose calls or
 //! thought the legacy pair of its table cannot read ([`Legacy`]: a family with a reasoning parser
@@ -488,7 +489,9 @@ impl Said {
             && calls_equal(&self.calls, &other.calls)
     }
 
-    /// [`Self::equal`] once whitespace at the edges of the content and the reasoning is trimmed.
+    /// [`Self::equal`] once the newlines at the edges of the content and the reasoning are
+    /// trimmed: [`EQUIVALENT_BY_CONTRACT`], the one difference the differential allows between the
+    /// two paths. Any other whitespace counts.
     fn equivalent(&self, other: &Self) -> bool {
         self.trimmed().equal(&other.trimmed())
     }
@@ -496,8 +499,8 @@ impl Said {
     fn trimmed(&self) -> Self {
         let trim = |part: &Option<String>| {
             part.as_deref()
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
+                .map(|text| text.trim_matches('\n'))
+                .filter(|text| !text.trim().is_empty())
                 .map(str::to_string)
         };
         Self {
@@ -665,7 +668,7 @@ impl Verdict {
             Self::Listed => "listed",
             Self::Bitwise => "bitwise",
             Self::Equal => "equal",
-            Self::Equivalent => "equivalent",
+            Self::Equivalent => "equivalent (edge newlines)",
             Self::SymphonyRight => "symphony right",
             Self::LegacyRight => "LEGACY RIGHT",
             Self::BothWrong => "both wrong",
@@ -708,6 +711,15 @@ impl Reach {
             && (self.reasoning || reference.reasoning.is_none())
     }
 }
+
+/// The one class of difference between the two paths allowed by contract, with its reason: the
+/// newlines a chat template writes around its markers (after `<think>`, after `</think>`, before
+/// a call's opener) are in the output; the table hands them on as the model's bytes and the legacy
+/// parsers strip some of them, and bellwether's reference trims them (bellwether #17). A replay
+/// whose two sides agree once those newlines are trimmed from the edges of the content and the
+/// reasoning is `equivalent`; a difference in any other byte, whitespace included, is graded.
+const EQUIVALENT_BY_CONTRACT: &str =
+    "newlines at the edges of the content and the reasoning: the template's separators (bellwether #17)";
 
 /// The probe cases of bellwether's common set (bellwether #16) that put a marker inside text: a
 /// `</think>` inside the reasoning and a complete `<tool_call>` block inside a code fence. Every
@@ -1755,8 +1767,10 @@ fn every_recorded_output_reads_no_worse_with_its_table_than_with_the_legacy_pars
     } else {
         String::new()
     };
-    println!("per table{sample}:\n{totals}");
-    file.write(&format!("per table{sample}:\n{totals}"));
+    println!("per table{sample}:\n{totals}equivalent by contract: {EQUIVALENT_BY_CONTRACT}\n");
+    file.write(&format!(
+        "per table{sample}:\n{totals}equivalent by contract: {EQUIVALENT_BY_CONTRACT}\n"
+    ));
     for failure in &failures {
         file.write(&format!("{failure}\n"));
     }
@@ -1902,6 +1916,17 @@ fn the_verdict_grades_the_agreement_and_names_the_right_side() {
             reach
         ),
         Verdict::Equivalent
+    );
+    // Any other whitespace at an edge is a difference, judged by the reference.
+    assert_eq!(
+        verdict(
+            "m/parse/x",
+            &said("Done. ", "{\"a\": 1}"),
+            &said("Done.", "{\"a\":1}"),
+            &reference,
+            reach
+        ),
+        Verdict::LegacyRight
     );
     assert_eq!(
         verdict(
