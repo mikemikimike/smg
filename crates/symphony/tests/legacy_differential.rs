@@ -13,8 +13,9 @@
 //! flush and the unstreamed text and arguments the gateway takes at the end of a stream. The
 //! legacy side runs as the gateway runs it: the reasoning parser first, armed when the prompt
 //! leaves the model inside its thought, then the tool parser on the text outside the thought when
-//! the request declares tools; whitespace-only content is absent, and `stop` after a call is
-//! `tool_calls`.
+//! the request declares tools (a list, empty or not, as the gateway reads it; a request with a
+//! `tool_choice` is not routed and counted); whitespace-only content is absent, and `stop` after
+//! a call is `tool_calls`.
 //!
 //! What the two say is compared at three strengths and every difference is classified against
 //! the template reference bellwether recorded with the case: `bitwise` (the same strings), `equal`
@@ -334,8 +335,13 @@ struct Fixture {
 
 #[derive(Default, Deserialize)]
 struct Request {
-    #[serde(default)]
-    tools: Vec<Tool>,
+    /// The declared tools: the gateway runs its tool parser when the request declares a list,
+    /// an empty one included, and not when it declares none.
+    tools: Option<Vec<Tool>>,
+    /// A `tool_choice` takes the gateway's legacy path elsewhere (`none` runs no tool parser, a
+    /// forced or named choice reads with the JSON schema parser): a case that sets one is not
+    /// routed here, and counted. The recorded corpus sets none.
+    tool_choice: Option<Value>,
     #[serde(default)]
     chat_template_kwargs: Option<ChatTemplateKwargs>,
 }
@@ -520,6 +526,78 @@ impl fmt::Display for Said {
     }
 }
 
+/// Where two sides first differ, field by field: the field, the byte, and a window of each side
+/// around it, so a report whose brief rendering shows the same prefix for both still says what
+/// tells them apart.
+fn located(symphony: &Said, legacy: &Said) -> String {
+    let mut fields: Vec<(String, &str, &str)> = vec![
+        (
+            "content".to_string(),
+            symphony.content.as_deref().unwrap_or(""),
+            legacy.content.as_deref().unwrap_or(""),
+        ),
+        (
+            "reasoning".to_string(),
+            symphony.reasoning.as_deref().unwrap_or(""),
+            legacy.reasoning.as_deref().unwrap_or(""),
+        ),
+    ];
+    for (at, (a, b)) in symphony.calls.iter().zip(&legacy.calls).enumerate() {
+        fields.push((format!("calls[{at}].name"), &a.0, &b.0));
+        fields.push((format!("calls[{at}].arguments"), &a.1, &b.1));
+    }
+    fields.push(("finish".to_string(), &symphony.finish, &legacy.finish));
+    let mut out = String::new();
+    for (field, a, b) in fields {
+        if a == b {
+            continue;
+        }
+        let at = a
+            .bytes()
+            .zip(b.bytes())
+            .position(|(x, y)| x != y)
+            .unwrap_or(a.len().min(b.len()));
+        out.push_str(&format!(
+            "      {field} differs at byte {at}: symphony {} legacy {}\n",
+            window(a, at),
+            window(b, at)
+        ));
+    }
+    if symphony.calls.len() != legacy.calls.len() {
+        out.push_str(&format!(
+            "      {} call(s) on the symphony side, {} on the legacy side\n",
+            symphony.calls.len(),
+            legacy.calls.len()
+        ));
+    }
+    out
+}
+
+/// Up to 60 characters of `text` before `at` and 60 from it, on character boundaries, with the
+/// bar at `at`.
+fn window(text: &str, at: usize) -> String {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let from = text[..at]
+        .char_indices()
+        .rev()
+        .nth(59)
+        .map_or(0, |(i, _)| i);
+    let to = text[at..]
+        .char_indices()
+        .nth(60)
+        .map_or(text.len(), |(i, _)| at + i);
+    format!(
+        "{}{:?}|{:?}{}",
+        if from > 0 { "…" } else { "" },
+        &text[from..at],
+        &text[at..to],
+        if to < text.len() { "…" } else { "" }
+    )
+}
+
 /// Whether two call lists name the same tools with the same arguments, the arguments compared as
 /// JSON values where both parse and as text otherwise.
 fn calls_equal(a: &[(String, String)], b: &[(String, String)]) -> bool {
@@ -591,10 +669,12 @@ impl Reach {
         }
     }
 
-    /// Whether the pair can read everything the table or the reference found in the case.
-    fn covers(self, symphony: &Said, reference: &Said) -> bool {
-        (self.calls || (symphony.calls.is_empty() && reference.calls.is_empty()))
-            && (self.reasoning || (symphony.reasoning.is_none() && reference.reasoning.is_none()))
+    /// Whether the pair can read everything the reference says the case holds. The reference
+    /// alone decides: a call or a thought the table finds where the reference has none is the
+    /// table's to answer for, so such a case is compared.
+    fn covers(self, reference: &Said) -> bool {
+        (self.calls || reference.calls.is_empty())
+            && (self.reasoning || reference.reasoning.is_none())
     }
 }
 
@@ -616,7 +696,7 @@ fn is_probe(id: &str) -> bool {
 
 /// The verdict for one replay: how far the two sides agree, and which is right when they differ.
 fn verdict(id: &str, symphony: &Said, legacy: &Said, reference: &Said, reach: Reach) -> Verdict {
-    if !reach.covers(symphony, reference) {
+    if !reach.covers(reference) {
         Verdict::OutOfReach
     } else if symphony == legacy {
         Verdict::Bitwise
@@ -693,12 +773,13 @@ fn legacy_finish(finish: &str, calls: bool) -> String {
 
 /// The legacy path on a whole output, as the non-streaming gateway runs it: the reasoning parser
 /// first, armed when the prompt leaves the model inside its thought (`opened`), then the tool
-/// parser on the text outside the thought when the request declares tools.
+/// parser on the text outside the thought when the request declares `tools` (a list, empty or
+/// not; `None` declares none).
 fn legacy_whole(
     factories: &Factories,
     legacy: Legacy,
     text: &str,
-    tools: &[Tool],
+    tools: Option<&[Tool]>,
     opened: bool,
     finish: &str,
 ) -> Said {
@@ -714,18 +795,16 @@ fn legacy_whole(
         }
     }
     let mut calls = Vec::new();
-    if let Some(parser) = factories.tool_parser(legacy) {
-        if !tools.is_empty() {
-            if let Ok((normal, parsed)) = factories
-                .runtime
-                .block_on(parser.parse_complete_with_tools(&rest, tools))
-            {
-                calls = parsed
-                    .into_iter()
-                    .map(|call| (call.function.name, call.function.arguments))
-                    .collect();
-                rest = normal;
-            }
+    if let (Some(parser), Some(tools)) = (factories.tool_parser(legacy), tools) {
+        if let Ok((normal, parsed)) = factories
+            .runtime
+            .block_on(parser.parse_complete_with_tools(&rest, tools))
+        {
+            calls = parsed
+                .into_iter()
+                .map(|call| (call.function.name, call.function.arguments))
+                .collect();
+            rest = normal;
         }
     }
     let finish = legacy_finish(finish, !calls.is_empty());
@@ -734,15 +813,16 @@ fn legacy_whole(
 
 /// The legacy path on an output cut at `cuts`, as the streaming gateway runs it: every delta
 /// through the reasoning parser (armed as above, the prompt's `<think>` stripped), its normal text
-/// through the tool parser when the request declares tools and the reasoning parser is not inside
-/// the thought, else to the content; at the end the reasoning parser's flush, then the tool
-/// parser's unstreamed text and arguments. A client folds the deltas as the chat message does.
+/// through the tool parser when the request declares `tools` and the reasoning parser is not
+/// inside the thought, else to the content; at the end the reasoning parser's flush, then the
+/// tool parser's unstreamed text and arguments. A client folds the deltas as the chat message
+/// does.
 fn legacy_streamed(
     factories: &Factories,
     legacy: Legacy,
     text: &str,
     cuts: &[usize],
-    tools: &[Tool],
+    tools: Option<&[Tool]>,
     opened: bool,
     finish: &str,
 ) -> Said {
@@ -751,7 +831,8 @@ fn legacy_streamed(
         parser.mark_reasoning_started();
         parser.mark_think_start_stripped();
     }
-    let mut tool_parser = factories.tool_parser(legacy).filter(|_| !tools.is_empty());
+    let mut tool_parser = tools.and_then(|_| factories.tool_parser(legacy));
+    let tools = tools.unwrap_or_default();
     let (mut content, mut reasoning) = (String::new(), String::new());
     let mut calls: BTreeMap<usize, (Option<String>, String)> = BTreeMap::new();
     let mut any_call = false;
@@ -1003,6 +1084,8 @@ impl Drift {
 #[derive(Clone, Debug, Default)]
 struct Counts {
     cases: usize,
+    /// Cases whose request sets a `tool_choice`, which the differential does not route.
+    unrouted: usize,
     /// Cases without recorded pieces, which have no token plans.
     without_pieces: usize,
     whole: Tally,
@@ -1019,6 +1102,7 @@ struct Counts {
 impl Counts {
     fn add(&mut self, other: &Self) {
         self.cases += other.cases;
+        self.unrouted += other.unrouted;
         self.without_pieces += other.without_pieces;
         self.whole.add(other.whole);
         self.token.add(other.token);
@@ -1043,8 +1127,8 @@ impl fmt::Display for Counts {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "  {} cases ({} without recorded pieces)",
-            self.cases, self.without_pieces
+            "  {} cases ({} without recorded pieces, {} with a tool_choice, not routed)",
+            self.cases, self.without_pieces, self.unrouted
         )?;
         writeln!(f, "  whole:           {}", self.whole)?;
         writeln!(f, "  token plans:     {}", self.token)?;
@@ -1242,8 +1326,14 @@ fn replay_model(
     let mut equivalents_shown = 0;
     let cases = each_fixture(&recorded.parse, every, &mut |fixture: Fixture| {
         let fixture = &fixture;
+        if fixture.request.tool_choice.is_some() {
+            counts.unrouted += 1;
+            report.push_str(&format!("  {:16} {}\n", "not routed", fixture.id));
+            return;
+        }
         let text = fixture.reference.text.as_str();
-        let tools = fixture.request.tools.as_slice();
+        let declared = fixture.request.tools.as_deref();
+        let tools = declared.unwrap_or_default();
         let tail = prompt.tail(&fixture.request, markers);
         let opened = format.reasoning_open(&tail);
         let finish = engine_finish(&fixture.reference.finish_reason);
@@ -1270,7 +1360,7 @@ fn replay_model(
                 symphony_said(&format, tools, &tail, text, &[], &finish)
             }),
             caught("the legacy parsers", || {
-                legacy_whole(&factories, legacy, text, tools, opened, engine_reason)
+                legacy_whole(&factories, legacy, text, declared, opened, engine_reason)
             }),
         );
         case.counts.whole.count(whole_verdict);
@@ -1298,7 +1388,7 @@ fn replay_model(
                         legacy,
                         text,
                         &cuts,
-                        tools,
+                        declared,
                         opened,
                         engine_reason,
                     )
@@ -1402,9 +1492,10 @@ impl Case<'_> {
             if let (Some(symphony), Some(legacy)) = (&symphony, &legacy) {
                 self.details.push_str(&format!(
                     "    {plan}: {}\n      symphony:  {symphony}\n      legacy:    {legacy}\n      \
-                     reference: {}\n",
+                     reference: {}\n{}",
                     verdict.name(),
-                    self.reference
+                    self.reference,
+                    located(symphony, legacy)
                 ));
             }
             if verdict == Verdict::LegacyRight {
@@ -1502,15 +1593,45 @@ impl Drop for StopOnPanic<'_> {
     }
 }
 
-/// The report file under [`REPORT_DIR_ENV`] or the build's `target/tmp`.
-fn report_file() -> Result<(PathBuf, BufWriter<fs::File>), String> {
-    let dir = std::env::var_os(REPORT_DIR_ENV)
-        .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
-    fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let path = dir.join(REPORT_FILE);
-    let file =
-        fs::File::create(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-    Ok((path, BufWriter::new(file)))
+/// The report file under [`REPORT_DIR_ENV`] or the build's `target/tmp`; a write that fails is
+/// kept and reported when the file is finished, so that the run's closures need not handle it.
+struct Report {
+    path: PathBuf,
+    file: BufWriter<fs::File>,
+    error: Option<std::io::Error>,
+}
+
+impl Report {
+    fn create() -> Result<Self, String> {
+        let dir = std::env::var_os(REPORT_DIR_ENV)
+            .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let path = dir.join(REPORT_FILE);
+        let file = fs::File::create(&path)
+            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        Ok(Self {
+            path,
+            file: BufWriter::new(file),
+            error: None,
+        })
+    }
+
+    fn write(&mut self, text: &str) {
+        if let Err(e) = self.file.write_all(text.as_bytes()) {
+            self.error.get_or_insert(e);
+        }
+    }
+
+    /// Close the file: its path, or the first error met.
+    fn finish(mut self) -> Result<PathBuf, String> {
+        if let Err(e) = self.file.flush() {
+            self.error.get_or_insert(e);
+        }
+        match self.error {
+            Some(e) => Err(format!("cannot write {}: {e}", self.path.display())),
+            None => Ok(self.path),
+        }
+    }
 }
 
 #[test]
@@ -1530,7 +1651,7 @@ fn every_recorded_output_reads_no_worse_with_its_table_than_with_the_legacy_pars
     let slugs = recorded(&root).unwrap_or_else(|e| panic!("{e}"));
     let every = sample_every();
     let asked = asked_slugs();
-    let (path, mut file) = report_file().unwrap_or_else(|e| panic!("{e}"));
+    let mut file = Report::create().unwrap_or_else(|e| panic!("{e}"));
     let mut by_table: BTreeMap<&'static str, (Legacy, usize, Counts)> = BTreeMap::new();
     let mut failures = Vec::new();
     let mut replayed = 0;
@@ -1557,7 +1678,7 @@ fn every_recorded_output_reads_no_worse_with_its_table_than_with_the_legacy_pars
             }
             Ok(model) => {
                 print!("{}", model.shown);
-                let _ = file.write_all(model.report.as_bytes());
+                file.write(&model.report);
                 let entry = by_table
                     .entry(model.table.name())
                     .or_insert_with(|| (model.legacy, 0, Counts::default()));
@@ -1591,12 +1712,11 @@ fn every_recorded_output_reads_no_worse_with_its_table_than_with_the_legacy_pars
         String::new()
     };
     println!("per table{sample}:\n{totals}");
-    let _ = file.write_all(format!("per table{sample}:\n{totals}").as_bytes());
+    file.write(&format!("per table{sample}:\n{totals}"));
     for failure in &failures {
-        let _ = file.write_all(format!("{failure}\n").as_bytes());
+        file.write(&format!("{failure}\n"));
     }
-    file.flush()
-        .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
+    let path = file.finish().unwrap_or_else(|e| panic!("{e}"));
     println!("per-case report: {}", path.display());
     assert!(
         failures.is_empty(),
@@ -1654,6 +1774,25 @@ fn every_legacy_name_the_tables_declare_is_registered() {
             );
         }
     }
+}
+
+#[test]
+fn a_difference_past_the_shown_prefix_is_located_by_its_first_byte() {
+    let long = "x".repeat(300);
+    let said = |arguments: String| Said {
+        content: None,
+        reasoning: None,
+        calls: vec![("f".to_string(), arguments)],
+        finish: "tool_calls".to_string(),
+    };
+    let text = located(&said(format!("{long}\n")), &said(long.clone()));
+    assert!(
+        text.contains("calls[0].arguments differs at byte 300"),
+        "{text}"
+    );
+    assert!(text.contains("\"\\n\""), "{text}");
+    assert_eq!(window("héllo", 1), "\"h\"|\"éllo\"");
+    assert_eq!(window("héllo", 2), "\"h\"|\"éllo\"");
 }
 
 #[test]
@@ -1778,14 +1917,14 @@ fn the_legacy_path_reads_a_qwen_output_as_the_gateway_does_whole_and_streamed() 
     }]))
     .expect("a tool");
     let text = "<think>\nplan\n</think>\n\nLet me check.\n<tool_call>\n{\"name\": \"f\", \"arguments\": {\"a\": 1}}\n</tool_call>";
-    let whole = legacy_whole(&factories, legacy, text, &tools, false, "stop");
+    let whole = legacy_whole(&factories, legacy, text, Some(&tools), false, "stop");
     assert_eq!(whole.reasoning.as_deref(), Some("\nplan\n"));
     assert_eq!(whole.content.as_deref(), Some("\n\nLet me check.\n"));
     assert_eq!(whole.calls.len(), 1);
     assert_eq!(whole.calls[0].0, "f");
     assert_eq!(whole.finish, "tool_calls");
     let cuts: Vec<usize> = text.char_indices().map(|(at, _)| at).skip(1).collect();
-    let streamed = legacy_streamed(&factories, legacy, text, &cuts, &tools, false, "stop");
+    let streamed = legacy_streamed(&factories, legacy, text, &cuts, Some(&tools), false, "stop");
     assert!(
         whole.equivalent(&streamed),
         "whole {whole:?}\nstreamed {streamed:?}"
@@ -1803,7 +1942,7 @@ fn the_legacy_path_reads_a_qwen_output_as_the_gateway_does_whole_and_streamed() 
         &factories,
         legacy,
         "plan</think>Done.",
-        &tools,
+        Some(&tools),
         true,
         "stop",
     );
