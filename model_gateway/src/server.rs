@@ -1,4 +1,6 @@
 use std::{
+    future::Future,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -980,6 +982,13 @@ pub struct ServerConfig {
     /// leaves the dedicated listener off; probe routes always stay on the
     /// main `port` regardless.
     pub health_check_port: Option<u16>,
+    /// Port of the admin listener. When set, the control-plane routes (the
+    /// admin, worker-registry and RL routes) are served there, with the probe
+    /// routes, and the data listener answers 404 for them. `None` keeps the
+    /// control plane on the data listener.
+    pub admin_port: Option<u16>,
+    /// Bind host of the admin listener; `None` binds it on `host`.
+    pub admin_host: Option<String>,
     /// Explicit async runtime worker-thread count. `None` uses tokio's
     /// container-aware default (`available_parallelism()`). Only the CLI's
     /// `main` sizes its runtime from it; `startup` runs on the caller's
@@ -1045,10 +1054,23 @@ fn with_admission_layer(
     }
 }
 
-/// `serving_auth_config` covers inference-serving routes and may include
-/// per-tenant keys. `admin_auth_config` is the admin/worker-management
-/// fallback (used when `control_plane_auth_state` is `None`) and must
-/// contain only the shared gateway-wide key, never per-tenant keys.
+/// A listener's serve future, boxed so the plain and the TLS stacks share a
+/// type.
+type Serving = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
+
+/// The routers of one start: the data plane's and, with an admin listener,
+/// the control plane's.
+pub struct GatewayApps {
+    /// The serving routes; the control-plane routes too without an admin
+    /// listener.
+    pub data: Router,
+    /// The control-plane routes (admin, worker registry, RL) with the probe
+    /// routes, for the admin listener; `None` without one.
+    pub admin: Option<Router>,
+}
+
+/// One router with every route: the layout without an admin listener. See
+/// [`build_apps`] for the arguments.
 pub fn build_app(
     app_state: Arc<AppState>,
     serving_auth_config: AuthConfig,
@@ -1058,6 +1080,40 @@ pub fn build_app(
     request_id_headers: Vec<String>,
     cors_allowed_origins: Vec<String>,
 ) -> Result<Router, InvalidHeaderName> {
+    build_apps(
+        app_state,
+        serving_auth_config,
+        admin_auth_config,
+        control_plane_auth_state,
+        max_payload_size,
+        request_id_headers,
+        cors_allowed_origins,
+        false,
+    )
+    .map(|apps| apps.data)
+}
+
+/// `serving_auth_config` covers inference-serving routes and may include
+/// per-tenant keys. `admin_auth_config` is the admin/worker-management
+/// fallback (used when `control_plane_auth_state` is `None`) and must
+/// contain only the shared gateway-wide key, never per-tenant keys.
+/// `admin_listener` puts the control-plane routes on a router of their own,
+/// for the admin listener, and leaves them off the data router, which then
+/// answers 404 for them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the inputs of the route groups, named one by one as `build_app` names them"
+)]
+pub fn build_apps(
+    app_state: Arc<AppState>,
+    serving_auth_config: AuthConfig,
+    admin_auth_config: AuthConfig,
+    control_plane_auth_state: Option<smg_auth::ControlPlaneAuthState>,
+    max_payload_size: usize,
+    request_id_headers: Vec<String>,
+    cors_allowed_origins: Vec<String>,
+    admin_listener: bool,
+) -> Result<GatewayApps, InvalidHeaderName> {
     // Pending (upgrade not completed): 30s TTL
     // Disconnected: 60 min TTL
     app_state.context.realtime_registry.start_reaper(
@@ -1301,25 +1357,45 @@ pub fn build_app(
     // A v2-aware admin surface will return in a follow-up PR once
     // adapters are production-wired.
 
-    let mut app = Router::new()
+    let data = Router::new()
         .merge(protected_routes)
         .merge(realtime_routes)
         .merge(multipart_upload_routes)
-        .merge(public_routes)
-        .merge(admin_routes)
-        .merge(worker_routes);
+        .merge(public_routes);
+    let mut control_plane = Router::new().merge(admin_routes).merge(worker_routes);
     if let Some(rl_routes) = rl_routes {
-        app = app.merge(rl_routes);
+        control_plane = control_plane.merge(rl_routes);
     }
 
-    Ok(attach_edge_layers(
-        app,
-        max_payload_size,
-        app_state.context.inflight_tracker.clone(),
-        request_id_headers,
-        cors_allowed_origins,
-    )
-    .with_state(app_state))
+    // Each listener's router gets the edge layers; their not-found fallback
+    // is what answers 404 for a route that lives on the other listener.
+    let finish = |app: Router<Arc<AppState>>| {
+        attach_edge_layers(
+            app,
+            max_payload_size,
+            app_state.context.inflight_tracker.clone(),
+            request_id_headers.clone(),
+            cors_allowed_origins.clone(),
+        )
+        .with_state(Arc::clone(&app_state))
+    };
+    if admin_listener {
+        // The probe routes answer on the admin listener too, so it can be
+        // checked on its own, by an orchestrator or through a network policy.
+        let probes = Router::new()
+            .route("/liveness", get(liveness))
+            .route("/readiness", get(readiness))
+            .route("/health", get(health));
+        Ok(GatewayApps {
+            admin: Some(finish(control_plane.merge(probes))),
+            data: finish(data),
+        })
+    } else {
+        Ok(GatewayApps {
+            data: finish(data.merge(control_plane)),
+            admin: None,
+        })
+    }
 }
 
 /// The middleware every request crosses, matched or not: body limits, the
@@ -1470,6 +1546,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 .as_ref()
                 .map(|prometheus_config| prometheus_config.port),
             config.health_check_port,
+            config.admin_port,
         )?;
     }
 
@@ -1961,6 +2038,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
+    // The admin listener's address, when the control plane has a listener of
+    // its own (`--admin-port`); its bind host defaults to the data listener's.
+    let admin_addr = match config.admin_port {
+        Some(admin_port) => Some(
+            crate::config::bind_socket_addr(
+                config.admin_host.as_deref().unwrap_or(&config.host),
+                admin_port,
+            )
+            .map_err(|e| {
+                format!("Invalid admin listener address (--admin-host, --admin-port): {e}")
+            })?,
+        ),
+        None => None,
+    };
+
     // Name what this start leaves open, once, before the listener opens:
     // an unauthenticated gateway is a decision, not an omission.
     crate::posture::log_open_posture(
@@ -1969,11 +2061,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         control_plane_auth_state.is_some(),
         config.prometheus_config.as_ref(),
         config.mesh_server_config.as_ref(),
+        admin_addr,
     );
     // And where a keyed start's secrets came from, sources alone.
     crate::posture::log_secret_sources(&config.secret_sources);
 
-    let app = build_app(
+    let GatewayApps {
+        data: app,
+        admin: admin_app,
+    } = build_apps(
         app_state,
         serving_auth_config,
         admin_auth_config,
@@ -1981,6 +2077,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size,
         request_id_headers,
         config.router_config.cors_allowed_origins.clone(),
+        admin_addr.is_some(),
     )?;
 
     // One bind-host rule for every listener: IPv6 with or without brackets.
@@ -2033,6 +2130,20 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
         _ => None,
     };
+    // The admin listener binds now, before the HTTP listener, for the reason
+    // the mesh listener did: a port another process holds fails the start
+    // here, before anything serves.
+    let admin_listener = match admin_addr {
+        Some(admin_addr) => Some(
+            tokio::net::TcpListener::bind(admin_addr)
+                .await
+                .and_then(tokio::net::TcpListener::into_std)
+                .map_err(|e| {
+                    format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
+                })?,
+        ),
+        None => None,
+    };
     // The HTTP listener binds now, eagerly, the last of the listeners: a port
     // another process holds fails the start here, before the mesh server
     // below has joined the cluster. Bound through tokio, as axum-server
@@ -2066,6 +2177,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
+    // The admin listener's handle: it drains with the data listener's.
+    let admin_handle = axum_server::Handle::new();
+    let admin_handle_clone = admin_handle.clone();
     let inflight_tracker = app_context.inflight_tracker.clone();
     let grace = Duration::from_secs(config.shutdown_grace_period_secs);
     // Keep accepting for a short settle window before gating, so requests still
@@ -2100,6 +2214,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             tokio::time::sleep(settle).await;
         }
         handle_clone.graceful_shutdown(Some(drain_timeout));
+        admin_handle_clone.graceful_shutdown(Some(drain_timeout));
 
         // Phase 2: Drain — wait for in-flight requests to complete
         // Re-check after gating to catch requests that arrived between the
@@ -2132,21 +2247,56 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         "HTTP connection timeouts (0 = disabled)"
     );
 
-    let server_result = if let Some(tls_config) = tls_config {
+    // The admin listener serves the control plane with the data listener's
+    // TLS material and connection timeouts, and drains with it (the shutdown
+    // above closes both handles together).
+    let admin_serving: Serving = match (admin_listener, admin_app) {
+        (Some(admin_listener), Some(admin_app)) => {
+            let admin_addr = admin_listener.local_addr()?;
+            info!(
+                "Admin listener serving the control plane on {admin_addr} (--admin-port): the \
+                 admin, worker-registry and RL routes answer there, and 404 on {addr}"
+            );
+            let admin_app = admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+            match tls_config.clone() {
+                Some(tls_config) => Box::pin(
+                    axum_server::from_tcp_rustls(admin_listener, tls_config)?
+                        .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
+                        .handle(admin_handle)
+                        .serve(admin_app),
+                ),
+                None => Box::pin(
+                    axum_server::from_tcp(admin_listener)?
+                        .acceptor(http_acceptor(connection_timeouts))
+                        .handle(admin_handle)
+                        .serve(admin_app),
+                ),
+            }
+        }
+        _ => Box::pin(std::future::ready(Ok(()))),
+    };
+    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let data_serving: Serving = if let Some(tls_config) = tls_config {
         info!("TLS enabled");
 
-        axum_server::from_tcp_rustls(listener, tls_config)?
-            .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
-            .handle(handle)
-            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
+        Box::pin(
+            axum_server::from_tcp_rustls(listener, tls_config)?
+                .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
+                .handle(handle)
+                .serve(app),
+        )
     } else {
-        axum_server::from_tcp(listener)?
-            .acceptor(http_acceptor(connection_timeouts))
-            .handle(handle)
-            .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await
+        Box::pin(
+            axum_server::from_tcp(listener)?
+                .acceptor(http_acceptor(connection_timeouts))
+                .handle(handle)
+                .serve(app),
+        )
     };
+    let (server_result, admin_result) = tokio::join!(data_serving, admin_serving);
+    if let Err(e) = admin_result {
+        error!("Admin listener stopped with an error: {e}");
+    }
 
     // Graceful Shutdown
 
@@ -2975,6 +3125,8 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 0,
             health_check_port: None,
+            admin_port: None,
+            admin_host: None,
             runtime_worker_threads: None,
             router_config,
             max_payload_size: 1024,
