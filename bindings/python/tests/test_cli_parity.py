@@ -93,41 +93,73 @@ def literal_default(attribute: str) -> object:
 
 
 def parse_rust_cli(text: str) -> RustCli:
-    """The flags of ``struct CliArgs``: each ``#[arg(...)]`` attribute and the field
-    it annotates, the long flag being the explicit ``long = ".."`` or the field
+    """The flags of ``struct CliArgs`` and of every group it flattens
+    (``#[command(flatten)]``, followed into the group's struct, and on into the
+    groups that one flattens): each ``#[arg(...)]`` attribute and the field it
+    annotates, the long flag being the explicit ``long = ".."`` or the field
     name with dashes, the second spellings its ``alias``/``visible_alias``."""
     lines = text.splitlines()
-    start = lines.index("struct CliArgs {")
-    end = lines.index("}", start)
     cli = RustCli(pre_clap=set(re.findall(r'args\[i\] == "(--[a-z-]+)"', text)))
-    i = start + 1
-    while i < end:
-        if not lines[i].lstrip().startswith("#[arg("):
+    seen: set[str] = set()
+
+    def struct_lines(name: str) -> tuple[int, int]:
+        for header in (
+            f"struct {name} {{",
+            f"pub struct {name} {{",
+            f"pub(crate) struct {name} {{",
+        ):
+            if header in lines:
+                start = lines.index(header)
+                return start, lines.index("}", start)
+        raise AssertionError(
+            f"struct {name} is not declared on one line; the parser needs updating"
+        )
+
+    def scan(name: str) -> None:
+        if name in seen:
+            return
+        seen.add(name)
+        start, end = struct_lines(name)
+        i = start + 1
+        while i < end:
+            stripped = lines[i].lstrip()
+            if stripped.startswith("#[command(flatten)]"):
+                i += 1
+                while not lines[i].strip() or lines[i].lstrip().startswith(("#", "/")):
+                    i += 1
+                group = re.match(r"\s*(?:pub\s+)?[a-z0-9_]+\s*:\s*([A-Za-z0-9_]+)", lines[i])
+                assert group is not None, f"no group field after the flatten attribute at line {i}"
+                scan(group.group(1))
+                i += 1
+                continue
+            if not stripped.startswith("#[arg("):
+                i += 1
+                continue
+            attribute = lines[i].strip()
+            depth = attribute.count("(") - attribute.count(")")
+            while depth > 0 or not attribute.endswith("]"):
+                i += 1
+                attribute += " " + lines[i].strip()
+                depth += lines[i].count("(") - lines[i].count(")")
             i += 1
-            continue
-        attribute = lines[i].strip()
-        depth = attribute.count("(") - attribute.count(")")
-        while depth > 0 or not attribute.endswith("]"):
+            while not lines[i].strip() or lines[i].lstrip().startswith(("#", "/")):
+                i += 1
+            declared = re.match(r"\s*(?:pub\s+)?([a-z0-9_]+)\s*:", lines[i])
+            assert declared is not None, f"no field after the attribute ending at line {i}"
+            if re.fullmatch(r"#\[arg\(\s*skip\s*(=.*)?\)\]", attribute):
+                # A field clap never reads from the command line (a record filled
+                # after parsing): no flag to mirror.
+                i += 1
+                continue
+            field = declared.group(1)
+            explicit = re.search(r'\blong\s*=\s*"([^"]+)"', attribute)
+            flag = "--" + (explicit.group(1) if explicit else field.replace("_", "-"))
+            cli.flags[flag] = literal_default(attribute)
+            for alias in re.findall(r'\b(?:visible_)?alias\s*=\s*"([^"]+)"', attribute):
+                cli.aliases["--" + alias] = flag
             i += 1
-            attribute += " " + lines[i].strip()
-            depth += lines[i].count("(") - lines[i].count(")")
-        i += 1
-        while not lines[i].strip() or lines[i].lstrip().startswith(("#", "/")):
-            i += 1
-        declared = re.match(r"\s*(?:pub\s+)?([a-z0-9_]+)\s*:", lines[i])
-        assert declared is not None, f"no field after the attribute ending at line {i}"
-        if re.fullmatch(r"#\[arg\(\s*skip\s*(=.*)?\)\]", attribute):
-            # A field clap never reads from the command line (a record filled
-            # after parsing): no flag to mirror.
-            i += 1
-            continue
-        name = declared.group(1)
-        explicit = re.search(r'\blong\s*=\s*"([^"]+)"', attribute)
-        flag = "--" + (explicit.group(1) if explicit else name.replace("_", "-"))
-        cli.flags[flag] = literal_default(attribute)
-        for alias in re.findall(r'\b(?:visible_)?alias\s*=\s*"([^"]+)"', attribute):
-            cli.aliases["--" + alias] = flag
-        i += 1
+
+    scan("CliArgs")
     return cli
 
 
