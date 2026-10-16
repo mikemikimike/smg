@@ -17,6 +17,7 @@
 //! [`kv_state`] keeps the engine's live blocks from that stream, the state
 //! snapshot a subscriber receives once the relay's history has rolled.
 
+mod admin;
 pub mod engine_hash;
 mod engine_link;
 mod error;
@@ -31,6 +32,7 @@ mod requests;
 mod server;
 pub mod sglang;
 mod stop_match;
+mod stream;
 #[cfg(test)]
 mod testing;
 mod tokenizer_bundle;
