@@ -116,6 +116,9 @@ impl HarmonyStreamingProcessor {
         let guards = body_guards(load_guards, reservation.as_ref());
         // Create SSE channel
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         // Spawn background task based on execution mode
         match execution_result {

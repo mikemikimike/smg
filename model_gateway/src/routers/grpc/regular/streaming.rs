@@ -251,6 +251,9 @@ impl StreamingProcessor {
 
         // Create SSE channel
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         // Spawn background task based on execution mode
         match execution_result {
@@ -492,6 +495,9 @@ impl StreamingProcessor {
         let guards = body_guards(load_guards, reservation.as_ref());
         // Create SSE channel
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         // Build context once, clone for spawned task
         let ctx = GenerateStreamContext {
@@ -1633,6 +1639,9 @@ impl StreamingProcessor {
         );
 
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         match execution_result {
             context::ExecutionResult::Single { stream } => {
@@ -2745,6 +2754,9 @@ impl StreamingProcessor {
         let source = source.with_backend(self.backend_type);
         let guards = body_guards(load_guards, reservation.as_ref());
         let (tx, rx) = sse_channel();
+        // Read for this client: the moment the response body is dropped, the
+        // request is aborted on the engine (see `ProtoStream::until_client_gone`).
+        let execution_result = execution_result.until_client_gone(&tx, &dispatch.request_id);
 
         let units = match Self::completion_stream_units(execution_result) {
             Ok(units) => units,
