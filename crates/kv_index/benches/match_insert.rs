@@ -175,6 +175,61 @@ fn bench_token_tree(c: &mut Criterion) {
     group.finish();
 }
 
+/// The fixed-tenant form, `match_and_insert(tokens, tenant)`: the tenant is
+/// known before the match (the policy's load-routed path inserts for the
+/// worker it chose), so the inserting tenant is the matched one (`hit_own`)
+/// or another (`hit_other`), and a new prompt is a `miss`.
+fn bench_token_tree_fixed(c: &mut Criterion) {
+    let (tree, tenants, prompts) = warm_token_tree();
+    let mut group = c.benchmark_group("token_tree/match_and_insert_fixed");
+    group.throughput(Throughput::Elements(1));
+
+    let mut i = 0usize;
+    group.bench_function("hit_own", |b| {
+        b.iter(|| {
+            let k = i % TENANTS;
+            i += 1;
+            let result = tree.match_and_insert(&prompts[k], &tenants[k]);
+            assert!(result.matched_token_count >= SYSTEM_TOKENS);
+            result.matched_token_count
+        });
+    });
+
+    let other_tree = warm_token_tree().0;
+    let mut j = 0usize;
+    group.bench_function("hit_other", |b| {
+        b.iter(|| {
+            let k = j % TENANTS;
+            j += 1;
+            let result = other_tree.match_and_insert(&prompts[k], &tenants[(k + 1) % TENANTS]);
+            assert!(result.matched_token_count >= SYSTEM_TOKENS);
+            result.matched_token_count
+        });
+    });
+
+    let miss_tree = RefCell::new(warm_token_tree().0);
+    let mut turn = 2_000_000u64;
+    group.bench_function("miss", |b| {
+        b.iter_batched(
+            || {
+                turn += 1;
+                if turn.is_multiple_of(MISS_BATCH) {
+                    *miss_tree.borrow_mut() = warm_token_tree().0;
+                }
+                (token_prompt(turn), (turn % TENANTS as u64) as usize)
+            },
+            |(prompt, t)| {
+                miss_tree
+                    .borrow()
+                    .match_and_insert(&prompt, tenants[t].as_str())
+                    .matched_token_count
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 fn bench_string_tree(c: &mut Criterion) {
     let (tree, tenants, prompts) = warm_string_tree();
     let names = by_name(&tenants);
@@ -430,6 +485,7 @@ fn bench_chain_index_lookup(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_token_tree,
+    bench_token_tree_fixed,
     bench_string_tree,
     bench_event_path,
     bench_chain_index_store,
