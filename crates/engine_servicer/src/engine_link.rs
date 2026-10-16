@@ -106,13 +106,51 @@ mod tests {
         assert!(matches!(slot.get(), Some(None)));
     }
 
+    /// A slot the lifecycle owner already filled is left alone and the
+    /// directory is not read: an empty directory read for an empty slot warns
+    /// that the load failed, and that warning is what the guard spares.
     #[tokio::test]
-    async fn a_slot_already_set_is_left_alone() {
+    async fn a_slot_already_set_is_left_alone_and_the_directory_is_not_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tracing::{Event, Level, Subscriber};
+        use tracing_subscriber::{
+            layer::{Context, SubscriberExt},
+            Layer,
+        };
+
+        struct Warnings(Arc<AtomicUsize>);
+        impl<S: Subscriber> Layer<S> for Warnings {
+            fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+                if *event.metadata().level() == Level::WARN {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Warnings(Arc::clone(&warnings))),
+        );
         let dir = tempfile::tempdir().unwrap();
-        let slot = TokenizerSlot::new();
-        let _ = slot.set(None);
-        // Nothing is loaded for a set slot (the directory is not read).
-        load_tokenizer_once(&slot, Some(dir.path().to_str().unwrap())).await;
-        assert!(matches!(slot.get(), Some(None)));
+        let path = dir.path().to_str().unwrap();
+
+        let set = TokenizerSlot::new();
+        let _ = set.set(None);
+        load_tokenizer_once(&set, Some(path)).await;
+        assert!(matches!(set.get(), Some(None)));
+        assert_eq!(
+            warnings.load(Ordering::SeqCst),
+            0,
+            "the directory was not read"
+        );
+
+        let empty = TokenizerSlot::new();
+        load_tokenizer_once(&empty, Some(path)).await;
+        assert!(matches!(empty.get(), Some(None)));
+        assert_eq!(
+            warnings.load(Ordering::SeqCst),
+            1,
+            "the read the guard spared"
+        );
     }
 }
