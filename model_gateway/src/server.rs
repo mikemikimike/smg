@@ -982,13 +982,6 @@ pub struct ServerConfig {
     /// leaves the dedicated listener off; probe routes always stay on the
     /// main `port` regardless.
     pub health_check_port: Option<u16>,
-    /// Port of the admin listener. When set, the control-plane routes (the
-    /// admin, worker-registry and RL routes) are served there, with the probe
-    /// routes, and the data listener answers 404 for them. `None` keeps the
-    /// control plane on the data listener.
-    pub admin_port: Option<u16>,
-    /// Bind host of the admin listener; `None` binds it on `host`.
-    pub admin_host: Option<String>,
     /// Explicit async runtime worker-thread count. `None` uses tokio's
     /// container-aware default (`available_parallelism()`). Only the CLI's
     /// `main` sizes its runtime from it; `startup` runs on the caller's
@@ -1380,6 +1373,8 @@ pub fn build_apps(
         .with_state(Arc::clone(&app_state))
     };
     if admin_listener {
+        // The public `/loads` stays with the data routes: a gateway registered
+        // as a worker is polled there by its parent's monitor.
         // The probe routes answer on the admin listener too, so it can be
         // checked on its own, by an orchestrator or through a network policy.
         let probes = Router::new()
@@ -1546,7 +1541,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 .as_ref()
                 .map(|prometheus_config| prometheus_config.port),
             config.health_check_port,
-            config.admin_port,
+            config.router_config.admin_port,
         )?;
     }
 
@@ -2040,10 +2035,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     // The admin listener's address, when the control plane has a listener of
     // its own (`--admin-port`); its bind host defaults to the data listener's.
-    let admin_addr = match config.admin_port {
+    // Read from the router configuration, the copy `validate` above checked
+    // (port, host, distinct ports), whichever way the caller built it.
+    let admin_addr = match config.router_config.admin_port {
         Some(admin_port) => Some(
             crate::config::bind_socket_addr(
-                config.admin_host.as_deref().unwrap_or(&config.host),
+                config
+                    .router_config
+                    .admin_host
+                    .as_deref()
+                    .unwrap_or(&config.host),
                 admin_port,
             )
             .map_err(|e| {
@@ -3125,8 +3126,6 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 0,
             health_check_port: None,
-            admin_port: None,
-            admin_host: None,
             runtime_worker_threads: None,
             router_config,
             max_payload_size: 1024,

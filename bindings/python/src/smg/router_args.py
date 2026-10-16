@@ -749,8 +749,9 @@ class RouterArgs:
                 " routes, the worker-registry routes /workers and the RL routes /v1/rl) are"
                 " served there, with /health, /liveness and /readiness, and the data listener"
                 " (--port) answers 404 for them. Control-plane authentication applies on it as"
-                " it does on the data listener. Each listener needs its own port. Unset = the"
-                " control plane stays on the data listener."
+                " it does on the data listener; the public /loads stays on the data listener."
+                " Each listener needs its own port. Unset = the control plane stays on the data"
+                " listener."
             ),
         )
         worker_group.add_argument(

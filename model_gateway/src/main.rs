@@ -376,7 +376,9 @@ struct RoutingArgs {
     /// (--port) answers 404 for them: the control plane can sit on a private
     /// address, behind its own network policy, off the data port's ingress.
     /// Control-plane authentication applies on it as it does on the data
-    /// listener. Each listener needs its own port. Unset = the control plane
+    /// listener. The public /loads stays on the data listener (a gateway
+    /// registered as a worker is polled there) and names the backends as
+    /// before. Each listener needs its own port. Unset = the control plane
     /// stays on the data listener
     #[arg(long, help_heading = "Worker Configuration")]
     admin_port: Option<u16>,
@@ -3272,8 +3274,6 @@ impl CliArgs {
             host: self.routing.host.clone(),
             port: self.routing.port,
             health_check_port: self.routing.health_check_port,
-            admin_port: self.routing.admin_port,
-            admin_host: self.routing.admin_host.clone(),
             runtime_worker_threads: self.integrations.runtime_worker_threads,
             router_config,
             max_payload_size: self.serving.max_payload_size,
@@ -4814,26 +4814,25 @@ mod tests {
         assert_eq!(server_config.health_check_port, None);
     }
 
-    /// `--admin-port` and `--admin-host` flow into both conversion paths, as
-    /// `--health-check-port` does; unset, the control plane stays on the data
-    /// listener.
+    /// `--admin-port` and `--admin-host` flow into `RouterConfig`, the copy
+    /// the validator checks and `startup` reads, and reach `ServerConfig`
+    /// nested in it; unset, the control plane stays on the data listener.
     #[test]
-    fn admin_listener_flags_flow_into_both_configs() {
+    fn admin_listener_flags_flow_into_the_router_config() {
         let cli = cli_args_from(&["--admin-port", "9001", "--admin-host", "127.0.0.1"]);
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.admin_port, Some(9001));
         assert_eq!(router_config.admin_host.as_deref(), Some("127.0.0.1"));
         let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.admin_port, Some(9001));
-        assert_eq!(server_config.admin_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(server_config.router_config.admin_port, Some(9001));
+        assert_eq!(
+            server_config.router_config.admin_host.as_deref(),
+            Some("127.0.0.1")
+        );
 
-        let cli = cli_args_from(&[]);
-        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        let router_config = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.admin_port, None);
         assert_eq!(router_config.admin_host, None);
-        let server_config = cli.to_server_config(router_config).unwrap();
-        assert_eq!(server_config.admin_port, None);
-        assert_eq!(server_config.admin_host, None);
     }
 
     /// `--engine-metrics` must flow into `RouterConfig` and survive nesting
