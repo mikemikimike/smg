@@ -145,9 +145,9 @@ const MODEL_PATTERNS: &[(&str, &str)] = &[
     // match wins), so M3 IDs are not captured by the M2 `minimax` parser.
     ("minimax-m3", "minimax_m3"),
     ("mm-m3", "minimax_m3"),
-    ("minimax", "minimax"),
     ("minimax-m2", "minimax"),
     ("mm-m2", "minimax"),
+    ("minimax", "minimax"),
     // Cohere Command models use <|START_THINKING|> / <|END_THINKING|>
     ("command-r", "cohere_cmd"),
     ("command-a", "cohere_cmd"),
@@ -303,7 +303,18 @@ mod tests {
     #[test]
     fn every_pattern_resolves_to_the_parser_its_row_names_in_order() {
         let factory = ParserFactory::new();
-        for (pattern, parser) in MODEL_PATTERNS {
+        for (index, (pattern, parser)) in MODEL_PATTERNS.iter().enumerate() {
+            // No row is shadowed: the first row that matches its own pattern
+            // is the row itself.
+            let first = MODEL_PATTERNS
+                .iter()
+                .position(|(earlier, _)| pattern.contains(earlier))
+                .unwrap_or(index);
+            assert_eq!(
+                first, index,
+                "{pattern}: shadowed by {:?}",
+                MODEL_PATTERNS[first]
+            );
             let by_pattern = factory
                 .registry()
                 .create_for_model(pattern)
