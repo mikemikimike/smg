@@ -556,7 +556,7 @@ fn located(symphony: &Said, legacy: &Said) -> String {
             .bytes()
             .zip(b.bytes())
             .position(|(x, y)| x != y)
-            .unwrap_or(a.len().min(b.len()));
+            .unwrap_or_else(|| a.len().min(b.len()));
         out.push_str(&format!(
             "      {field} differs at byte {at}: symphony {} legacy {}\n",
             window(a, at),
