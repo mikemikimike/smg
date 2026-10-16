@@ -19,12 +19,7 @@ import dataclasses
 from functools import cached_property
 from typing import Any
 
-
-def _positive_int(value: Any) -> int | None:
-    """``value`` as a count above zero, else ``None`` (a bool is not a count)."""
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return None
-    return value
+from smg_grpc_servicer.config_view import hf_int, hf_list, hf_str, positive_int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,11 +59,11 @@ class ServerArgsSection:
             weight_version=str(getattr(server_args, "weight_version", None) or ""),
             preferred_sampling_params=getattr(server_args, "preferred_sampling_params", None),
             revision=getattr(server_args, "revision", None),
-            max_running_requests=_positive_int(getattr(server_args, "max_running_requests", None)),
-            dp_size=_positive_int(getattr(server_args, "dp_size", None)),
+            max_running_requests=positive_int(getattr(server_args, "max_running_requests", None)),
+            dp_size=positive_int(getattr(server_args, "dp_size", None)),
             enable_dp_attention=bool(getattr(server_args, "enable_dp_attention", False)),
-            attn_dp_size=_positive_int(getattr(server_args, "attn_dp_size", None)),
-            attn_cp_size=_positive_int(getattr(server_args, "attn_cp_size", None)),
+            attn_dp_size=positive_int(getattr(server_args, "attn_dp_size", None)),
+            attn_cp_size=positive_int(getattr(server_args, "attn_cp_size", None)),
             kv_events_config=getattr(server_args, "kv_events_config", None),
             disaggregation_mode=getattr(server_args, "disaggregation_mode", "null") or "null",
             language_only=bool(getattr(server_args, "language_only", False)),
@@ -136,12 +131,10 @@ class ModelConfigSection:
         return cls(
             hf_config=hf_config,
             eos_token_ids=eos_token_ids,
-            model_type=str((getattr(hf_config, "model_type", "") or "") if hf_config else ""),
-            architectures=list(
-                (getattr(hf_config, "architectures", []) or []) if hf_config else []
-            ),
-            pad_token_id=int((getattr(hf_config, "pad_token_id", 0) or 0) if hf_config else 0),
-            bos_token_id=int((getattr(hf_config, "bos_token_id", 0) or 0) if hf_config else 0),
+            model_type=hf_str(hf_config, "model_type"),
+            architectures=hf_list(hf_config, "architectures"),
+            pad_token_id=hf_int(hf_config, "pad_token_id"),
+            bos_token_id=hf_int(hf_config, "bos_token_id"),
             id2label=id2label,
             num_labels=int(num_labels or 0),
             context_len=int(getattr(model_config, "context_len", 0) or 0),
