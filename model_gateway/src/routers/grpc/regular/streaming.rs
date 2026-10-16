@@ -525,6 +525,8 @@ impl StreamingProcessor {
         // of the tokens differs.
         let assignment = original_request.symphony.as_ref();
         let mut readers: HashMap<u32, Reader> = HashMap::new();
+        // One choice's stream of chat deltas, holding the whitespace the whole message leaves out.
+        let mut deltas: HashMap<u32, adapt::chat::Deltas> = HashMap::new();
 
         // Phase 2: Main streaming loop
         let mut final_indices: Option<Vec<(u32, bool)>> = None;
@@ -685,6 +687,7 @@ impl StreamingProcessor {
                             &mut sse_buffer,
                             &chunk_frame,
                             index,
+                            deltas.entry(index).or_default(),
                             &events,
                             choice_logprobs,
                             usage.as_ref(),
@@ -814,6 +817,7 @@ impl StreamingProcessor {
                             &mut sse_buffer,
                             &chunk_frame,
                             index,
+                            deltas.entry(index).or_default(),
                             &events,
                             None,
                             usage.as_ref(),
@@ -878,6 +882,7 @@ impl StreamingProcessor {
                             &mut sse_buffer,
                             &chunk_frame,
                             index,
+                            deltas.entry(index).or_default(),
                             &events,
                             None,
                             usage.as_ref(),
@@ -2176,13 +2181,14 @@ impl StreamingProcessor {
         buffer: &mut BytesMut,
         frame: &ChatChunkFrame,
         index: u32,
+        deltas: &mut adapt::chat::Deltas,
         events: &[Event],
         mut logprobs: Option<ChatLogProbs>,
         usage: Option<&Usage>,
         emit_usage_null: bool,
     ) -> Result<(), String> {
         for event in events {
-            let Some(mut choice) = adapt::chat::delta(index, event) else {
+            let Some(mut choice) = deltas.push(index, event) else {
                 continue;
             };
             if choice.finish_reason.is_some() {

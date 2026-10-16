@@ -2,9 +2,12 @@
 //!
 //! [`delta`] maps one [`Event`] to at most one [`ChatStreamChoice`]; [`message`] folds a whole
 //! event sequence into one [`ChatChoice`]. Both are pure: call ids ride on the events, the finish
-//! reason is decided from the `Finish` event alone, and nothing is remembered between calls. The
-//! driver wraps the choices in the response envelope (request id, model, timestamp, usage) and sets
-//! `matched_stop`, and `logprobs` where it has them, since the events carry neither.
+//! reason is decided from the `Finish` event alone, and nothing is remembered between calls.
+//! [`Deltas`] streams one choice's events through [`delta`] with the one thing a stream must
+//! remember to agree with [`message`]: whitespace-only content before any content with substance
+//! is held, and dropped where the message drops it. The driver wraps the choices in the response
+//! envelope (request id, model, timestamp, usage) and sets `matched_stop`, and `logprobs` where it
+//! has them, since the events carry neither.
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/adapters.md`.
 
@@ -98,15 +101,62 @@ pub fn delta(choice: u32, event: &Event) -> Option<ChatStreamChoice> {
     })
 }
 
-/// The stream choices a sequence of events produces, in order.
+/// The stream choices a sequence of events produces, in order, as [`Deltas`] streams them.
 pub fn deltas<'a>(
     choice: u32,
     events: impl IntoIterator<Item = &'a Event>,
 ) -> Vec<ChatStreamChoice> {
+    let mut stream = Deltas::default();
     events
         .into_iter()
-        .filter_map(|event| delta(choice, event))
+        .filter_map(|event| stream.push(choice, event))
         .collect()
+}
+
+/// One choice's stream of [`delta`]s, agreeing with [`message`] on what is content: whitespace-only
+/// content that arrives before any content with substance (a format's spacing between the thought
+/// and the calls, or between calls) is held; it leads the first content with substance when one
+/// follows, and is dropped when a call starts or the choice finishes, as the message leaves out
+/// content that is only whitespace. Once content has substance, every run of whitespace in it
+/// streams as it comes, the spacing after a call included, as the message keeps it.
+#[derive(Clone, Debug, Default)]
+pub struct Deltas {
+    /// Content with substance has streamed.
+    substance: bool,
+    /// Whitespace-only content held back until substance follows or a call or the finish drops it.
+    held: String,
+}
+
+impl Deltas {
+    /// The stream choice `event` produces for the choice at `choice`, if it produces one now.
+    pub fn push(&mut self, choice: u32, event: &Event) -> Option<ChatStreamChoice> {
+        match event {
+            Event::Content(text) | Event::Malformed { text, .. } if !self.substance => {
+                if text.text.trim().is_empty() {
+                    self.held.push_str(&text.text);
+                    return None;
+                }
+                self.substance = true;
+                let mut content = std::mem::take(&mut self.held);
+                content.push_str(&text.text);
+                Some(ChatStreamChoice {
+                    index: choice,
+                    delta: ChatMessageDelta {
+                        content: Some(content),
+                        ..assistant()
+                    },
+                    logprobs: None,
+                    finish_reason: None,
+                    matched_stop: None,
+                })
+            }
+            Event::ToolCallStart { .. } | Event::Finish { .. } => {
+                self.held.clear();
+                delta(choice, event)
+            }
+            _ => delta(choice, event),
+        }
+    }
 }
 
 /// One message for the choice at `choice`, folded from a whole event sequence.
@@ -419,6 +469,82 @@ mod tests {
                 "logprobs": null,
                 "finish_reason": "stop",
             })
+        );
+    }
+
+    #[test]
+    fn a_stream_holds_whitespace_before_substance_and_drops_it_as_the_message_does() {
+        // The spacing between the thought and the call, and between two calls, is content the
+        // message leaves out; the stream leaves it out too: no content delta at all.
+        let events = [
+            Event::Reasoning(Text::uncounted("plan")),
+            Event::ReasoningEnd,
+            Event::Content(Text::uncounted("\n\n")),
+            call(0, "f"),
+            arguments(0, "{}"),
+            Event::ToolCallEnd {
+                index: 0,
+                source: Text::default(),
+            },
+            Event::Content(Text::uncounted("\n")),
+            call(1, "g"),
+            arguments(1, "{}"),
+            Event::ToolCallEnd {
+                index: 1,
+                source: Text::default(),
+            },
+            finish(FinishReason::Stop, 2),
+        ];
+        let choices = deltas(0, &events);
+        assert!(
+            choices.iter().all(|choice| choice.delta.content.is_none()),
+            "{choices:#?}"
+        );
+        assert!(message(0, &events).message.content.is_none());
+        // Whitespace that arrives before content with substance leads it, as the message keeps it.
+        let led = deltas(
+            0,
+            &[
+                Event::Content(Text::uncounted("\n")),
+                Event::Content(Text::uncounted("Hi")),
+                Event::Content(Text::uncounted("\n\n")),
+                call(0, "f"),
+            ],
+        );
+        let contents: Vec<&str> = led
+            .iter()
+            .filter_map(|choice| choice.delta.content.as_deref())
+            .collect();
+        assert_eq!(contents, vec!["\nHi", "\n\n"]);
+        // Held whitespace that nothing follows goes at the finish, with the finish chunk intact.
+        let finished = deltas(
+            0,
+            &[
+                Event::Content(Text::uncounted("  ")),
+                finish(FinishReason::Stop, 0),
+            ],
+        );
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].finish_reason.as_deref(), Some("stop"));
+        assert!(finished[0].delta.content.is_none());
+        // Whitespace-only malformed text is held the same way; malformed text with substance is not.
+        let malformed = deltas(
+            0,
+            &[
+                Event::Malformed {
+                    text: Text::uncounted(" "),
+                    why: MalformedReason::InvalidArguments,
+                },
+                Event::Malformed {
+                    text: Text::uncounted("<tool_call>{broken"),
+                    why: MalformedReason::InvalidArguments,
+                },
+            ],
+        );
+        assert_eq!(malformed.len(), 1);
+        assert_eq!(
+            malformed[0].delta.content.as_deref(),
+            Some(" <tool_call>{broken")
         );
     }
 

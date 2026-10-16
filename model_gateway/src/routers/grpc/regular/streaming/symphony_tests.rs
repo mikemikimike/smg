@@ -185,6 +185,48 @@ async fn a_stop_the_decoder_matches_without_a_complete_frame_still_ends_with_too
 }
 
 #[tokio::test]
+async fn the_spacing_between_the_thought_and_the_calls_is_not_streamed_as_content() {
+    // Two calls after the thought, the format's newlines between them: the whole message has no
+    // content, and neither does the stream, where before the spacing arrived as content deltas.
+    let spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    let output = "<think>plan</think>\n\n<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>\n<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2}}\n</tool_call>";
+    let responses = vec![
+        chunk(0, &output[..21]),
+        chunk(0, &output[21..60]),
+        chunk(0, &output[60..]),
+        complete(0, "stop"),
+    ];
+    let (result, events) = stream_events(responses, true, spec).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
+    // The opening chunk carries the role with the public API's empty content; no later delta
+    // carries any content at all.
+    assert!(
+        events
+            .iter()
+            .all(|event| event["choices"][0]["delta"]["content"]
+                .as_str()
+                .is_none_or(str::is_empty)),
+        "{events:#?}"
+    );
+    let calls = tool_call_deltas(&events);
+    let names: Vec<&str> = calls
+        .iter()
+        .filter_map(|call| call["function"]["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["lookup", "lookup"]);
+    let finish = events
+        .iter()
+        .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+        .expect("a finish chunk");
+    assert_eq!(finish, "tool_calls");
+}
+
+#[tokio::test]
 async fn the_prompts_open_thought_is_replayed_so_the_output_starts_inside_it() {
     let spec = assigned(
         chat_spec(false),
