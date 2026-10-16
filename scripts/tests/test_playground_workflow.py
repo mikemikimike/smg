@@ -84,6 +84,41 @@ class SessionJobTests(unittest.TestCase):
         self.assertLess(ready, hold)
 
 
+class GitCredentialTests(unittest.TestCase):
+    """The job token rewrites github.com URLs only for engine setup, which
+    clones from GitHub through the cluster's shared NAT egress."""
+
+    def setUp(self):
+        self.steps = load_jobs()["session"]["steps"]
+
+    def test_no_step_writes_a_global_git_credential(self):
+        for step in self.steps:
+            self.assertNotIn("git config --global", step.get("run", ""), step.get("name"))
+
+    def test_engine_setup_steps_get_the_credential_through_env(self):
+        engine_steps = [
+            s for s in self.steps if s.get("uses", "").startswith("./.github/actions/setup-")
+        ]
+        self.assertEqual(len(engine_steps), 3)
+        for step in engine_steps:
+            env = step.get("env", {})
+            self.assertEqual(env.get("GIT_CONFIG_COUNT"), "1", step.get("name"))
+            self.assertEqual(
+                env.get("GIT_CONFIG_KEY_0"),
+                "url.https://x-access-token:${{ github.token }}@github.com/.insteadOf",
+                step.get("name"),
+            )
+            self.assertEqual(env.get("GIT_CONFIG_VALUE_0"), "https://github.com/", step.get("name"))
+
+    def test_only_engine_setup_steps_see_the_token(self):
+        holders = [
+            s.get("name")
+            for s in self.steps
+            if "github.token" in str(s.get("env", {})) + s.get("run", "")
+        ]
+        self.assertEqual(holders, ["Set up SGLang", "Set up vLLM", "Set up TokenSpeed"])
+
+
 class BuildJobTests(unittest.TestCase):
     def setUp(self):
         self.job = load_jobs()["build"]
@@ -100,6 +135,14 @@ class BuildJobTests(unittest.TestCase):
         self.assertEqual(len(cargo_steps), 2)
         for step in cargo_steps:
             self.assertEqual(step.get("env", {}).get("RUSTC_WRAPPER"), "env", step.get("name"))
+
+    def test_artifacts_outlive_the_longest_queue(self):
+        # A second launch builds at once, then its session waits behind the
+        # first: up to 24 h of hold plus 150 min of setup.
+        uploads = [s for s in self.job["steps"] if "upload-artifact" in s.get("uses", "")]
+        self.assertEqual(len(uploads), 2)
+        for step in uploads:
+            self.assertGreaterEqual(step["with"]["retention-days"], 2, step.get("name"))
 
     def test_caches_are_never_saved(self):
         cache = next(s for s in self.job["steps"] if "rust-cache" in s.get("uses", ""))

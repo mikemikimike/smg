@@ -72,7 +72,9 @@ VS Code: Remote-SSH to `runner@smg-pg-18234567890-1`.
 
 The session ends at the chosen time (open terminals get a warning 30 and 5
 minutes before), when you run `playground-done`, or when you cancel the run.
-One session per person runs at a time; a second launch waits for the first.
+One session per person runs at a time: a second launch waits for the first
+(its build runs right away), and a third launch replaces the waiting second
+one, which is cancelled.
 
 ## Security notes
 
@@ -88,6 +90,10 @@ One session per person runs at a time; a second launch waits for the first.
 - With `pr`, the PR's own setup code runs in a run started from `main`, so
   with `main`'s cache scope. That's why PRs from forks are refused: review a
   fork's branch and push it to this repo first.
+- Engine setup gets the job's GitHub token (read-only, this repo only,
+  expires with the job) for cloning from GitHub. Only those setup steps see
+  it, but they run the selected source's code, which could keep it for the
+  rest of the job.
 - Anyone in `group:playground` can reach any running session, and anything
   run in a session (yours, or a PR you are testing) can see what the pod
   holds, such as `HF_TOKEN`. Keep the group to people who can launch.

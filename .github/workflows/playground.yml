@@ -166,14 +166,16 @@ jobs:
         with:
           name: playground-smg-wheel
           path: bindings/python/dist/*.whl
-          retention-days: 1
+          # A queued second session can start a day or more after this build:
+          # the first one may hold for 24 h plus its setup.
+          retention-days: 3
 
       - name: Upload Python client types
         uses: actions/upload-artifact@v7
         with:
           name: playground-python-client-types
           path: clients/python/smg_client/types/_generated.py
-          retention-days: 1
+          retention-days: 3
 
   session:
     name: session (${{ inputs.gpus }}× H100, ${{ inputs.hours }}h)
@@ -238,36 +240,43 @@ jobs:
           PG_HOSTNAME: smg-pg-${{ github.run_id }}-${{ github.run_attempt }}
         run: bash "$PG_TOOLS/session.sh" join
 
-      # The cluster runners share one NAT egress IP and GitHub intermittently
-      # 401s anonymous git from it (see e2e-gpu-job.yml). Carry the job token
-      # for setup only; it is removed before the session opens.
-      - name: Authenticate git for github.com
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          git config --global \
-            url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
-            "https://github.com/"
-
       # Install failures don't end the run: a half-set-up pod is still a place
       # to debug the install. The summary reports what failed.
+      #
+      # The cluster runners share one NAT egress IP and GitHub intermittently
+      # 401s anonymous git from it (see e2e-gpu-job.yml), so engine setup gets
+      # the job's read-only token as a github.com URL rewrite. It is passed as
+      # step env rather than written to ~/.gitconfig, so only these steps see
+      # it, not the later install steps or the session.
       - name: Set up SGLang
         id: engine_sglang
         if: inputs.engine == 'sglang'
         continue-on-error: true
         uses: ./.github/actions/setup-sglang
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ github.token }}@github.com/.insteadOf
+          GIT_CONFIG_VALUE_0: https://github.com/
 
       - name: Set up vLLM
         id: engine_vllm
         if: inputs.engine == 'vllm'
         continue-on-error: true
         uses: ./.github/actions/setup-vllm
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ github.token }}@github.com/.insteadOf
+          GIT_CONFIG_VALUE_0: https://github.com/
 
       - name: Set up TokenSpeed
         id: engine_tokenspeed
         if: inputs.engine == 'tokenspeed'
         continue-on-error: true
         uses: ./.github/actions/setup-tokenspeed
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: url.https://x-access-token:${{ github.token }}@github.com/.insteadOf
+          GIT_CONFIG_VALUE_0: https://github.com/
 
       - name: Download SMG wheel
         if: needs.gate.outputs.build_wheel == 'true'
@@ -300,12 +309,6 @@ jobs:
             python3 -m pip install "$WHEEL_DIR"/*.whl
           fi
           bash scripts/ci_install_e2e_deps.sh
-
-      - name: Remove git credentials
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        run: git config --global --remove-section "url.https://x-access-token:${GITHUB_TOKEN}@github.com/" || true
 
       - name: Summarize setup
         id: setup

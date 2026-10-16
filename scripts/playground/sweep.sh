@@ -39,7 +39,14 @@ if [ -z "$stale" ]; then
     exit 0
 fi
 
+# One failed delete (say, a machine removed by hand meanwhile) must not leave
+# the rest behind; failures are reported once every machine has been tried.
+failed=0
 while read -r id hostname; do
     echo "Removing ${hostname} (${id})"
-    curl -fsS -X DELETE -H "Authorization: Bearer ${token}" "$API/api/v2/device/${id}"
+    if ! curl -fsS -X DELETE -H "Authorization: Bearer ${token}" "$API/api/v2/device/${id}"; then
+        echo "::warning::Could not remove ${hostname} (${id})"
+        failed=$((failed + 1))
+    fi
 done <<< "$stale"
+[ "$failed" -eq 0 ]
