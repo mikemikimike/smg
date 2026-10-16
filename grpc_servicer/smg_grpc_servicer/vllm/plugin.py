@@ -50,7 +50,10 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
         help=(
             "Which implementation serves the gRPC contract under --grpc: the Python "
             "servicer (default) or the Rust one (smg.servicer.VllmGrpcServer, with the "
-            f"engine headless). Unset falls back to ${SERVICER_IMPL_ENV}."
+            f"engine headless). Unset falls back to ${SERVICER_IMPL_ENV}. The Rust one needs "
+            "a launcher the switch binds (vLLM 0.28 and later under `vllm serve <model> "
+            "--grpc`, checked through 0.31); any other launcher is refused at this parse, "
+            "before the engine is built."
         ),
     )
     return True
@@ -91,6 +94,33 @@ def handoff_mm_flags(parser: argparse.ArgumentParser, parsed: Any) -> Any | None
     return carry_mm_flags(parsed)
 
 
+def check_servicer_impl(parser: argparse.ArgumentParser, parsed: Any) -> str | None:
+    """After a parse that serves gRPC (a gRPC launcher's parser, with
+    ``--grpc`` given where the parser has the flag): the implementation the
+    parse selected (the flag, else the environment), with a Rust selection
+    verified against the launcher here, in the launcher's own argument parse
+    and before it builds the engine: a value the switch cannot use, or a
+    launcher the switch cannot bind (``launcher_switch.require_launcher_hook``),
+    is one ERROR line and exit code 2 now, not a Python servicer that refuses
+    once the model has loaded. ``None`` for a parse that serves no gRPC
+    (another command's, ``vllm serve`` without ``--grpc``), which selects
+    nothing."""
+    if not serves_grpc(parser) or getattr(parsed, "grpc", None) is False:
+        return None
+    from smg_grpc_servicer.rust_lifecycle import ServicerConfigError, configuration_exit
+    from smg_grpc_servicer.vllm.launcher_switch import require_launcher_hook
+    from smg_grpc_servicer.vllm.rust import configure_logging, resolve_servicer_impl
+
+    try:
+        impl = resolve_servicer_impl(parsed)
+        if impl == "rust":
+            require_launcher_hook()
+    except ServicerConfigError as error:
+        configure_logging()
+        raise configuration_exit(error) from None
+    return impl
+
+
 def register() -> None:
     """The ``vllm.general_plugins`` entry point. Idempotent, and loaded in
     every vLLM process: it wraps the parser class's parse step and installs
@@ -119,6 +149,10 @@ def register() -> None:
         # process (so a flag stays `source=flag`), and the set values go into
         # the environment too; on every gRPC parse, the flags' origin aside.
         handoff_mm_flags(self, parsed)
+        # A Rust selection is checked against the launcher now, before the
+        # launcher builds the engine: a launcher the switch cannot bind is
+        # refused here, not by the Python servicer after the model loaded.
+        check_servicer_impl(self, parsed)
         return parsed, extras
 
     FlexibleArgumentParser.parse_known_args = parse_known_args  # type: ignore[method-assign]
