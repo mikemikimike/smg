@@ -50,13 +50,9 @@ struct ExternalWorkerParts<'a> {
 /// any, else a wildcard worker. The builder sets the initial status: Pending
 /// if health-checked, Ready if not.
 fn build_external_worker(parts: ExternalWorkerParts<'_>) -> BasicWorker {
-    let builder = BasicWorkerBuilder::new(parts.url);
-    let builder = if parts.model_cards.is_empty() {
-        builder
-    } else {
-        builder.models(parts.model_cards.to_vec())
-    };
-    let mut builder = builder
+    // No cards is the wildcard worker: the builder reads an empty list so.
+    let mut builder = BasicWorkerBuilder::new(parts.url)
+        .models(parts.model_cards.to_vec())
         .worker_type(WorkerType::Regular)
         .connection_mode(ConnectionMode::Http)
         .runtime_type(RuntimeType::External)
@@ -207,13 +203,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
-
-    fn card(id: &str) -> ModelCard {
-        serde_json::from_value(json!({"id": id})).unwrap()
-    }
 
     fn parts<'a>(
         cards: &'a [ModelCard],
@@ -242,7 +232,7 @@ mod tests {
     fn the_worker_is_built_the_same_way_with_and_without_model_cards() {
         let client = Arc::new(crate::http_client::client());
         let labels = HashMap::from([("tier".to_string(), "gold".to_string())]);
-        let cards = [card("m1"), card("m2")];
+        let cards = [ModelCard::new("m1"), ModelCard::new("m2")];
         let wildcard = build_external_worker(parts(&[], &labels, &client));
         let listed = build_external_worker(parts(&cards, &labels, &client));
 
@@ -259,6 +249,7 @@ mod tests {
             assert_eq!(worker.url(), "https://api.example.com");
             assert_eq!(spec.worker_type, WorkerType::Regular);
             assert_eq!(spec.connection_mode, ConnectionMode::Http);
+            assert_eq!(spec.runtime_type, RuntimeType::External);
             assert_eq!(worker.api_key().map(String::as_str), Some("key"));
             assert_eq!(worker.priority(), 3);
             assert_eq!(worker.cost(), 1.5);
