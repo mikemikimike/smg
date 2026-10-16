@@ -52,8 +52,10 @@ class SessionJobTests(unittest.TestCase):
     def test_launcher_is_rechecked_before_setup(self):
         check = step_index(
             self.steps,
-            lambda s: "needs.gate.outputs.actor" in str(s.get("env", {}))
-            and "github.triggering_actor" in str(s.get("env", {})),
+            lambda s: (
+                "needs.gate.outputs.actor" in str(s.get("env", {}))
+                and "github.triggering_actor" in str(s.get("env", {}))
+            ),
             "comparing the gate's launcher with the re-run's",
         )
         first_source = step_index(self.steps, runs_selected_source, "running source code")
@@ -61,7 +63,7 @@ class SessionJobTests(unittest.TestCase):
         self.assertEqual(self.jobs["gate"]["outputs"]["actor"], "${{ steps.gate.outputs.actor }}")
 
     def test_join_happens_before_selected_source_code_runs(self):
-        join = step_index(self.steps, lambda s: runs(s, "session.sh\" join"), "running join")
+        join = step_index(self.steps, lambda s: runs(s, 'session.sh" join'), "running join")
         first_source = step_index(self.steps, runs_selected_source, "running source code")
         self.assertLess(join, first_source)
 
@@ -71,13 +73,13 @@ class SessionJobTests(unittest.TestCase):
             for s in self.steps
             if "PLAYGROUND_TS_AUTHKEY_SECRET" in str(s.get("env", {}))
         ]
-        join = self.steps[step_index(self.steps, lambda s: runs(s, "session.sh\" join"), "join")]
+        join = self.steps[step_index(self.steps, lambda s: runs(s, 'session.sh" join'), "join")]
         self.assertEqual(holders, [join.get("name")])
 
     def test_ready_runs_after_setup_and_before_hold(self):
-        ready = step_index(self.steps, lambda s: runs(s, "session.sh\" ready"), "running ready")
+        ready = step_index(self.steps, lambda s: runs(s, 'session.sh" ready'), "running ready")
         install = step_index(self.steps, lambda s: s.get("id") == "smg", "installing SMG")
-        hold = step_index(self.steps, lambda s: runs(s, "session.sh\" hold"), "running hold")
+        hold = step_index(self.steps, lambda s: runs(s, 'session.sh" hold'), "running hold")
         self.assertLess(install, ready)
         self.assertLess(ready, hold)
 
