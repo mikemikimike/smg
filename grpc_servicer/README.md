@@ -82,7 +82,16 @@ by default) overrides the model's per-modality reference limits;
 meaning vLLM's own `--media-io-kwargs` decide) caps the frames a video is
 sampled to, so long clips stay bounded. All eight flag-backed settings are
 validated when the servicer starts, whatever the processor mode, so a stale
-unreadable value fails loudly.
+unreadable value fails loudly. Two layers bound an inline item: the router
+refuses a `data:` item above its own per-kind input bound
+(`SMG_IMAGE_MAX_INPUT_BYTES`, `SMG_VIDEO_MAX_INPUT_BYTES`,
+`SMG_AUDIO_MAX_INPUT_BYTES`; default 256 MiB each) with a 400
+`media_ref_too_large` before the worker sees it, and the worker refuses one
+above `--mm-max-item-bytes` with a message that names the worker as the flag's
+owner, which the router relays as a 400 `start_generation_failed`. With the
+defaults a 50 MB item clears the router and stops at the worker's 32 MiB, so
+that flag is the one to raise; the router's `--max-payload-size` (default
+512 MiB) must also hold the whole request body.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
 the model's spec opts in and every registered worker of the model advertises
@@ -267,7 +276,7 @@ structured request either way, as it does behind vLLM's own frontend.
 Both vLLM servicers also advertise the engine's reasoning parser
 (`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
 a router reads off a worker's labels) and where its grammar starts on a prompt
-that ends inside the model's thinking block (`structured_outputs_start`): `after_reasoning` when
+that ends inside the model's thinking block (`constrained_decoding_start`): `after_reasoning` when
 a reasoning parser is set and `enable_in_reasoning` is off, since vLLM then
 holds a request's grammar back until the parser has seen the thought's end,
 `first_token` otherwise. A router shapes a forced tool call's grammar by it as
@@ -377,12 +386,22 @@ Both TokenSpeed servicers advertise, as `server_args` keys, the engine's
 reasoning parser (`engine_reasoning_parser`; `reasoning_parser` is the
 per-model parser override a router reads off a worker's labels) and where its
 grammar starts on a prompt that ends inside the model's thinking block
-(`structured_outputs_start`): always `first_token`, since this engine's grammar
+(`constrained_decoding_start`): always `first_token`, since this engine's grammar
 manager has no reasoning gate and starts every grammar at the first generated
 token (`--reasoning-parser` only has a JSON-schema constraint rewritten into a
 structural tag that lets the thought precede the JSON). A router shapes a
 forced tool call's grammar by it as the engine's own server would: the thought
 and then the calls, so the call is not forced into the thought.
+
+Both TokenSpeed servicers also report the engine's constrained-decoding policy,
+when it declares one, as `GetServerInfo.constrained_decoding` (a field of its
+own, not a `server_args` key): `always` for a model that takes a grammar on
+every turn, `requested` for one only when the request asks. The servicers read
+it as `constrained_decoding` off TokenSpeed's `ServerArgs`, else its
+`ModelConfig`. A router turns the field into the worker's `constrained_decoding`
+label and records the policy there; the request paths that act on `always` are a
+separate change, so until they land every worker is served as `requested`, which
+is what every worker did before the label existed.
 
 #### Multi-node engines: the worker pod's liveness
 
@@ -434,7 +453,7 @@ label is absent.
 They also advertise, as `server_args` keys, the engine's reasoning parser
 (`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
 a router reads off a worker's labels) and where its grammar starts on a prompt
-that ends inside the model's thinking block (`structured_outputs_start`):
+that ends inside the model's thinking block (`constrained_decoding_start`):
 `after_reasoning` with `--reasoning-parser`, since the scheduler then wraps its
 grammar backend in a reasoner that holds a request's grammar back until the
 parser's thought-end sequence has been generated (for a request that asks for

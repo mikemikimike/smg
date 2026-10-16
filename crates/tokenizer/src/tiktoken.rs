@@ -16,8 +16,8 @@ use tiktoken_rs::{
 use crate::{
     byte_level::{ByteLevelIncremental, ByteLevelTable, ByteLevelTableBuilder, UnknownId},
     chat_template::{
-        load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
-        ChatTemplateState, ThinkingKeyName, ThinkingToggle,
+        load_chat_template_from_file, python_isspace, ChatTemplateContentFormat,
+        ChatTemplateParams, ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
     encoders::{
         kimi_k25_tools::apply_kimi_k25_tools,
@@ -450,6 +450,35 @@ impl TiktokenTokenizer {
             },
         }
     }
+
+    /// `apply_chat_template`, also saying whether the prompt continues the
+    /// final message (see `ChatTemplateState::apply_with_continuation`).
+    fn apply_with_continuation(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
+        // Inject special tokens if the caller didn't provide them
+        let params = if params.special_tokens.is_some() {
+            params
+        } else {
+            ChatTemplateParams {
+                special_tokens: Some(&self.special_tokens),
+                ..params
+            }
+        };
+        match self.renderer {
+            Renderer::Jinja => self.chat_template.apply_with_continuation(messages, params),
+            Renderer::KimiK25Tools => apply_kimi_k25_tools(&self.chat_template, messages, params),
+            // This is the layer the checkpoint's own `apply_chat_template` sits
+            // at, so it applies that wrapper's `thinking_effort` default. K3 does
+            // not continue a final message (its prefill is the assistant prefix).
+            Renderer::KimiK3Xtml => Ok((
+                apply_kimi_k3_xtml_with_effort_default(messages, &params)?,
+                false,
+            )),
+        }
+    }
 }
 
 /// Parse a .tiktoken / tiktoken.model file into a BPE encoder.
@@ -653,12 +682,6 @@ fn cut_runs<'a>(window: &'a str, pieces: &mut Vec<&'a str>) {
     pieces.push(&window[piece_start..]);
 }
 
-/// Python's `str.isspace`, which the checkpoint classifies the runs with:
-/// Unicode white space plus the ASCII separators U+001C..U+001F.
-fn python_isspace(c: char) -> bool {
-    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
-}
-
 /// Piecewise encode for a segmented prompt: control pieces with special
 /// tokens recognized, text pieces as ordinary BPE, each segment in the
 /// checkpoint's pieces when `checkpoint_pieces` is set. The allowed-special
@@ -806,22 +829,8 @@ impl TokenizerTrait for TiktokenTokenizer {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
-        // Inject special tokens if the caller didn't provide them
-        let params = if params.special_tokens.is_some() {
-            params
-        } else {
-            ChatTemplateParams {
-                special_tokens: Some(&self.special_tokens),
-                ..params
-            }
-        };
-        match self.renderer {
-            Renderer::Jinja => self.chat_template.apply(messages, params),
-            Renderer::KimiK25Tools => apply_kimi_k25_tools(&self.chat_template, messages, params),
-            // This is the layer the checkpoint's own `apply_chat_template` sits
-            // at, so it applies that wrapper's `thinking_effort` default.
-            Renderer::KimiK3Xtml => apply_kimi_k3_xtml_with_effort_default(messages, &params),
-        }
+        self.apply_with_continuation(messages, params)
+            .map(|(text, _)| text)
     }
 
     fn apply_chat_template_with_encoding(
@@ -831,7 +840,8 @@ impl TokenizerTrait for TiktokenTokenizer {
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
         if !matches!(self.renderer, Renderer::KimiK3Xtml) {
-            let mut text = self.apply_chat_template(messages, params)?;
+            let (mut text, continued_final_message) =
+                self.apply_with_continuation(messages, params)?;
             if let Some(prefix) = assistant_prefix {
                 text.push_str(prefix);
             }
@@ -839,6 +849,7 @@ impl TokenizerTrait for TiktokenTokenizer {
                 text,
                 encoding: PromptEncoding::FromText,
                 unbilled_prompt_tokens: 0,
+                continued_final_message,
             });
         }
         // K3's ids are not a function of the flat text: render the reference's
@@ -861,6 +872,7 @@ impl TokenizerTrait for TiktokenTokenizer {
             text,
             encoding: PromptEncoding::Deferred(job),
             unbilled_prompt_tokens,
+            continued_final_message: false,
         })
     }
 
@@ -917,8 +929,13 @@ impl TokenizerTrait for TiktokenTokenizer {
     }
 
     fn renderer_capabilities(&self) -> RendererCapabilities {
+        // A renderer with an encoder of its own answers from its profile; the
+        // others render through the Jinja template, which continues a
+        // trailing assistant message the way transformers does.
         self.profile
-            .map_or_else(Default::default, |profile| profile.capabilities)
+            .map_or(RendererProfile::TEMPLATE_CAPABILITIES, |profile| {
+                profile.capabilities
+            })
     }
 
     fn native_thinking_mode(
@@ -1720,7 +1737,10 @@ mod tests {
         let jinja = TiktokenTokenizer::from_dir(jinja.path()).unwrap();
         assert_eq!(
             jinja.renderer_capabilities(),
-            RendererCapabilities::default()
+            RendererCapabilities {
+                native_assistant_continuation: true,
+                ..RendererCapabilities::default()
+            }
         );
     }
 

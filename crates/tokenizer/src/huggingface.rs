@@ -29,8 +29,8 @@ use crate::{
     encoders::{deepseek_v32, deepseek_v4, deepseek_v41, RendererProfile},
     native::NativeEncoder,
     traits::{
-        DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder, SpecialTokens, TokenIdType,
-        Tokenizer as TokenizerTrait,
+        ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder,
+        PromptEncoding, SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
     },
 };
 
@@ -62,6 +62,8 @@ pub struct HuggingFaceTokenizer {
     vocab: HashMap<String, TokenIdType>,
     reverse_vocab: HashMap<TokenIdType, String>,
     chat_template: ChatTemplateState,
+    /// Raw `response_template` from the sibling tokenizer_config.json.
+    response_template: Option<serde_json::Value>,
     /// EOS token IDs from config.json + generation_config.json
     eos_token_ids: Vec<TokenIdType>,
     /// Which renderer applies chat templates for this model.
@@ -420,6 +422,7 @@ impl HuggingFaceTokenizer {
         // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
         let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
         let mut chat_template_str = config_result.chat_template;
+        let response_template = config_result.response_template;
         let add_bos_token = config_result.add_bos_token;
         let add_eos_token = config_result.add_eos_token;
 
@@ -483,6 +486,7 @@ impl HuggingFaceTokenizer {
             vocab,
             reverse_vocab,
             chat_template: ChatTemplateState::new(chat_template_str)?,
+            response_template,
             eos_token_ids,
             profile: renderer.profile(),
             renderer,
@@ -634,6 +638,7 @@ impl HuggingFaceTokenizer {
             vocab,
             reverse_vocab,
             chat_template: ChatTemplateState::empty(),
+            response_template: None,
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
             renderer: Renderer::Jinja,
             profile: None,
@@ -715,6 +720,8 @@ impl HuggingFaceTokenizer {
                 .get("chat_template")
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            // Kept raw; parser selection validates it.
+            let response_template = config.get("response_template").cloned();
 
             let add_bos_token = config.get("add_bos_token").and_then(|v| v.as_bool());
             let add_eos_token = config.get("add_eos_token").and_then(|v| v.as_bool());
@@ -737,12 +744,28 @@ impl HuggingFaceTokenizer {
 
             Some(TokenizerConfigResult {
                 chat_template,
+                response_template,
                 add_bos_token,
                 add_eos_token,
                 config_tokens,
             })
         })()
         .unwrap_or_default()
+    }
+
+    /// The Jinja renderer, with this tokenizer's special tokens unless the
+    /// caller passed its own. The flag says whether the prompt continues the
+    /// final message (see `ChatTemplateState::apply_with_continuation`).
+    fn apply_jinja(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
+        let params = ChatTemplateParams {
+            special_tokens: params.special_tokens.or(Some(&self.special_tokens)),
+            ..params
+        };
+        self.chat_template.apply_with_continuation(messages, params)
     }
 }
 
@@ -759,6 +782,7 @@ struct ConfigTokens {
 #[derive(Default)]
 struct TokenizerConfigResult {
     chat_template: Option<String>,
+    response_template: Option<serde_json::Value>,
     add_bos_token: Option<bool>,
     add_eos_token: Option<bool>,
     config_tokens: ConfigTokens,
@@ -1293,6 +1317,10 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         self
     }
 
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        self.response_template.as_ref()
+    }
+
     fn eos_token_ids(&self) -> &[TokenIdType] {
         &self.eos_token_ids
     }
@@ -1321,21 +1349,39 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         params: ChatTemplateParams,
     ) -> Result<String> {
         match self.renderer {
-            Renderer::Jinja => {
-                // Inject special tokens if the caller didn't provide them.
-                if params.special_tokens.is_some() {
-                    return self.chat_template.apply(messages, params);
-                }
-                let params = ChatTemplateParams {
-                    special_tokens: Some(&self.special_tokens),
-                    ..params
-                };
-                self.chat_template.apply(messages, params)
-            }
+            Renderer::Jinja => self.apply_jinja(messages, params).map(|(text, _)| text),
             Renderer::DeepseekV32 => apply_deepseek_v32(messages, &params),
             Renderer::DeepseekV4(encoding) => apply_deepseek_v4(messages, &params, encoding),
             Renderer::DeepseekV41 => apply_deepseek_v41(messages, &params),
         }
+    }
+
+    fn apply_chat_template_with_encoding(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        // The Jinja template says whether it continued the final message or
+        // appended its text after the generation prompt; the native encoders
+        // continue it whenever they are asked to (V4.1) or are never asked.
+        let continue_final_message = params.continue_final_message;
+        let (mut text, continued_final_message) = match self.renderer {
+            Renderer::Jinja => self.apply_jinja(messages, params)?,
+            _ => (
+                self.apply_chat_template(messages, params)?,
+                continue_final_message,
+            ),
+        };
+        if let Some(prefix) = assistant_prefix {
+            text.push_str(prefix);
+        }
+        Ok(ChatTemplateOutput {
+            text,
+            encoding: PromptEncoding::FromText,
+            unbilled_prompt_tokens: 0,
+            continued_final_message,
+        })
     }
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
@@ -1387,8 +1433,13 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     }
 
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+        // A renderer with an encoder of its own answers from its profile; the
+        // Jinja renderer continues a trailing assistant message the way
+        // transformers' `continue_final_message` does.
         self.profile
-            .map_or_else(Default::default, |profile| profile.capabilities)
+            .map_or(RendererProfile::TEMPLATE_CAPABILITIES, |profile| {
+                profile.capabilities
+            })
     }
 
     fn native_thinking_mode(
@@ -1832,10 +1883,32 @@ fn apply_deepseek_v41(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, fs};
+
+    use serde_json::json;
+    use tempfile::TempDir;
 
     use super::derive_thinking_mode;
-    use crate::{chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode};
+    use crate::{
+        chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode,
+        traits::Tokenizer as _, HuggingFaceTokenizer,
+    };
+
+    const MIN_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": { "type": "Whitespace" },
+        "post_processor": null,
+        "decoder": null,
+        "model": {
+            "type": "BPE",
+            "vocab": { "hello": 0 },
+            "merges": []
+        }
+    }"#;
 
     /// The added tokens a prefix cache may match are those of the raw pass
     /// (`normalized: false`); the tokens matched after normalization, special
@@ -2022,6 +2095,41 @@ mod tests {
 
     fn thinking_kwargs(value: bool) -> HashMap<String, serde_json::Value> {
         HashMap::from([("thinking".to_string(), serde_json::Value::Bool(value))])
+    }
+
+    #[test]
+    fn response_template_is_retained_from_tokenizer_config() {
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+        let expected = json!({
+            "defaults": {"thinking": "", "content": "", "tool_calls": []},
+            "start_anchor_pattern": "anchor",
+            "fields": {"sentinel": "raw-value-is-not-rewritten"}
+        });
+        fs::write(
+            temp.path().join("tokenizer_config.json"),
+            json!({"response_template": expected}).to_string(),
+        )
+        .unwrap();
+
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        assert_eq!(tokenizer.response_template(), Some(&expected));
+    }
+
+    #[test]
+    fn tokenizer_without_response_template_reports_none() {
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+        fs::write(
+            temp.path().join("tokenizer_config.json"),
+            json!({"chat_template": "{{ messages }}"}).to_string(),
+        )
+        .unwrap();
+
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        assert_eq!(tokenizer.response_template(), None);
     }
 
     // Regression: DeepSeek V3.2/V4 bypass ChatTemplateState::apply, so the

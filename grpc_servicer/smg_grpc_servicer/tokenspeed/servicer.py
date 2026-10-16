@@ -58,8 +58,8 @@ from smg_grpc_servicer.tokenspeed.loads import (
 )
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 
+from ..constrained_decoding import grammar_start_labels, tokenspeed_constrained_decoding_start
 from ..pd_pairing import pairing_protocol_from_env
-from ..structured_outputs import grammar_start_labels, tokenspeed_structured_outputs_start
 
 if TYPE_CHECKING:
     # Type-only — keeps these out of the cold-path graph when the servicer is
@@ -258,6 +258,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # n>1 emits a *list* of final dicts (non-streaming) or per-choice
         # streamed dicts tagged with ``index`` — both handled below.
         expanded_rid = getattr(req_obj, "rid", None)
+        # The stream closes once every requested choice has its Complete: the
+        # engine's iterator may stay open briefly after its final output, and a
+        # client must not wait on transport EOF for a response that is whole.
+        expected_choices = len(expanded_rid) if isinstance(expanded_rid, list) else 1
+        completed_indices: set[int] = set()
         if os.environ.get("SMG_CACHE_TRACE") == "1":
             logger.info(
                 "cache_request_mapping %s",
@@ -277,10 +282,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         no_stop_trim = bool(request.sampling_params.no_stop_trim)
 
         aborted = False
+        # Held so the finally can close it: a return at semantic completion
+        # leaves the engine's iterator suspended at its final yield, and the
+        # close releases what it holds there now, not in asyncio's generator
+        # finalizer later.
+        engine_outputs = self.async_llm.generate_request(req_obj)
+        # Choices that have sent a Chunk; only their empty terminal delta is skipped.
+        indices_with_chunks: set[int] = set()
         try:
             engine_started = time.perf_counter()
             first_output = True
-            async for output in self.async_llm.generate_request(req_obj):
+            async for output in engine_outputs:
                 if LOG_MM_TIMING and first_output:
                     first_output = False
                     logger.info(
@@ -306,7 +318,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                         yield self._complete_response(
                             rid, item, item_reason, ci, no_stop_trim=no_stop_trim
                         )
-                    continue
+                    return
 
                 meta = output.get("meta_info", {})
                 reason_dict = _finish_reason_to_dict(meta.get("finish_reason"))
@@ -320,9 +332,19 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 choice_index = int(output.get("index", 0))
 
                 if request.stream:
-                    yield self._chunk_response(
+                    chunk_response = self._chunk_response(
                         rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
                     )
+                    # A matched stop token may be the whole final engine delta;
+                    # trimmed, it leaves no client-visible payload, and an empty
+                    # Chunk before Complete would hold a streaming client at the
+                    # terminal boundary. A choice's first output goes out even
+                    # when empty: the gateway opens the choice (its role delta,
+                    # its first-token time) on the first Chunk, and a Complete
+                    # alone opens nothing.
+                    if chunk_response.chunk.token_ids or choice_index not in indices_with_chunks:
+                        indices_with_chunks.add(choice_index)
+                        yield chunk_response
                     if is_finished:
                         yield self._complete_response(
                             rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
@@ -331,6 +353,11 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     yield self._complete_response(
                         rid, output, reason_dict, choice_index, no_stop_trim=no_stop_trim
                     )
+
+                if is_finished:
+                    completed_indices.add(choice_index)
+                    if len(completed_indices) == expected_choices:
+                        return
 
         except ValueError as e:
             logger.warning("Generate invalid request %s: %s", rid, e)
@@ -352,6 +379,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             logger.exception("Generate failed for request %s", rid)
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
         finally:
+            # The engine's iterator first: closing it runs the engine's own
+            # exit (the model-update reader lock it holds across yields) now
+            # rather than in asyncio's generator finalizer. Its per-request
+            # cleanup is not part of that close, so the check below is still
+            # what aborts an abandoned request.
+            await engine_outputs.aclose()
             # Defensive cleanup — the scheduler owns rid_to_state, but if the
             # stream was torn down before finish we need to notify it. When
             # n>1 we expanded rid to a list of per-choice ids, so walk them.
@@ -586,11 +619,17 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             supported.append(image_modality)
             if hf_config is not None and config_value(hf_config, "video_token_id") is not None:
                 supported.append(video_modality)
-        if (
-            bool(getattr(model_config, "is_audio_model", False))
-            and hf_config is not None
+        # A checkpoint that declares a waveform tower in its own config
+        # (`audio_config` with an `audio_token_id`) takes audio whether or not
+        # the engine's architecture list names it an audio model.
+        declares_audio_tower = (
+            hf_config is not None
+            and config_value(hf_config, "audio_config") is not None
             and config_value(hf_config, "audio_token_id") is not None
-        ):
+        )
+        if (
+            bool(getattr(model_config, "is_audio_model", False)) or declares_audio_tower
+        ) and config_value(hf_config, "audio_token_id") is not None:
             supported.append(audio_modality)
         return supported
 
@@ -631,7 +670,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # in front of a grammar), for the gateway to shape a forced tool
         # call's grammar by.
         server_args_dict.update(
-            grammar_start_labels(self.server_args, tokenspeed_structured_outputs_start())
+            grammar_start_labels(self.server_args, tokenspeed_constrained_decoding_start())
         )
 
         # Control endpoint and capabilities for a fronting gateway (SMG reads
@@ -666,7 +705,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         except Exception:  # noqa: BLE001 — fall back gracefully.
             version = "unknown"
 
-        return tokenspeed_scheduler_pb2.GetServerInfoResponse(
+        info = tokenspeed_scheduler_pb2.GetServerInfoResponse(
             server_args=server_args_struct,
             scheduler_info=scheduler_info_struct,
             active_requests=len(self.async_llm.rid_to_state),
@@ -676,6 +715,15 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             start_time=start_timestamp,
             max_total_num_tokens=int(self.scheduler_info.get("max_total_num_tokens", 0)),
         )
+        # The engine's declared constrained-decoding policy, a field of its own:
+        # the gateway follows it per worker as the `constrained_decoding` label
+        # (a grammar on every turn, or only when the request asks). An engine
+        # that declares none, and a proto package predating the field, leave
+        # it out.
+        constrained_decoding = self._config.constrained_decoding
+        if constrained_decoding and "constrained_decoding" in info.DESCRIPTOR.fields_by_name:
+            info.constrained_decoding = constrained_decoding
+        return info
 
     # The in-flight pause probe, kept across calls. TokenSpeed answers the query
     # through a queueing communicator that resets its result state only after a

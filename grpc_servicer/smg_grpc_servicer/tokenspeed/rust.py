@@ -34,6 +34,10 @@ import threading
 from collections.abc import Mapping
 from typing import Any
 
+from smg_grpc_servicer.constrained_decoding import (
+    grammar_start_labels,
+    tokenspeed_constrained_decoding_start,
+)
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 
 # The lifecycle's defaults and the switch's choices, re-exported: this
@@ -54,10 +58,6 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
     wait_for_ready_reports,
-)
-from smg_grpc_servicer.structured_outputs import (
-    grammar_start_labels,
-    tokenspeed_structured_outputs_start,
 )
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
@@ -147,6 +147,45 @@ def _dtype_name(dtype: Any) -> str:
     return text.removeprefix("torch.")
 
 
+def _config_section(config: Any, name: str) -> Any:
+    """``config[name]`` or ``config.name``, ``None`` when absent."""
+    if isinstance(config, Mapping):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def mrope_positions(hf_config: Any) -> bool | None:
+    """Whether the language model's rotary positions are MRoPE, read off the
+    checkpoint's text rope config: ``rope_scaling`` / ``rope_parameters`` (on the
+    text config when the checkpoint nests one, and the top level) with an
+    ``mrope_section``, or a rope type named ``mrope``. A checkpoint whose rope
+    config is plain (``rope_type: default`` with no section) uses 1-D positions,
+    so its vision grid tensors only lay out the patches. ``None`` when the
+    config carries no rope section at all."""
+    if hf_config is None:
+        return None
+    # Both the nested text config and the top level are read: a config class
+    # may fill a plain rope default on one while the checkpoint declares its
+    # MRoPE section on the other, and either declaration means MRoPE.
+    sections = [hf_config]
+    text = _config_section(hf_config, "text_config")
+    if text is not None:
+        sections.insert(0, text)
+    found = False
+    for section in sections:
+        for key in ("rope_scaling", "rope_parameters"):
+            rope = _config_section(section, key)
+            if rope is None:
+                continue
+            found = True
+            if _config_section(rope, "mrope_section") is not None:
+                return True
+            kind = _config_section(rope, "rope_type") or _config_section(rope, "type")
+            if isinstance(kind, str) and "mrope" in kind:
+                return True
+    return False if found else None
+
+
 def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, Any]:
     """``TokenSpeedGrpcServer`` keyword arguments for ``GetModelInfo``: the
     Python servicer's ``GetModelInfo`` fields, computed up front."""
@@ -170,10 +209,14 @@ def model_facts(server_args: Any, model_config: Any | None = None) -> dict[str, 
         "eos_token_ids": model.eos_token_ids,
         "pad_token_id": model.pad_token_id,
         "bos_token_id": model.bos_token_id,
+        # The engine's declared constrained-decoding policy: off the server args,
+        # else the model config, as the Python servicer reads it.
+        "constrained_decoding": view.constrained_decoding,
         "default_sampling_params_json": str(args.preferred_sampling_params or ""),
         "supports_vision": any(modality in (1, 3) for modality in supported_modalities),
         "supports_multimodal": bool(supported_modalities),
         "supported_modalities": [int(modality) for modality in supported_modalities],
+        "mrope_positions": mrope_positions(model.hf_config),
         "model_dtype": dtype,
         "multimodal_encoder_dtype": dtype,
     }
@@ -198,7 +241,7 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         args_dict["pairing_protocol"] = pairing_protocol
     # The engine's reasoning parser and where it starts a grammar on a thinking
     # prompt, as the Python servicer adds them.
-    args_dict.update(grammar_start_labels(server_args, tokenspeed_structured_outputs_start()))
+    args_dict.update(grammar_start_labels(server_args, tokenspeed_constrained_decoding_start()))
     kv_events = resolve_kv_events_config(server_args)
     try:
         from tokenspeed.version import __version__ as tokenspeed_version

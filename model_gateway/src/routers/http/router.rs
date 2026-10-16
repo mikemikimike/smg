@@ -3860,6 +3860,50 @@ mod tests {
         assert!(seen_body.get("max_tokens").is_none());
     }
 
+    /// Of the engine's `x-override-*` headers only the priority reaches the
+    /// worker, on the typed and on the streamed path.
+    #[tokio::test]
+    async fn override_priority_header_reaches_the_worker_alone() {
+        let (url, captured) = spawn_capture_stub("application/json", "{}").await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Override-Priority", HeaderValue::from_static("7"));
+        headers.insert("x-override-rid", HeaderValue::from_static("client-rid"));
+        headers.insert(
+            "x-override-bootstrap-host",
+            HeaderValue::from_static("evil.invalid"),
+        );
+
+        let typed = router
+            .route_typed_request(
+                Some(&headers),
+                DropProbeRequest {
+                    text: "hello".to_string(),
+                    _probe: Arc::new(()),
+                },
+                "/generate",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+        assert_eq!(typed.status(), StatusCode::OK);
+        let (seen, _) = captured.lock().await.take().unwrap();
+        assert_eq!(seen["x-override-priority"], "7");
+        assert!(seen.get("x-override-rid").is_none());
+        assert!(seen.get("x-override-bootstrap-host").is_none());
+
+        let mut request = streamed_request(&[b"{\"text\":\"hello\"}"]);
+        request.headers_mut().extend(headers);
+        let streamed = router
+            .route_streaming_request(request, "/generate", false)
+            .await
+            .unwrap();
+        assert_eq!(streamed.status(), StatusCode::OK);
+        let (seen, _) = captured.lock().await.take().unwrap();
+        assert_eq!(seen["x-override-priority"], "7");
+        assert!(seen.get("x-override-rid").is_none());
+        assert!(seen.get("x-override-bootstrap-host").is_none());
+    }
+
     #[tokio::test]
     async fn messages_count_tokens_without_workers_is_not_forwarded() {
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
@@ -4101,6 +4145,73 @@ mod tests {
             assert_eq!(body["top_p"], json!(0.9));
             assert_eq!(body["seed"], json!(7));
         }
+    }
+
+    /// The relay forwards the request as its provider profile normalized it:
+    /// a MiniMax stream sent without `stream_options` reaches the upstream
+    /// asking for the usage chunk the vendor's API always ends a stream with;
+    /// a plain served model's stream carries no field the client did not send.
+    #[tokio::test]
+    async fn the_relay_forwards_the_minimax_stream_usage_default() {
+        use openai_protocol::validated::Normalizable;
+        use tokio::sync::Mutex;
+
+        let bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&bodies);
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |body: Bytes| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock()
+                        .await
+                        .push(serde_json::from_slice(&body).unwrap());
+                    ([(CONTENT_TYPE, "text/event-stream")], "data: [DONE]\n\n").into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![plain_worker(&format!("http://{addr}"))],
+        );
+        let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
+        for model in ["MiniMax-M3", "self-hosted-model"] {
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{model}");
+        }
+
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 2, "one dispatch per model");
+        assert_eq!(
+            bodies[0]["stream_options"]["include_usage"],
+            json!(true),
+            "the MiniMax stream asks the upstream for the usage chunk"
+        );
+        assert!(
+            bodies[1].get("stream_options").is_none(),
+            "a plain served model's stream carries no stream_options the client did not send: {}",
+            bodies[1]
+        );
     }
 
     /// A request pinned by a routing key whose worker answers a transient

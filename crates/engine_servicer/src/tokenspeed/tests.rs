@@ -53,7 +53,7 @@ fn model_info() -> TokenSpeedModelInfo {
         bos_token_id: 1,
         default_sampling_params_json: "{\"temperature\":0.7}".to_string(),
         server_args_json:
-            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1","engine_reasoning_parser":"kimi_k25","structured_outputs_start":"first_token"}"#
+            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1","engine_reasoning_parser":"kimi_k25","constrained_decoding_start":"first_token"}"#
                 .to_string(),
         scheduler_info_json: r#"{"shm_namespace_id":"boot:1"}"#.to_string(),
         tokenspeed_version: "0.1.0.post20261003".to_string(),
@@ -852,6 +852,29 @@ async fn requests_without_token_ids_are_refused() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The launcher's constrained-decoding policy (the engine's declaration that
+/// it takes a grammar on every turn) reaches `GetServerInfo` as a field of its
+/// own, for the Router's `constrained_decoding` label.
+#[tokio::test]
+async fn server_info_reports_the_engines_constrained_decoding_policy() {
+    let mut h = harness(
+        TokenSpeedModelInfo {
+            constrained_decoding: "always".to_string(),
+            ..model_info()
+        },
+        None,
+    )
+    .await;
+    let info = h
+        .client
+        .get_server_info(ts::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.constrained_decoding, "always");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// The info RPCs report the launcher's facts, with the handshake's capacity
 /// figures under `scheduler_info`, and the loads the scheduler piggybacks on
 /// its output (zero-filled per rank before any step).
@@ -879,6 +902,9 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         .await
         .unwrap()
         .into_inner();
+    // A launcher that reports no constrained-decoding policy leaves the field
+    // at its default; the Router then sets no `constrained_decoding` label.
+    assert_eq!(info.constrained_decoding, "");
     let server_args = info.server_args.expect("server_args");
     assert_eq!(
         server_args.fields["dp_size"].kind,
@@ -896,7 +922,7 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         Some(Kind::StringValue("kimi_k25".to_string()))
     );
     assert_eq!(
-        server_args.fields["structured_outputs_start"].kind,
+        server_args.fields["constrained_decoding_start"].kind,
         Some(Kind::StringValue("first_token".to_string()))
     );
     let scheduler_info = info.scheduler_info.expect("scheduler_info");

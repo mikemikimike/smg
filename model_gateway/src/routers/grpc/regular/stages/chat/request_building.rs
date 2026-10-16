@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use axum::response::Response;
+use openai_protocol::worker::ConstrainedDecoding;
 use tracing::error;
 
 use crate::{
@@ -44,22 +45,56 @@ impl ChatRequestBuildingStage {
     }
 }
 
+/// Whether the rendered prompt leaves the model inside its thought, as the
+/// request's grammar, the plan's reasoning state and the response spec all
+/// read it: native Gemma4 channels follow the rendered prompt when that
+/// parser decides; other parsers keep their tokenizer-driven preference for
+/// the engine's reasoning gate.
+fn reasoning_decision(
+    ctx: &RequestContext,
+    chat_request: &openai_protocol::chat::ChatCompletionRequest,
+    processed_text: &str,
+    continued_final_message: bool,
+) -> bool {
+    utils::rendered_prompt_reasoning_in_prefill(
+        &ctx.components.reasoning_parser_factory,
+        ctx.components
+            .parser_resolver
+            .reasoning_parser(&chat_request.model)
+            .as_deref(),
+        &chat_request.model,
+        processed_text,
+    )
+    .unwrap_or_else(|| {
+        ctx.tokenizer_arc().is_some_and(|tokenizer| {
+            utils::chat_reasoning_starts_in_rendered_prefill(
+                chat_request,
+                continued_final_message,
+                tokenizer.as_ref(),
+            )
+        })
+    })
+}
+
 /// Build the backend `GenerateRequest` from a chat-shaped request, shared by
 /// the chat endpoint and the transcription endpoint. Assembles multimodal
 /// data, applies sampling defaults (from the chat request), finalizes stops,
 /// and injects PD/EPD metadata — returning the plan, attempt stamp and rendered
 /// reasoning state. The caller supplies the `ResponseSpec`.
+/// `continued_final_message` is the rendered prompt's
+/// (`ProcessedMessages::continued_final_message`).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_chat_backed_plan(
     ctx: &mut RequestContext,
     chat_request: &openai_protocol::chat::ChatCompletionRequest,
     processed_text: String,
+    continued_final_message: bool,
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
     id_prefix: &'static str,
     inject_pd_metadata: bool,
     plan_kind: ExecutionPlanKind,
-) -> Result<(ExecutionPlan, AttemptStamp, Option<bool>), Response> {
+) -> Result<(ExecutionPlan, AttemptStamp, bool), Response> {
     let clients = ctx.state.clients.as_ref().ok_or_else(|| {
         error!(
             function = "build_chat_backed_plan",
@@ -120,27 +155,13 @@ pub(crate) async fn build_chat_backed_plan(
         .await?;
     }
 
-    // Native Gemma4 channels follow the rendered prompt; other parsers keep
-    // their tokenizer-driven preference for the engine's reasoning gate.
-    let reasoning_in_prefill = utils::rendered_prompt_reasoning_in_prefill(
-        &ctx.components.reasoning_parser_factory,
-        ctx.components
-            .parser_resolver
-            .reasoning_parser(&chat_request.model)
-            .as_deref(),
-        &chat_request.model,
-        &processed_text,
-    );
-    let require_reasoning = reasoning_in_prefill.unwrap_or_else(|| {
-        ctx.tokenizer_arc().is_some_and(|tokenizer| {
-            utils::chat_reasoning_starts_in_prefill(chat_request, tokenizer.as_ref())
-        })
-    });
+    let require_reasoning =
+        reasoning_decision(ctx, chat_request, &processed_text, continued_final_message);
 
     // Now that the worker is known, a forced call's grammar takes the shape
     // its engine needs: the bare calls behind a reasoning parser's gate, the
     // thought and then the calls from the first token (the worker's
-    // `structured_outputs_start` label; see `utils::tool_constraints_for_worker`).
+    // `constrained_decoding_start` label; see `utils::tool_constraints_for_worker`).
     // The unshaped constraint stays on the attempt stamp: a retry gives the
     // worker it selects the same shaping (`helpers::ToolConstraintStamp`).
     let tool_parser = ctx
@@ -243,7 +264,7 @@ pub(crate) async fn build_chat_backed_plan(
             inject_pd_metadata,
             tool_constraint,
         },
-        reasoning_in_prefill,
+        require_reasoning,
     ))
 }
 
@@ -281,21 +302,71 @@ impl BuildStage for ChatRequestBuildingStage {
         // the one that reads the response is Symphony only when a table takes
         // the request, so the state records that for the response's header.
         let names = ctx.components.parser_resolver.names(&chat_request.model);
+        // A worker whose engine takes a grammar on every turn gets the table's
+        // tag for the calls the request allows under `auto`, when the request
+        // asked for no constraint of its own (`regular::symphony::auto_constraint`),
+        // built on the reasoning state the plan takes (`reasoning_decision`).
+        // The policy is read once, for the first attempt's worker: the attempt
+        // stamp carries the tag unshaped like a forced call's, so a retry's
+        // worker shapes it again but is not asked for its own policy.
+        let tool_constraints = match tool_constraints {
+            None if utils::constrained_decoding_for(ctx.state.workers.as_ref())
+                == ConstrainedDecoding::Always =>
+            {
+                let reasoning = reasoning_decision(
+                    ctx,
+                    &chat_request,
+                    &processed_messages.text,
+                    processed_messages.continued_final_message,
+                );
+                symphony::auto_constraint(
+                    ctx.state.parser.unwrap_or_default(),
+                    &names,
+                    chat_request.as_ref(),
+                    &chat_request.callable_tools(),
+                    reasoning,
+                    &ctx.components.templates,
+                )
+                .map_err(|why| error::bad_request("invalid_parser_configuration", why))?
+                .map(|constraint| constraint.to_tuple())
+            }
+            other => other,
+        };
         let assignment = symphony::assign(
             ctx.state.parser.unwrap_or_default(),
             &names,
             chat_request.as_ref(),
             tool_constraints.as_ref(),
             &processed_messages.text,
-        );
+            &ctx.components.templates,
+        )
+        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
         ctx.state.parser = Some(match assignment {
             Some(_) => ParserChoice::Symphony,
             None => ParserChoice::Legacy,
         });
+        // The table's structural tag stands in for a JSON response_format (see
+        // `regular::symphony::constraint`): the engine's request carries the tag
+        // alone, so no client reads the two as competing constraints.
+        let answered = assignment.is_some()
+            && chat_request.response_format.is_some()
+            && tool_constraints
+                .as_ref()
+                .is_some_and(|(kind, _)| kind == "structural_tag");
+        let engine_request = answered.then(|| openai_protocol::chat::ChatCompletionRequest {
+            response_format: None,
+            ..chat_request.as_ref().clone()
+        });
+        let engine_request = match &engine_request {
+            Some(request) => request,
+            None => chat_request.as_ref(),
+        };
+        let continued_final_message = processed_messages.continued_final_message;
         let (plan, stamp, reasoning_in_prefill) = build_chat_backed_plan(
             ctx,
-            &chat_request,
+            engine_request,
             processed_messages.text,
+            continued_final_message,
             token_ids,
             tool_constraints,
             "chatcmpl-",

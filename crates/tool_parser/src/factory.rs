@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
+use openai_protocol::common::{Tool, ToolChoice};
 use parking_lot::RwLock;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -35,7 +35,7 @@ type ReasoningPrefixFn = fn(GrammarStart) -> Option<serde_json::Value>;
 
 /// Where the engine that runs a forced call's grammar starts applying it on a
 /// prompt that ends inside the model's thinking block, as its worker
-/// advertises it (the `structured_outputs_start` label).
+/// advertises it (the `constrained_decoding_start` label).
 ///
 /// An engine's own server picks the grammar's shape from this: it sends
 /// xgrammar's reasoning-aware tags (the thought, its close, then the calls)
@@ -63,13 +63,13 @@ pub enum GrammarStart {
 
 impl GrammarStart {
     /// The worker label that carries it.
-    pub const LABEL: &'static str = "structured_outputs_start";
+    pub const LABEL: &'static str = "constrained_decoding_start";
     /// The label's value for [`Self::AfterReasoning`].
     pub const AFTER_REASONING: &'static str = "after_reasoning";
     /// The label's value for [`Self::FirstToken`].
     pub const FIRST_TOKEN: &'static str = "first_token";
 
-    /// The start a worker's `structured_outputs_start` label names; anything
+    /// The start a worker's `constrained_decoding_start` label names; anything
     /// else, the label's absence included, is [`Self::Unknown`].
     pub fn from_label(value: Option<&str>) -> Self {
         match value {
@@ -371,12 +371,9 @@ impl ParserRegistry {
             return Ok(None);
         }
 
-        let at_least_one = match tool_choice {
-            ToolChoice::Value(ToolChoiceValue::Required) => true,
-            ToolChoice::Function { .. } => true,
-            ToolChoice::AllowedTools { mode, .. } if mode == "required" => true,
-            _ => return Ok(None),
-        };
+        if !tool_choice.forces_call() {
+            return Ok(None);
+        }
 
         // Like vLLM's Gemma4EngineToolParser.adjust_request, let Gemma4 emit
         // native calls even for required/named choices instead of forcing JSON.
@@ -389,7 +386,8 @@ impl ParserRegistry {
             let entries = self.entries.read();
             if let Some(entry) = entries.get(name) {
                 if let Some(build_fn) = entry.build_structural_tag.as_ref() {
-                    let mut tag = build_fn(tools, at_least_one);
+                    // A choice that forces a call asks the grammar for at least one.
+                    let mut tag = build_fn(tools, true);
                     if let (true, Some(prefix)) = (reasoning, entry.reasoning_prefix) {
                         if let Some(prefix) = prefix(GrammarStart::Unknown) {
                             tag = wrap_in_reasoning_prefix(tag, prefix)?;
@@ -542,7 +540,12 @@ impl ParserFactory {
             InklingParser::build_structural_tag,
         );
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
-        registry.register_parser("minimax_m3", || Box::new(MinimaxM3Parser::new()));
+        registry.register_parser_with_structural_tag(
+            "minimax_m3",
+            || Box::new(MinimaxM3Parser::new()),
+            MinimaxM3Parser::build_structural_tag,
+        );
+        registry.register_reasoning_prefix("minimax_m3", MinimaxM3Parser::reasoning_prefix);
         registry.register_parser_with_structural_tag(
             "hy_v4",
             || Box::new(HyV4Parser::new()),

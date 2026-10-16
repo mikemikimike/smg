@@ -231,7 +231,8 @@ fn gemma4_template() -> Box<dyn Parser> {
 /// Inkling's messages, spelled from transformers v5.18.0's `tests/utils/test_chat_parsing.py`
 /// (`inkling_template`): each message is a thought, an answer or a call after its own marker, all
 /// of them closed by `<|end_message|>`, and nothing is kept outside them; the thoughts and the
-/// answers repeat, joined with `""` (no row) and not stripped (no trim row).
+/// answers repeat, joined with `""`, as the engine's stays follow one another, and not stripped
+/// (no trim row).
 fn inkling_template() -> Box<dyn Parser> {
     Box::new(Engine::new(
         Format::new("inkling template")
@@ -295,6 +296,10 @@ fn minimax_m3() -> Box<dyn Parser> {
 
 fn kimi_k3() -> Box<dyn Parser> {
     Box::new(Engine::new(formats::kimi_k3(), Declared::default()))
+}
+
+fn muse_spark() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::muse_spark(), Declared::default()))
 }
 
 fn mistral_v13() -> Box<dyn Parser> {
@@ -749,6 +754,11 @@ const FORMATS: &[Subject] = &[
         outputs: KIMI_K3_OUTPUTS,
     },
     Subject {
+        name: "muse spark",
+        new: muse_spark,
+        outputs: MUSE_SPARK_OUTPUTS,
+    },
+    Subject {
         name: "plain",
         new: plain,
         outputs: PLAIN_OUTPUTS,
@@ -882,8 +892,8 @@ const GPT_OSS_OUTPUTS: &[&str] = &[
 
 /// Calls on abstract tags: a call its trailer closes, terminals whose header does not match (in
 /// the content, in a thought, twice in a row), a close the trailer does not end at, a call cut
-/// short, a call the stop closes after its trailer, a header the end leaves unfinished, and
-/// nothing.
+/// short, a value the reader refuses before the trailer closes the call, a call the stop closes
+/// after its trailer, a header the end leaves unfinished, and nothing.
 const SHAPED_TAGS_OUTPUTS: &[&str] = &[
     "Sure.<c><n=f>{\"a\": 1}</f>\n</c>Done.",
     "Hi <c><x>bye",
@@ -891,6 +901,7 @@ const SHAPED_TAGS_OUTPUTS: &[&str] = &[
     "<c><c><n=f>{}</f></c>",
     "<c><n=f>{}</c>x</f></c>",
     "<c><n=f>{\"a\": [1, 2",
+    "<c><n=f>{\"a\": 1</f>\n</c>Done.",
     "<c><n=f>{}</f>",
     "<c><n=",
     "",
@@ -932,6 +943,44 @@ const M3_OUTPUTS: &[&str] = &[
     "Plain prose with no marker at all.",
     "<mm:think>Only a thought.",
     "",
+];
+
+/// Muse Spark's syntax: a turn of messages after the turn's opener, which the contract's empty
+/// prompt leaves to the output's first state: the thought, an update and a call in their own
+/// messages, every value type, two calls, a header with other attributes, call markup quoted in
+/// the answer, a call cut by its message's end, text outside every message, and an output cut
+/// inside a header.
+const MUSE_SPARK_OUTPUTS: &[&str] = &[
+    " to=self<|message|>The user asks about Paris.<|eom|>\
+     <|start|>assistant to=commentary<|message|>Checking.<|eom|>\
+     <|start|>assistant to=get_weather<|message|><atem:function_calls>\n\
+     <atem:invoke name=\"get_weather\">\n\
+     <atem:parameter name=\"city\">Paris</atem:parameter>\n\
+     <atem:parameter name=\"days\">3</atem:parameter>\n\
+     </atem:invoke>\n</atem:function_calls>",
+    " to=self<|message|>Plan.<|eom|><|start|>assistant to=user<|message|>It is sunny.",
+    " to=f<|message|><atem:function_calls>\n<atem:invoke name=\"f\">\n\
+     <atem:parameter name=\"s\">a \"quoted\" line\nand a \\ backslash</atem:parameter>\n\
+     <atem:parameter name=\"n\">1.5</atem:parameter>\n\
+     <atem:parameter name=\"b\">true</atem:parameter>\n\
+     <atem:parameter name=\"z\">null</atem:parameter>\n\
+     <atem:parameter name=\"a\">[1, \"two\"]</atem:parameter>\n\
+     <atem:parameter name=\"o\">{\"k\": {\"v\": 1}}</atem:parameter>\n\
+     </atem:invoke>\n</atem:function_calls><|eom|>\
+     <|start|>assistant to=g<|message|><atem:function_calls>\n<atem:invoke name=\"g\">\n\
+     </atem:invoke>\n</atem:function_calls>",
+    " to=lookup<|message|><atem:function_calls>\n\
+     <atem:invoke id=\"1\" name=\"lookup\">\n\
+     <atem:parameter type=\"string\" name=\"q\">x y</atem:parameter>\n\
+     </atem:invoke>\n</atem:function_calls>",
+    " to=user<|message|>Example: <atem:function_calls>\n<atem:invoke name=\"f\">\n\
+     </atem:invoke>\n</atem:function_calls><|eot|>",
+    " to=f<|message|><atem:function_calls>\n<atem:invoke name=\"f\">\n\
+     <atem:parameter name=\"s\">cut<|eom|><|start|>assistant to=user<|message|>Done",
+    " junk to=user<|message|>\nHi\n",
+    "<atem:invoke id=\"1\">text</atem:invoke> to=user<|message|>Hi",
+    " to=self<|message|>A thought cut<|eom|><|start|>assistant to=us",
+    "unframed text",
 ];
 
 /// Kimi K3's syntax: the recorded shape, a thought with text, every value type, calls ended every

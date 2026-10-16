@@ -3,7 +3,7 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use std::{borrow::Cow, collections::HashMap, fs, io, sync::OnceLock};
+use std::{borrow::Cow, collections::HashMap, fs, io, iter, sync::OnceLock};
 
 use anyhow::{anyhow, Result};
 use chrono::{
@@ -187,7 +187,8 @@ fn mentions_thinking_variable(template: &str) -> bool {
 /// same templates as the engine does (see [`ChatTemplateState::apply`]). A
 /// template is of the "openai" format when it has a loop over a message's
 /// content, a message being a loop variable over `messages` or over a
-/// variable assigned from it: the loop runs over `message.content` (also
+/// variable assigned from it (a namespace attribute included, `{% set
+/// ns.rest = messages[1:] %}`): the loop runs over `message.content` (also
 /// through a filter, a test or a slice), over a macro parameter the template
 /// fills with a message's content, or, outside any macro, over a variable
 /// named `content`. Any other template is of the "string" format, one that
@@ -402,8 +403,11 @@ fn is_var_or_elems_access(expr: &Expr<'_>, varname: &str, key: Option<&str>) -> 
         Expr::Var(v) => key.is_none() && v.id == varname,
         // The base of the attribute is the name itself, as in the engine's
         // `_is_attr_access`; the wrappers above are allowed around the whole
-        // access only.
-        Expr::GetAttr(g) => key.is_some_and(|key| g.name == key && is_var(&g.expr, varname)),
+        // access only. Without a key, a namespace attribute path is the name.
+        Expr::GetAttr(g) => match key {
+            Some(key) => g.name == key && is_var(&g.expr, varname),
+            None => attr_path(expr).as_deref() == Some(varname),
+        },
         Expr::GetItem(g) => key.is_some_and(|key| {
             matches!(&g.subscript_expr, Expr::Const(c) if c.value.as_str() == Some(key))
                 && is_var(&g.expr, varname)
@@ -412,27 +416,50 @@ fn is_var_or_elems_access(expr: &Expr<'_>, varname: &str, key: Option<&str>) -> 
     }
 }
 
-/// Whether `expr` is the plain name `varname`: the engine's `_is_var_access`.
+/// Whether `expr` is the plain name `varname`, or the namespace attribute
+/// path `varname` spells (`ns.rest`): the engine's `_is_var_access`, plus
+/// the namespace attributes [`names_assigned_from`] records.
 fn is_var(expr: &Expr<'_>, varname: &str) -> bool {
-    matches!(expr, Expr::Var(v) if v.id == varname)
+    match expr {
+        Expr::Var(v) => v.id == varname,
+        Expr::GetAttr(_) => attr_path(expr).as_deref() == Some(varname),
+        _ => false,
+    }
+}
+
+/// The dotted path of a chain of attribute accesses on a plain name
+/// (`ns.rest`), the way a namespace attribute is written; `None` for any
+/// other expression.
+fn attr_path(expr: &Expr<'_>) -> Option<String> {
+    match expr {
+        Expr::Var(v) => Some(v.id.to_string()),
+        Expr::GetAttr(g) => attr_path(&g.expr).map(|base| format!("{base}.{}", g.name)),
+        _ => None,
+    }
 }
 
 /// `root` and every name assigned from it or from such a name, through
 /// filters, tests and slices: the engine's `_iter_nodes_assign_var_or_elems`.
-fn names_assigned_from<'a>(sets: &[&'a Set<'a>], root: &'a str) -> Result<Vec<&'a str>, NotAName> {
-    let mut names = vec![root];
-    let mut queue = std::collections::VecDeque::from([root]);
+/// A namespace attribute assigned that way (`{% set ns.rest = messages[1:] %}`,
+/// which a template loops over as `ns.rest`) is recorded by its dotted path,
+/// where the engine's walk stops; any other target that is not a name stops
+/// this one too.
+fn names_assigned_from<'a>(sets: &[&'a Set<'a>], root: &'a str) -> Result<Vec<String>, NotAName> {
+    let mut names = vec![root.to_string()];
+    let mut queue = std::collections::VecDeque::from([root.to_string()]);
     while let Some(related) = queue.pop_front() {
         for set in sets {
-            if !is_var_or_elems_access(&set.expr, related, None) {
+            if !is_var_or_elems_access(&set.expr, &related, None) {
                 continue;
             }
-            let Expr::Var(target) = &set.target else {
-                return Err(NotAName);
+            let target = match &set.target {
+                Expr::Var(target) => target.id.to_string(),
+                Expr::GetAttr(_) => attr_path(&set.target).ok_or(NotAName)?,
+                _ => return Err(NotAName),
             };
-            if !names.contains(&target.id) {
-                names.push(target.id);
-                queue.push_back(target.id);
+            if !names.contains(&target) {
+                names.push(target.clone());
+                queue.push_back(target);
             }
         }
     }
@@ -443,7 +470,7 @@ fn names_assigned_from<'a>(sets: &[&'a Set<'a>], root: &'a str) -> Result<Vec<&'
 /// `_iter_nodes_assign_messages_item`.
 fn message_loop_vars<'a>(
     loops: &[(&'a ForLoop<'a>, Vec<&'a Macro<'a>>)],
-    messages_names: &[&str],
+    messages_names: &[String],
 ) -> Result<Vec<&'a str>, NotAName> {
     let mut vars = Vec::new();
     for (fl, _) in loops {
@@ -821,6 +848,14 @@ pub struct ChatTemplateParams<'a> {
     /// must come out the same each time; `None` is the clock (see
     /// [`render_instant`]).
     pub now: Option<DateTime<FixedOffset>>,
+    /// Leave the final message open for the model to continue, as
+    /// transformers' `continue_final_message` does: the conversation is
+    /// rendered with that message and cut right after its text. Not
+    /// compatible with `add_generation_prompt`. Where the template cannot
+    /// continue the message, its text follows the generation prompt instead
+    /// (`ChatTemplateOutput::continued_final_message` says which happened),
+    /// and a message that also has `reasoning_content` is refused.
+    pub continue_final_message: bool,
 }
 
 /// JSON separator pair passed through HuggingFace's `tojson` filter.
@@ -1512,14 +1547,206 @@ fn consolidate_system_messages(messages: Vec<serde_json::Value>) -> Vec<serde_js
         }
     }
     let merged = serde_json::json!({"role": "system", "content": system_texts.join("\n\n")});
-    std::iter::once(merged).chain(others).collect()
+    iter::once(merged).chain(others).collect()
 }
 
+/// The marker transformers appends to the continued text before rendering;
+/// the prompt is cut where it lands.
+const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
+
+/// Python's `str.isspace`, which transformers' `strip`/`rstrip` and the
+/// checkpoints' whitespace runs go by: Unicode white space plus the
+/// separators U+001C..=U+001F.
+pub(crate) fn python_isspace(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// The marker for one render: transformers' own, unless the request already
+/// carries its words (in a message, a tool, a document or a template kwarg);
+/// then the words followed by one more underscore than ever follows them
+/// there. Either way only the final message carries the marker.
+fn continuation_marker(messages: &[JsonValue], params: &ChatTemplateParams) -> Cow<'static, str> {
+    let words = CONTINUE_FINAL_MESSAGE_TAG.trim_end();
+    fn longest_run(text: &str, words: &str, longest: &mut Option<usize>) {
+        for (at, _) in text.match_indices(words) {
+            let run = text[at + words.len()..]
+                .bytes()
+                .take_while(|&b| b == b'_')
+                .count();
+            *longest = Some(longest.map_or(run, |n| n.max(run)));
+        }
+    }
+    fn walk(value: &JsonValue, words: &str, longest: &mut Option<usize>) {
+        match value {
+            JsonValue::String(text) => longest_run(text, words, longest),
+            JsonValue::Array(items) => items.iter().for_each(|item| walk(item, words, longest)),
+            JsonValue::Object(fields) => fields.iter().for_each(|(key, item)| {
+                longest_run(key, words, longest);
+                walk(item, words, longest);
+            }),
+            _ => {}
+        }
+    }
+    let mut longest = None;
+    for value in messages
+        .iter()
+        .chain(params.tools.into_iter().flatten())
+        .chain(params.documents.into_iter().flatten())
+    {
+        walk(value, words, &mut longest);
+    }
+    for (key, value) in params.template_kwargs.into_iter().flatten() {
+        longest_run(key, words, &mut longest);
+        walk(value, words, &mut longest);
+    }
+    match longest {
+        Some(n) => Cow::Owned(format!("{words}{} ", "_".repeat(n + 1))),
+        None => Cow::Borrowed(CONTINUE_FINAL_MESSAGE_TAG),
+    }
+}
+
+/// The text the final message is continued from: its string content, or
+/// the text of its last part that has one.
+fn final_text(message: &JsonValue) -> Option<&str> {
+    match message.get("content")? {
+        JsonValue::Array(parts) => parts.iter().rev().find_map(|part| part.get("text")),
+        content => Some(content),
+    }?
+    .as_str()
+}
+
+/// Append `marker` to the text the final message is continued from.
+fn tag_final_message(message: &mut JsonValue, marker: &str) -> Result<()> {
+    let text = match message.get_mut("content") {
+        Some(JsonValue::Array(parts)) => parts.iter_mut().rev().find_map(|p| p.get_mut("text")),
+        content => content,
+    };
+    let Some(JsonValue::String(text)) = text else {
+        return Err(anyhow!("the final message has no text to continue"));
+    };
+    text.push_str(marker);
+    Ok(())
+}
+
+/// Cut a rendering of the tagged conversation right after the continued
+/// text: at `marker`, and also past the whitespace before it when the
+/// template trimmed the marker's trailing space. The text must end right
+/// there (whitespace aside), so the cut belongs to the final message;
+/// transformers only checks that the text appears somewhere in the prompt.
+fn cut_at_final_message(mut rendered: String, text: &str, marker: &str) -> Result<String> {
+    let tag_at = rendered
+        .rfind(marker.trim_end())
+        .filter(|&at| {
+            rendered[..at]
+                .trim_end_matches(python_isspace)
+                .ends_with(text.trim_matches(python_isspace))
+        })
+        .ok_or_else(|| anyhow!("the final message does not appear in the rendered chat"))?;
+    let cut = if rendered[tag_at..].starts_with(marker) {
+        tag_at
+    } else {
+        rendered[..tag_at].trim_end_matches(python_isspace).len()
+    };
+    rendered.truncate(cut);
+    Ok(rendered)
+}
+
+/// Render with the final message left open, following transformers'
+/// `continue_final_message`: mark the end of the message's text, render the
+/// whole conversation without a generation prompt, and cut at the marker.
+///
+/// Where transformers raises instead (no text to continue, the template
+/// fails on the message, or the text never reaches the prompt, as with a
+/// template that renders no assistant turns), or would cut anywhere but
+/// right after the final message's text, the message is left out and
+/// its text appended after the generation prompt, which is how every
+/// continued message rendered before. Speech-recognition prompts rely on
+/// this: their forced-language prefill follows a generation prompt the
+/// template opens but whose turn it never renders. Only the text survives
+/// that, so a message that also has `reasoning_content` is refused there
+/// instead. The flag says which happened: true when the message was
+/// continued.
+fn render_continuing_final_message(
+    env: &Environment<'_>,
+    messages: &[JsonValue],
+    params: ChatTemplateParams,
+) -> Result<(String, bool)> {
+    if params.add_generation_prompt {
+        return Err(anyhow!(
+            "continue_final_message and add_generation_prompt are not compatible"
+        ));
+    }
+    let Some((last, head)) = messages.split_last() else {
+        return Err(anyhow!("no final message to continue"));
+    };
+    let marker = continuation_marker(messages, &params);
+    let continued = (|| {
+        let text =
+            final_text(last).ok_or_else(|| anyhow!("the final message has no text to continue"))?;
+        let mut tagged = last.clone();
+        tag_final_message(&mut tagged, &marker)?;
+        let params = ChatTemplateParams {
+            continue_final_message: false,
+            ..params
+        };
+        let (rendered, _) = render_messages(env, head.iter().chain(iter::once(&tagged)), params)?;
+        cut_at_final_message(rendered, text, &marker)
+    })();
+    let reason = match continued {
+        Ok(prompt) => return Ok((prompt, true)),
+        Err(reason) => reason,
+    };
+    if last
+        .get("reasoning_content")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|reasoning| !reasoning.is_empty())
+    {
+        return Err(anyhow!(
+            "{reason}: only its text could follow the generation prompt, and its \
+             reasoning_content would be lost"
+        ));
+    }
+    tracing::debug!(%reason, "appending the continued message after the generation prompt");
+    let (mut prompt, _) = render_chat_template(
+        env,
+        head,
+        ChatTemplateParams {
+            add_generation_prompt: true,
+            continue_final_message: false,
+            ..params
+        },
+    )?;
+    match last.get("content") {
+        Some(JsonValue::String(text)) => prompt.push_str(text),
+        Some(JsonValue::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text")?.as_str())
+            .for_each(|text| prompt.push_str(text)),
+        _ => {}
+    }
+    Ok((prompt, false))
+}
+
+/// Render the chat, and say whether the prompt continues the final message
+/// (see [`render_continuing_final_message`]).
 fn render_chat_template(
     env: &Environment<'_>,
     messages: &[serde_json::Value],
     params: ChatTemplateParams,
-) -> Result<String> {
+) -> Result<(String, bool)> {
+    if params.continue_final_message {
+        return render_continuing_final_message(env, messages, params);
+    }
+    render_messages(env, messages.iter(), params)
+}
+
+/// Render `messages` through the template with the generation prompt the
+/// params ask for; the flag says the prompt does not continue a message.
+fn render_messages<'a>(
+    env: &Environment<'_>,
+    messages: impl Iterator<Item = &'a JsonValue>,
+    params: ChatTemplateParams,
+) -> Result<(String, bool)> {
     let tmpl = env
         .get_template("chat")
         .map_err(|e| anyhow!("Failed to get template: {e}"))?;
@@ -1530,7 +1757,7 @@ fn render_chat_template(
     let strftime_now = Value::from_function(move |format: String| strftime(&now, &format));
 
     // Convert messages to minijinja::Value (messages already processed by router)
-    let minijinja_messages: Vec<Value> = messages.iter().map(Value::from_serialize).collect();
+    let minijinja_messages: Vec<Value> = messages.map(Value::from_serialize).collect();
 
     // transformers renders with `tools=None` and `documents=None` when the
     // request carries none: the names are defined and hold none. A template
@@ -1583,7 +1810,7 @@ fn render_chat_template(
         .render(&ctx)
         .map_err(|e| anyhow!("Failed to render template: {e}"))?;
 
-    Ok(rendered)
+    Ok((rendered, false))
 }
 
 /// The messages with every string `content` of a non-tool message replaced by
@@ -1639,7 +1866,7 @@ impl ChatTemplateProcessor {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
-        render_chat_template(&self.env, messages, params)
+        render_chat_template(&self.env, messages, params).map(|(prompt, _)| prompt)
     }
 }
 
@@ -1782,6 +2009,20 @@ impl ChatTemplateState {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
+        self.apply_with_continuation(messages, params)
+            .map(|(prompt, _)| prompt)
+    }
+
+    /// [`Self::apply`], also saying whether the prompt continues the final
+    /// message: false unless `continue_final_message` was asked for and the
+    /// template could continue the message instead of appending its text
+    /// after the generation prompt (see
+    /// [`ChatTemplateParams::continue_final_message`]).
+    pub fn apply_with_continuation(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
         let env = self.env.as_ref().ok_or_else(|| {
             anyhow!(
                 "Cannot use chat template functions because tokenizer.chat_template is not set \
@@ -1973,6 +2214,51 @@ mod tests {
         assert_eq!(
             detect_chat_template_content_format(parts_template),
             ChatTemplateContentFormat::OpenAI
+        );
+    }
+
+    /// A template that keeps the messages it loops over in a namespace
+    /// attribute (`ns.rest = messages[1:]`) and renders each message's
+    /// content through a macro that walks its parts is of the "openai"
+    /// format: its parts reach the template, which writes the media anchors
+    /// itself. Any other non-name assignment target still falls back to the
+    /// "string" format.
+    #[test]
+    fn namespace_message_lists_are_followed_to_their_content_loop() {
+        let template = "{%- macro render_content(content) -%}\
+                        {%- if content is string -%}{{ content }}\
+                        {%- else -%}{%- for part in content -%}\
+                        {%- if part.get('type', '') in ['image', 'image_url'] -%}<|patch|>\
+                        {%- elif part.get('type', '') == 'text' -%}{{ part.get('text', '') }}\
+                        {%- endif -%}{%- endfor -%}{%- endif -%}{%- endmacro -%}\
+                        {%- set ns = namespace(rest=messages) -%}\
+                        {%- if messages and messages[0]['role'] == 'system' -%}\
+                        {%- set ns.rest = messages[1:] -%}{%- endif -%}\
+                        {%- for message in ns.rest -%}\
+                        <|start|>{{ message['role'] }}<|message|>{{ render_content(message['content']) }}<|eot|>\
+                        {%- endfor -%}";
+        assert_eq!(
+            detect_chat_template_content_format(template),
+            ChatTemplateContentFormat::OpenAI
+        );
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": "what is this?"}
+        ]})];
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|start|>user<|message|><|patch|>what is this?<|eot|>"
+        );
+
+        // A plain string-content template with the same namespace shape stays string-format.
+        let plain = "{%- set ns = namespace(rest=messages) -%}{%- for message in ns.rest -%}\
+                     {{ message['content'] }}{%- endfor -%}";
+        assert_eq!(
+            detect_chat_template_content_format(plain),
+            ChatTemplateContentFormat::String
         );
     }
 

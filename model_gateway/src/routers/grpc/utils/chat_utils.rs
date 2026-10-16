@@ -31,6 +31,7 @@ use openai_protocol::{
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
+use tool_parser::types::ToolCallItem;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
@@ -391,7 +392,7 @@ pub(crate) fn process_content_format(
     )
 }
 
-const REASONING_EFFORT_KEY: &str = "reasoning_effort";
+pub(super) const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const TOOL_CHOICE_KEY: &str = "tool_choice";
 const RESPONSE_FORMAT_KEY: &str = "response_format";
 
@@ -437,11 +438,11 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     combined
 }
 
-/// Typed `thinking.type` first, else the OpenAI mapping of the effective effort.
+/// The thinking preference the prompt is rendered with: the typed toggle,
+/// else the effective effort, both as the request's provider profile reads
+/// them (`ChatCompletionRequest::template_thinking`).
 fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
-    request.thinking_toggle().or_else(|| {
-        openai_protocol::chat::thinking_from_reasoning_effort(request.effective_reasoning_effort())
-    })
+    request.template_thinking()
 }
 
 /// gRPC backends require content parts the gateway knows how to render.
@@ -628,9 +629,9 @@ fn transform_content_field(
 }
 
 /// A popped assistant message's prefill: its string content, or its text parts joined in order.
-fn prefill_text(content: &Value) -> Option<String> {
+fn prefill_text(content: Value) -> Option<String> {
     match content {
-        Value::String(text) => Some(text.clone()),
+        Value::String(text) => Some(text),
         Value::Array(parts) => Some(
             parts
                 .iter()
@@ -810,14 +811,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
             Some(&combined_template_kwargs)
         };
 
-        let continues_final_assistant = request.continue_final_message
-            && transformed_messages
-                .last()
-                .and_then(|msg| msg.get("role"))
-                .and_then(|v| v.as_str())
-                == Some("assistant");
+        let continues_final_assistant = request.continues_final_assistant();
         // Renderers that continue a trailing assistant message natively
-        // (DeepSeek-V4.1: rendered without EOS and without a generation
+        // (Jinja templates, cut right after the message as transformers
+        // does; DeepSeek-V4.1: rendered without EOS and without a generation
         // header) keep the message and are called without a generation
         // prompt; other templates get the message popped and its content
         // appended after the generation prompt as a prefix.
@@ -828,6 +825,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
 
         let params = ChatTemplateParams {
             add_generation_prompt: !native_continuation,
+            continue_final_message: native_continuation,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             // The tokenizer applies the toggle under the template's own key.
@@ -840,17 +838,20 @@ pub(crate) fn process_chat_messages_with_placeholders(
             // Pop the last message to render it as the prefix. A trailing
             // assistant role implies a non-empty list, so the `else` arm is
             // only defensive.
-            let Some(last_msg) = transformed_messages.pop() else {
+            let Some(mut last_msg) = transformed_messages.pop() else {
                 return Ok((
                     ProcessedMessages {
                         text: String::new(),
-                        stop_sequences: request.stop.clone(),
                         unbilled_prompt_tokens: 0,
+                        continued_final_message: false,
                     },
                     PromptEncoding::FromText,
                 ));
             };
-            last_msg.get("content").and_then(prefill_text)
+            last_msg
+                .get_mut("content")
+                .map(Value::take)
+                .and_then(prefill_text)
         } else {
             None
         };
@@ -871,8 +872,8 @@ pub(crate) fn process_chat_messages_with_placeholders(
     Ok((
         ProcessedMessages {
             text,
-            stop_sequences: request.stop.clone(),
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
+            continued_final_message: rendered.continued_final_message,
         },
         rendered.encoding,
     ))
@@ -928,6 +929,24 @@ pub fn create_stop_decoder(
     }
 
     builder.build()
+}
+
+/// With parallel tool calls turned off (`parallel_tool_calls: false`, or
+/// Messages `disable_parallel_tool_use: true`) a response returns only its
+/// first tool call; the calls a model writes after it are dropped.
+pub(crate) fn keep_first_tool_call(calls: &mut Option<Vec<ToolCall>>) {
+    if let Some(calls) = calls.as_mut().filter(|calls| calls.len() > 1) {
+        debug!(
+            dropped = calls.len() - 1,
+            "parallel tool calls are off: returning the first call"
+        );
+        calls.truncate(1);
+    }
+}
+
+/// The streamed form of [`keep_first_tool_call`].
+pub(crate) fn keep_first_tool_call_items(items: &mut Vec<ToolCallItem>) {
+    items.retain(|item| item.tool_index == 0);
 }
 
 /// Parse tool calls from JSON schema constrained response
@@ -1006,22 +1025,6 @@ pub(crate) fn parse_json_schema_response(
         }
         _ => (None, processed_text.to_string()),
     }
-}
-
-/// Count the number of tool calls in the request message history
-/// This is used for KimiK2 format which needs globally unique indices
-pub(crate) fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
-    request
-        .messages
-        .iter()
-        .filter_map(|msg| {
-            if let ChatMessage::Assistant { tool_calls, .. } = msg {
-                tool_calls.as_ref().map(|calls| calls.len())
-            } else {
-                None
-            }
-        })
-        .sum()
 }
 
 /// Generate a tool call ID based on model format
@@ -1958,6 +1961,42 @@ mod tests {
         );
     }
 
+    /// Under the MiniMax profile no effort value switches thinking off and an
+    /// explicit effort outranks `thinking.disabled`; the request renders the
+    /// template's default (thinking on, the model's own depth).
+    #[test]
+    fn minimax_effort_keeps_thinking_on() {
+        let minimax = |thinking: Option<Value>, reasoning_effort: Option<&str>| {
+            let mut request = effort_request(reasoning_effort);
+            request.model = "MiniMax-M3".to_string();
+            request.thinking = thinking.map(|value| serde_json::from_value(value).unwrap());
+            request
+        };
+        for effort in ["none", "minimal", "high"] {
+            assert_eq!(
+                resolve_template_thinking(&minimax(None, Some(effort))),
+                None,
+                "{effort}"
+            );
+            assert_eq!(
+                resolve_template_thinking(&minimax(
+                    Some(json!({"type": "disabled"})),
+                    Some(effort)
+                )),
+                None,
+                "{effort} outranks thinking.disabled"
+            );
+        }
+        assert_eq!(
+            resolve_template_thinking(&minimax(Some(json!({"type": "disabled"})), None)),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_template_thinking(&minimax(Some(json!({"type": "enabled"})), Some("none"))),
+            Some(true)
+        );
+    }
+
     #[test]
     fn thinking_enabled_beats_reasoning_effort_none() {
         let request = thinking_request(json!({"type": "enabled"}), Some("none"));
@@ -2264,6 +2303,39 @@ mod tests {
         let anchored = render(Some(&placeholders));
         assert!(anchored.contains("<SPECIAL_30>") && !anchored.contains("<video>"));
         assert!(render(None).contains("<video>"));
+    }
+
+    /// An assistant turn that opens with a header the generation prompt
+    /// lacks: the continued text must follow the header.
+    const HEADER_TEMPLATE: &str = r"
+{%- for m in messages -%}
+{%- if m.role == 'assistant' -%}{{- '<|turn|>assistant<|to|>user<|body|>' + m.content + '<|end|>' -}}
+{%- else -%}{{- '<|turn|>' + m.role + '<|body|>' + m.content + '<|end|>' -}}{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|turn|>assistant' -}}{%- endif -%}";
+
+    /// A Jinja template continues the trailing assistant message inside the
+    /// turn it renders for it, as transformers does.
+    #[test]
+    fn jinja_template_continues_inside_the_assistant_turn() {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(HEADER_TEMPLATE.to_string())
+            .unwrap();
+        let (processed, _) = process_chat_messages_with_placeholders(
+            &prefill_request(),
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert_eq!(
+            processed.text,
+            "<|turn|>user<|body|>Hello<|end|><|turn|>assistant<|to|>user<|body|>Sure"
+        );
+        assert!(processed.continued_final_message);
     }
 
     /// Under the OpenAI content format the popped assistant message keeps its

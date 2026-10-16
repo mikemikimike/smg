@@ -79,6 +79,13 @@ pub struct Arguments {
     invalid_from: Option<usize>,
     /// Where the value ended, once it is whole.
     whole: Option<usize>,
+    /// Whether the value ends where its bytes stop being a JSON prefix: the bytes from there on
+    /// are then the caller's ([`Self::refused_tail`]), for a shaped call's trailer to read, rather
+    /// than the value's malformed rest.
+    ends_where_refused: bool,
+    /// The last character of the whitespace before the value, if any came: what stands before a
+    /// value refused at its first byte ([`Self::refused_tail`]).
+    led_by: Option<char>,
     /// The top-level object's members, as far as holding a string needs them.
     members: Members,
 }
@@ -205,8 +212,49 @@ impl Arguments {
             prefix: Prefix::default(),
             invalid_from: None,
             whole: None,
+            ends_where_refused: false,
+            led_by: None,
             members: Members::default(),
         }
+    }
+
+    /// The value ends where its bytes stop being a JSON prefix (see [`Self::refused_tail`]).
+    pub fn ending_where_refused(mut self) -> Self {
+        self.ends_where_refused = true;
+        self
+    }
+
+    /// Whether the bytes stopped being a JSON prefix.
+    pub fn refused(&self) -> bool {
+        self.invalid_from.is_some()
+    }
+
+    /// Whether the value ended where its bytes stopped being a JSON prefix: it ends there
+    /// ([`Self::ending_where_refused`]), and they did.
+    pub fn ended_where_refused(&self) -> bool {
+        self.ends_where_refused && self.invalid_from.is_some()
+    }
+
+    /// Whether the value takes no more bytes: it is whole, or it ended where refused.
+    pub fn over(&self) -> bool {
+        self.whole.is_some() || self.ended_where_refused()
+    }
+
+    /// For a value that ends where refused: the bytes from the refusal on, which the value took
+    /// before the refusal was known (a held word, the rest of the piece), handed back once with
+    /// the character before them (the last of the whitespace before the value, for a value refused
+    /// at its first byte; `None` when nothing came before it), for the caller to read as what
+    /// follows the value; `None` for a value not refused, or whose tail was already taken. `feed`
+    /// takes nothing after this.
+    pub fn refused_tail(&mut self) -> Option<(String, Option<char>)> {
+        let from = self.invalid_from.filter(|_| self.ends_where_refused)?;
+        if from >= self.value.len() && self.emitted >= from {
+            return None;
+        }
+        let tail = self.value.split_off(from);
+        let before = self.value.chars().next_back().or(self.led_by);
+        self.emitted = self.emitted.min(from);
+        Some((tail, before))
     }
 
     /// Whether the value's first byte has arrived.
@@ -223,7 +271,7 @@ impl Arguments {
     /// holds, and return how many of them the value took: all of them before its end, up to its
     /// end in the piece that carries it, and none once it is whole.
     pub fn feed(&mut self, bytes: &str, strings: &dyn Strings, out: &mut Events) -> usize {
-        if self.whole.is_some() {
+        if self.over() {
             return 0;
         }
         let mut taken = 0;
@@ -231,7 +279,8 @@ impl Arguments {
         if !self.started {
             let value = rest.trim_start_matches(json_space);
             let space = &rest[..rest.len() - value.len()];
-            if !space.is_empty() {
+            if let Some(last) = space.chars().next_back() {
+                self.led_by = Some(last);
                 out.push(Event::Dropped {
                     text: Text::uncounted(space),
                     why: DropReason::Whitespace,
@@ -269,7 +318,13 @@ impl Arguments {
             let held = [self.prefix.word_start(), self.members.open];
             upto = held.into_iter().flatten().fold(end, usize::min);
         }
-        self.emit(upto.max(self.emitted), end, strings, out);
+        // A value that ends where refused keeps the bytes from the refusal on for the caller
+        // (`refused_tail`), instead of reporting them as its malformed rest.
+        let reported = match self.invalid_from {
+            Some(from) if self.ends_where_refused => from.max(self.emitted).min(end),
+            _ => end,
+        };
+        self.emit(upto.max(self.emitted).min(reported), reported, strings, out);
         self.value.truncate(end);
         taken + end - before
     }
@@ -500,6 +555,78 @@ mod tests {
         for cut in (1..text.len()).filter(|&cut| text.is_char_boundary(cut)) {
             assert_eq!(held(&[&text[..cut], &text[cut..]]), whole, "cut at {cut}");
         }
+    }
+
+    /// A value that ends where refused takes the piece that breaks it, reports the prefix before
+    /// the break and nothing after, hands the bytes from the break on back once with the character
+    /// before them, and takes nothing more; a value refused at the end of a piece has no tail.
+    #[test]
+    fn a_value_ending_where_refused_hands_its_tail_back_once() {
+        let mut arguments = Arguments::new(0).ending_where_refused();
+        let mut out = Events::new();
+        assert_eq!(arguments.feed("{\"a\": 1</f>\n", &AsWritten, &mut out), 12);
+        assert!(arguments.refused() && arguments.over() && !arguments.whole());
+        let events = out.drain();
+        assert_eq!(fragments(&events), "{\"a\": 1");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "{events:#?}"
+        );
+        assert_eq!(
+            arguments.refused_tail(),
+            Some(("</f>\n".to_string(), Some('1')))
+        );
+        assert_eq!(arguments.refused_tail(), None);
+        assert_eq!(arguments.feed("more", &AsWritten, &mut out), 0);
+        assert!(!arguments.finish(&mut out));
+        assert!(out.drain().is_empty(), "nothing more is reported");
+
+        let mut arguments = Arguments::new(0).ending_where_refused();
+        let mut out = Events::new();
+        assert_eq!(arguments.feed("{\"a\": tr", &AsWritten, &mut out), 8);
+        assert!(!arguments.refused(), "a word being spelled is held");
+        assert_eq!(arguments.feed("uex</f>", &AsWritten, &mut out), 7);
+        assert!(arguments.refused());
+        assert_eq!(fragments(&out.drain()), "{\"a\": ");
+        assert_eq!(
+            arguments.refused_tail(),
+            Some(("truex</f>".to_string(), Some(' '))),
+            "the held word comes back with the tail"
+        );
+
+        // Refused at its first byte, the value has no character of its own before the tail: the
+        // last of the whitespace before it stands there, whichever piece it came in, and the
+        // caller knows what came before when none did.
+        let mut arguments = Arguments::new(0).ending_where_refused();
+        let mut out = Events::new();
+        assert_eq!(arguments.feed(" \nEND", &AsWritten, &mut out), 5);
+        assert!(arguments.ended_where_refused());
+        assert_eq!(fragments(&out.drain()), "");
+        assert_eq!(
+            arguments.refused_tail(),
+            Some(("END".to_string(), Some('\n')))
+        );
+        let mut arguments = Arguments::new(0).ending_where_refused();
+        assert_eq!(arguments.feed(" ", &AsWritten, &mut out), 1);
+        assert_eq!(arguments.feed("END", &AsWritten, &mut out), 3);
+        assert_eq!(
+            arguments.refused_tail(),
+            Some(("END".to_string(), Some(' ')))
+        );
+        let mut arguments = Arguments::new(0).ending_where_refused();
+        assert_eq!(arguments.feed("END", &AsWritten, &mut out), 3);
+        assert_eq!(arguments.refused_tail(), Some(("END".to_string(), None)));
+
+        let mut plain = Arguments::new(0);
+        let mut out = Events::new();
+        assert_eq!(plain.feed("{\"a\": 1</f>", &AsWritten, &mut out), 11);
+        assert!(
+            plain.refused() && !plain.over() && !plain.ended_where_refused(),
+            "a plain value keeps its malformed rest"
+        );
+        assert_eq!(plain.refused_tail(), None);
     }
 
     #[test]

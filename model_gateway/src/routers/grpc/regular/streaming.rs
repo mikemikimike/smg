@@ -471,10 +471,9 @@ impl StreamingProcessor {
                 reasoning_parser_available || original_request.symphony.is_some();
         }
 
-        // If the template supports a thinking toggle and the user enabled it,
-        // the template injected `<think>` in the prefill — parsers should start
-        // in reasoning mode.
-        let thinking_override = original_request.reasoning_starts_in_prefill(tokenizer.as_ref());
+        // Request building decided whether the rendered prompt ends inside the
+        // model's thinking block; the parsers then start in reasoning mode.
+        let thinking_override = original_request.reasoning_in_prefill;
         let think_in_prefill = tokenizer.think_in_prefill();
 
         // Check if JSON schema constraint was used (specific function or required mode)
@@ -485,12 +484,7 @@ impl StreamingProcessor {
         let used_json_schema = if native_tool_format {
             false
         } else {
-            match tool_choice {
-                Some(ToolChoice::Function { .. }) => true,
-                Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-                Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-                _ => false,
-            }
+            tool_choice.as_ref().is_some_and(ToolChoice::forces_call)
         };
 
         // Check if this is the specific function case (LLM generates parameters only, no name field).
@@ -634,10 +628,10 @@ impl StreamingProcessor {
                         Some(assignment) => {
                             let reader = match readers.entry(index) {
                                 Entry::Occupied(reader) => reader.into_mut(),
-                                Entry::Vacant(slot) => slot.insert(Reader::new(
-                                    assignment,
-                                    tools.as_deref().unwrap_or(&[]),
-                                )?),
+                                Entry::Vacant(slot) => slot.insert(
+                                    Reader::new(assignment, tools.as_deref().unwrap_or(&[]))?
+                                        .first_call_only(original_request.first_tool_call_only),
+                                ),
                             };
                             Some(reader.read(stop_decoder, chunk.token_ids())?)
                         }
@@ -754,6 +748,35 @@ impl StreamingProcessor {
                     completion_tokens.record_complete(&complete);
                     if let Some(usage) = &mut continuous_usage {
                         usage.record_complete(&complete);
+                    }
+
+                    // A choice's first engine output may be its Complete (a
+                    // completion with no tokens: a finish that carries none
+                    // comes without a Chunk). It opens the choice as a first
+                    // Chunk does, the role chunk before the finish chunk, and
+                    // records the stream's first-token time; its usage, as a
+                    // first Chunk's, counts the output it rides on.
+                    if first_token_time.is_none() {
+                        first_token_time = Some(Instant::now());
+                        if let Some(timing) = &pd_timing {
+                            timing.record_first_decode_token(self.backend_type, model);
+                        }
+                    }
+                    if is_firsts.get(&index).copied().unwrap_or(true) {
+                        let usage = continuous_usage.as_ref().map(|tracker| {
+                            tracker.snapshot(original_request.unbilled_prompt_tokens)
+                        });
+                        Self::send_role_chunk(
+                            tx,
+                            &mut sse_buffer,
+                            &chunk_frame,
+                            index,
+                            opens_tool_call,
+                            usage.as_ref(),
+                            emit_usage_null,
+                        )
+                        .await?;
+                        is_firsts.insert(index, false);
                     }
 
                     cached_tokens.insert(index, complete.cached_tokens());
@@ -1024,6 +1047,7 @@ impl StreamingProcessor {
                             model,
                             history_tool_calls_count,
                             used_json_schema,
+                            original_request.first_tool_call_only,
                         )
                         .await
                     };
@@ -1092,7 +1116,10 @@ impl StreamingProcessor {
                     .map_err(|_| "Failed to send flushed content chunk".to_string())?;
             }
 
-            if let Some(unstreamed_items) = parser_guard.get_unstreamed_tool_args() {
+            if let Some(mut unstreamed_items) = parser_guard.get_unstreamed_tool_args() {
+                if original_request.first_tool_call_only {
+                    utils::keep_first_tool_call_items(&mut unstreamed_items);
+                }
                 for tool_call_item in unstreamed_items {
                     let tool_call_delta = ToolCallDelta {
                         index: tool_call_item.tool_index as u32,
@@ -2034,6 +2061,7 @@ impl StreamingProcessor {
         model: &str,
         history_tool_calls_count: usize,
         use_json_parser: bool,
+        first_tool_call_only: bool,
     ) -> Vec<ChatStreamChoice> {
         let mut chunks = Vec::new();
 
@@ -2054,7 +2082,13 @@ impl StreamingProcessor {
 
         if let Some(parser) = tool_parsers.get_mut(&index) {
             match parser.parse_incremental(delta, tools).await {
-                Ok(StreamingParseResult { normal_text, calls }) => {
+                Ok(StreamingParseResult {
+                    normal_text,
+                    mut calls,
+                }) => {
+                    if first_tool_call_only {
+                        utils::keep_first_tool_call_items(&mut calls);
+                    }
                     // Emit normal text if present
                     if !normal_text.is_empty() {
                         chunks.push(assistant_choice(index, Some(normal_text), None, None));
@@ -2230,6 +2264,45 @@ impl StreamingProcessor {
         Ok(())
     }
 
+    /// Ends Symphony's reading of the message: `flushed`, the text the decoder released last,
+    /// then the engine's `finish`; the events go through the machine ([`Self::send_symphony_blocks`])
+    /// and the reasoning tokens they cost are added to `thinking_tokens`.
+    async fn end_symphony_message(
+        tx: &SseSender,
+        buffer: &mut Vec<u8>,
+        (reader, machine): (&mut Reader, &mut adapt::messages::Stream),
+        flushed: Option<&str>,
+        finish: EngineFinish,
+        thinking_tokens: &mut u32,
+    ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
+        let mut events = match flushed {
+            Some(text) => reader.tail(text)?,
+            None => Vec::new(),
+        };
+        events.extend(reader.end(finish)?);
+        *thinking_tokens += reasoning_text_tokens(&events);
+        Self::send_symphony_blocks(tx, buffer, machine, &events).await
+    }
+
+    /// Feeds Symphony's `events` to the content-block `machine` and sends the stream events it
+    /// gives, in order; the stop reason when a `Finish` was among the events.
+    async fn send_symphony_blocks(
+        tx: &SseSender,
+        buffer: &mut Vec<u8>,
+        machine: &mut adapt::messages::Stream,
+        events: &[Event],
+    ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
+        let mut stop = None;
+        let mut blocks = Vec::new();
+        for event in events {
+            stop = machine.feed(event, &mut blocks).or(stop);
+        }
+        for block in &blocks {
+            Self::send_messages_event(tx, buffer, block).await?;
+        }
+        Ok(stop)
+    }
+
     /// Send a `MessageStreamEvent` through the SSE channel using a reusable buffer.
     async fn send_messages_event(
         tx: &SseSender,
@@ -2350,7 +2423,7 @@ impl StreamingProcessor {
     pub async fn process_messages_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
-        messages_request: MessagesResponseSpec,
+        mut messages_request: MessagesResponseSpec,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
@@ -2358,11 +2431,10 @@ impl StreamingProcessor {
         source: utils::StreamSource,
     ) -> Response {
         let source = source.with_backend(self.backend_type);
+        // The stream's decoder takes the spec's stop sequences; nothing reads
+        // them from the spec after this.
         let stop_params = (
-            messages_request
-                .stop_sequences
-                .clone()
-                .map(StringOrArray::Array),
+            messages_request.stop_sequences.take(),
             None::<Vec<u32>>, // No stop_token_ids in Messages API
             skip_special_tokens,
             false, // no_stop_trim
@@ -2549,14 +2621,8 @@ impl StreamingProcessor {
             reasoning_parser_name.as_deref(),
             model,
         );
-        let separate_reasoning = reasoning_requires_special_tokens
-            || matches!(
-                &original_request.thinking,
-                Some(
-                    messages::ThinkingConfig::Enabled { .. }
-                        | messages::ThinkingConfig::Adaptive { .. }
-                )
-            );
+        let separate_reasoning =
+            reasoning_requires_special_tokens || original_request.thinking_requested;
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
@@ -2564,7 +2630,7 @@ impl StreamingProcessor {
                 model,
             );
 
-        let thinking_override = original_request.reasoning_starts_in_prefill(tokenizer.as_ref());
+        let thinking_override = original_request.reasoning_in_prefill;
         let think_in_prefill = tokenizer.think_in_prefill();
 
         let tool_choice_enabled = !matches!(
@@ -2604,17 +2670,34 @@ impl StreamingProcessor {
         let chat_tools: &[Tool] = &original_request.chat_tools;
 
         // Create fresh streaming tool parser (not pooled — streaming parsers maintain state)
-        let mut streaming_tool_parser: Option<Box<dyn ToolParser>> =
-            if has_tools && tool_choice_enabled && (tool_parser_available || used_json_schema) {
-                let parser_name = if used_json_schema {
-                    Some("json")
-                } else {
-                    tool_parser_name.as_deref()
-                };
-                utils::create_tool_parser(&self.tool_parser_factory, parser_name, model)
+        let mut streaming_tool_parser: Option<Box<dyn ToolParser>> = if has_tools
+            && tool_choice_enabled
+            && original_request.symphony.is_none()
+            && (tool_parser_available || used_json_schema)
+        {
+            let parser_name = if used_json_schema {
+                Some("json")
             } else {
-                None
+                tool_parser_name.as_deref()
             };
+            utils::create_tool_parser(&self.tool_parser_factory, parser_name, model)
+        } else {
+            None
+        };
+        // Symphony's reader and the content-block machine, when a table reads the message
+        // (see `regular::symphony`): the engine's tokens go through the reader, its events
+        // through the machine, and the parsers above are not run. The `Finish` event gives the
+        // stop reason.
+        let mut symphony = original_request
+            .symphony
+            .as_ref()
+            .map(|assignment| {
+                Reader::new(assignment, chat_tools)
+                    .map(|reader| reader.first_call_only(original_request.first_tool_call_only))
+            })
+            .transpose()?
+            .map(|reader| (reader, adapt::messages::Stream::new()));
+        let mut symphony_stop: Option<messages::StopReason> = None;
 
         // Phase 1: Emit message_start with skeleton Message
         let start_message = Message {
@@ -2631,13 +2714,7 @@ impl StreamingProcessor {
         };
         // Thinking tokens of the turn: the engine's count when it keeps one,
         // else the tokens the parser routed to thinking, chunk by chunk.
-        let thinking_requested = matches!(
-            &original_request.thinking,
-            Some(
-                messages::ThinkingConfig::Enabled { .. }
-                    | messages::ThinkingConfig::Adaptive { .. }
-            )
-        );
+        let thinking_requested = original_request.thinking_requested;
         let mut parsed_thinking_tokens: u32 = 0;
         let mut engine_thinking_tokens: u32 = 0;
         let mut was_in_reasoning = false;
@@ -2683,6 +2760,24 @@ impl StreamingProcessor {
 
                     completion_tokens.record_chunk(&chunk);
                     chunk_tokens = chunk.token_ids().len() as u32;
+
+                    if let Some((reader, machine)) = symphony.as_mut() {
+                        let (events, should_stop) =
+                            reader.read(&mut stop_decoder, chunk.token_ids())?;
+                        if should_stop {
+                            stopped = true;
+                            finish_reason_str = "stop".to_string();
+                            matched_stop = stop_decoder
+                                .matched_stop()
+                                .map(|s| Value::String(s.to_string()));
+                        }
+                        parsed_thinking_tokens += reasoning_text_tokens(&events);
+                        symphony_stop =
+                            Self::send_symphony_blocks(tx, &mut sse_buffer, machine, &events)
+                                .await?
+                                .or(symphony_stop);
+                        continue;
+                    }
 
                     let (chunk_text, should_stop) =
                         Self::process_chunk_tokens(&mut stop_decoder, chunk.token_ids())?;
@@ -2740,6 +2835,19 @@ impl StreamingProcessor {
                     if flushed.is_some() {
                         chunk_tokens = std::mem::take(&mut held_tokens);
                     }
+                    if let Some((reader, machine)) = symphony.as_mut() {
+                        symphony_stop = Self::end_symphony_message(
+                            tx,
+                            &mut sse_buffer,
+                            (reader, machine),
+                            flushed.as_deref(),
+                            engine_finish(&finish_reason_str),
+                            &mut parsed_thinking_tokens,
+                        )
+                        .await?
+                        .or(symphony_stop);
+                        continue;
+                    }
                     flushed
                 }
                 Some(ProtoResponseVariant::None) => continue,
@@ -2756,7 +2864,7 @@ impl StreamingProcessor {
                             .matched_stop()
                             .map(|s| Value::String(s.to_string()));
                     }
-                    match tail {
+                    let flushed = match tail {
                         SequenceDecoderOutput::Text(text)
                         | SequenceDecoderOutput::StoppedWithText(text)
                             if !text.is_empty() =>
@@ -2764,7 +2872,34 @@ impl StreamingProcessor {
                             chunk_tokens = std::mem::take(&mut held_tokens);
                             Some(text)
                         }
-                        _ => continue,
+                        _ => None,
+                    };
+                    if let Some((reader, machine)) = symphony.as_mut() {
+                        // A stream that ends without Complete is cut: the reader ends on an
+                        // abort, which leaves an open call cut, as the message says.
+                        if reader.ended() {
+                            continue;
+                        }
+                        let finish = if finish_reason_str.is_empty() {
+                            EngineFinish::Abort
+                        } else {
+                            engine_finish(&finish_reason_str)
+                        };
+                        symphony_stop = Self::end_symphony_message(
+                            tx,
+                            &mut sse_buffer,
+                            (reader, machine),
+                            flushed.as_deref(),
+                            finish,
+                            &mut parsed_thinking_tokens,
+                        )
+                        .await?
+                        .or(symphony_stop);
+                        continue;
+                    }
+                    match flushed {
+                        Some(text) => Some(text),
+                        None => continue,
                     }
                 }
                 None if reasoning_parser.is_some() => Some(String::new()),
@@ -2925,6 +3060,9 @@ impl StreamingProcessor {
                             normal_text: text,
                             mut calls,
                         }) => {
+                            if original_request.first_tool_call_only {
+                                utils::keep_first_tool_call_items(&mut calls);
+                            }
                             // Arguments that finish the open call come before
                             // the text after it in the same chunk.
                             let finishing = if tool_block_open {
@@ -3135,7 +3273,10 @@ impl StreamingProcessor {
         }
 
         if let Some(ref parser) = streaming_tool_parser {
-            if let Some(unstreamed_items) = parser.get_unstreamed_tool_args() {
+            if let Some(mut unstreamed_items) = parser.get_unstreamed_tool_args() {
+                if original_request.first_tool_call_only {
+                    utils::keep_first_tool_call_items(&mut unstreamed_items);
+                }
                 for tool_call_item in unstreamed_items {
                     has_tool_calls = true;
 
@@ -3238,6 +3379,17 @@ impl StreamingProcessor {
             Some(messages::StopReason::StopSequence)
         } else {
             Some(messages::StopReason::EndTurn)
+        };
+        // Symphony's stop reason is the `Finish` event's; a stop sequence the decoder or the
+        // engine matched is reported as such, as the message says.
+        let stop_reason = match symphony_stop {
+            Some(messages::StopReason::EndTurn)
+                if matched_stop.as_ref().is_some_and(Value::is_string) =>
+            {
+                Some(messages::StopReason::StopSequence)
+            }
+            Some(stop) => Some(stop),
+            None => stop_reason,
         };
 
         let stop_sequence = if matches!(stop_reason, Some(messages::StopReason::StopSequence)) {
@@ -4241,12 +4393,10 @@ fn opening_choice(index: u32, opens_tool_call: bool) -> OpeningChoice {
 /// call), so the stream's first delta is a tool call's, not text's.
 fn forces_tool_call(spec: &ChatResponseSpec) -> bool {
     spec.tools.as_ref().is_some_and(|tools| !tools.is_empty())
-        && match &spec.tool_choice {
-            Some(ToolChoice::Function { .. }) => true,
-            Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-            Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-            _ => false,
-        }
+        && spec
+            .tool_choice
+            .as_ref()
+            .is_some_and(ToolChoice::forces_call)
 }
 
 /// A streamed choice carrying whichever of `content`, `reasoning_content` and
@@ -4280,6 +4430,8 @@ mod failure_tests;
 mod pd_usage_tests;
 #[cfg(test)]
 mod symphony_tests;
+#[cfg(test)]
+mod usage_chunk_tests;
 
 #[cfg(test)]
 mod delta_slicing_tests;

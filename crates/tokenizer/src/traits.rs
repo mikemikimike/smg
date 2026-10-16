@@ -46,9 +46,10 @@ impl std::fmt::Debug for EncodeJob {
 pub struct RendererCapabilities {
     /// The renderer reads `enable_thinking` as an alias of its thinking key.
     pub enable_thinking_alias: bool,
-    /// With `add_generation_prompt` false the renderer continues a trailing
-    /// assistant message itself (no EOS, no generation header); the gateway
-    /// must keep the message instead of popping it into a text prefix.
+    /// With `add_generation_prompt` false and `continue_final_message` set
+    /// the renderer continues a trailing assistant message itself (no EOS, no
+    /// generation header); the gateway must keep the message instead of
+    /// popping it into a text prefix.
     pub native_assistant_continuation: bool,
     /// The renderer parses tool-call `arguments` strings itself with the
     /// reference's tolerance (non-object and double-encoded values); the
@@ -79,6 +80,12 @@ pub struct ChatTemplateOutput {
     pub encoding: PromptEncoding,
     /// Prompt tokens the provider does not bill (K3's response-channel stub); 0 for flat renderers.
     pub unbilled_prompt_tokens: u32,
+    /// The prompt ends inside the final message, kept and left open as
+    /// `continue_final_message` asks. False when that was not asked for, and
+    /// when a template could not continue the message and its text follows
+    /// the generation prompt instead: the completion then starts wherever
+    /// that prompt leaves it, inside a reasoning block it opens for one.
+    pub continued_final_message: bool,
 }
 
 /// Core encoding trait - separate from decoding for modularity
@@ -251,6 +258,14 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Enable downcasting to concrete types
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// The `response_template` object of `tokenizer_config.json`, if any.
+    ///
+    /// The value is kept verbatim. Parser selection decides whether it
+    /// describes a supported output format.
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        None
+    }
+
     /// Apply chat template to messages. Default returns an error for tokenizers without template support.
     fn apply_chat_template(
         &self,
@@ -266,13 +281,16 @@ pub trait Tokenizer: Encoder + Decoder {
     /// `continue_final_message` prefill applied. The default appends the
     /// prefill to the flat rendering and reports [`PromptEncoding::FromText`];
     /// renderers whose ids are not a function of the text override it and
-    /// hand back a deferred encode instead.
+    /// hand back a deferred encode instead. The default reports a requested
+    /// `continue_final_message` as honored; renderers that can fall back
+    /// from it override this to report what they did.
     fn apply_chat_template_with_encoding(
         &self,
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
+        let continued_final_message = params.continue_final_message;
         let mut text = self.apply_chat_template(messages, params)?;
         if let Some(prefix) = assistant_prefix {
             text.push_str(prefix);
@@ -281,6 +299,7 @@ pub trait Tokenizer: Encoder + Decoder {
             text,
             encoding: PromptEncoding::FromText,
             unbilled_prompt_tokens: 0,
+            continued_final_message,
         })
     }
 

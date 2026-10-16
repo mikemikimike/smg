@@ -5,7 +5,7 @@
 //! instead of `ChatCompletionRequest` / `ChatMessage`.
 #![allow(dead_code)] // wired in follow-up PR (pipeline factory)
 
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, fmt::Display, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
@@ -14,10 +14,10 @@ use llm_tokenizer::{
     traits::{PromptEncoding, RendererCapabilities, Tokenizer},
 };
 use openai_protocol::{
-    common::{self, StringOrArray, Tool as ChatTool, ToolChoice as ChatToolChoice},
+    common::{Tool as ChatTool, ToolChoice as ChatToolChoice},
     messages::{
         self, CountMessageTokensRequest, CreateMessageRequest, InputContent, InputContentBlock,
-        InputMessage, SystemContent, ThinkingConfig, ToolResultContent,
+        InputMessage, SystemContent, ToolResultContent,
     },
 };
 use serde_json::{json, Value};
@@ -44,8 +44,11 @@ use crate::routers::{
 pub(crate) struct MessagesPrompt<'a> {
     pub messages: &'a [InputMessage],
     pub system: Option<&'a SystemContent>,
-    pub thinking: Option<&'a ThinkingConfig>,
-    pub stop_sequences: Option<&'a [String]>,
+    /// The thinking preference the prompt is rendered with
+    /// (`CreateMessageRequest::template_thinking`).
+    pub thinking: Option<bool>,
+    /// `output_config.effort`, rendered as the `reasoning_effort` kwarg.
+    pub reasoning_effort: Option<&'a str>,
     /// The request's tool choice, told to the template as the chat path
     /// tells it; a renderer that declares the tools under `none` writes its
     /// instruction not to call them from it.
@@ -57,8 +60,8 @@ impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
         Self {
             messages: &request.messages,
             system: request.system.as_ref(),
-            thinking: request.thinking.as_ref(),
-            stop_sequences: request.stop_sequences.as_deref(),
+            thinking: request.template_thinking(),
+            reasoning_effort: request.reasoning_effort(),
             tool_choice: request.tool_choice.as_ref(),
         }
     }
@@ -69,8 +72,8 @@ impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
         Self {
             messages: &request.messages,
             system: request.system.as_ref(),
-            thinking: request.thinking.as_ref(),
-            stop_sequences: None,
+            thinking: request.template_thinking(),
+            reasoning_effort: request.reasoning_effort(),
             tool_choice: request.tool_choice.as_ref(),
         }
     }
@@ -80,8 +83,9 @@ impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
 ///
 /// Parallel to `process_chat_messages()` in chat_utils, but works with
 /// Anthropic Messages API types. Converts InputMessages to JSON values
-/// that the chat template expects, then applies the template. The second
-/// element says how the tokenize step must encode the prompt.
+/// that the chat template expects, then applies the template, with
+/// `reasoning_effort` as the template kwarg of that name when set. The
+/// second element says how the tokenize step must encode the prompt.
 pub fn process_messages(
     request: &CreateMessageRequest,
     tokenizer: &dyn Tokenizer,
@@ -166,30 +170,53 @@ pub(crate) fn process_messages_prompt(
         .transpose()
         .map_err(|e| format!("Failed to serialize tools: {e}"))?;
 
-    // Step 5: Project the Anthropic ThinkingConfig onto a thinking on/off
-    // preference. Adaptive is treated as "thinking on"; the model decides
-    // whether to actually emit it. The tokenizer applies this under the model's
-    // own toggle key (`enable_thinking`/`thinking`) in `apply`.
-    let thinking = match request.thinking {
-        Some(ThinkingConfig::Enabled { .. } | ThinkingConfig::Adaptive { .. }) => Some(true),
-        Some(ThinkingConfig::Disabled) => Some(false),
-        None => None, // Let template use its default behavior
-    };
+    // Step 5: the thinking preference the request states, or its provider
+    // profile reads from the effort, as for Chat.
+    let thinking = request.thinking;
 
     // Step 6: Apply chat template. The template learns the tool choice the
     // way the chat path tells it (the chat value under the same kwarg): a
     // renderer that declares the tools under `none` writes its instruction
-    // not to call them from this key.
-    let template_kwargs = request.tool_choice.map(|tool_choice| {
-        let mut kwargs = HashMap::with_capacity(1);
-        chat_utils::insert_tool_choice_kwarg(
-            &mut kwargs,
-            &convert_message_tool_choice(tool_choice),
+    // not to call them from this key. The effort rides under the chat
+    // path's `reasoning_effort` kwarg as well.
+    let mut kwargs = HashMap::with_capacity(2);
+    if let Some(tool_choice) = request.tool_choice {
+        chat_utils::insert_tool_choice_kwarg(&mut kwargs, &ChatToolChoice::from(tool_choice));
+    }
+    if let Some(effort) = request.reasoning_effort {
+        kwargs.insert(
+            chat_utils::REASONING_EFFORT_KEY.to_string(),
+            Value::String(effort.to_string()),
         );
-        kwargs
-    });
+    }
+    let template_kwargs = (!kwargs.is_empty()).then_some(kwargs);
+    // A trailing assistant message with text is a prefill the response
+    // continues. As for chat `continue_final_message`, a renderer that
+    // continues it natively keeps it; any other gets it popped and its text
+    // appended after the generation prompt. Only the text survives that, so
+    // a message that also has thinking stays a closed turn there.
+    let continues_final_assistant = messages::continues_final_assistant(request.messages);
+    let native_continuation = continues_final_assistant
+        && tokenizer
+            .renderer_capabilities()
+            .native_assistant_continuation;
+    let text_only = transformed_messages
+        .last()
+        .and_then(Value::as_object)
+        .is_some_and(|message| message.keys().all(|key| key == "role" || key == "content"));
+    let assistant_prefix = if continues_final_assistant && !native_continuation && text_only {
+        transformed_messages.pop().and_then(|mut message| {
+            match message.get_mut("content").map(Value::take) {
+                Some(Value::String(text)) => Some(text),
+                _ => None,
+            }
+        })
+    } else {
+        None
+    };
     let params = ChatTemplateParams {
-        add_generation_prompt: true,
+        add_generation_prompt: !native_continuation,
+        continue_final_message: native_continuation,
         tools: tools_json.as_deref(),
         template_kwargs: template_kwargs.as_ref(),
         thinking,
@@ -197,50 +224,48 @@ pub(crate) fn process_messages_prompt(
     };
 
     let rendered = tokenizer
-        .apply_chat_template_with_encoding(&transformed_messages, params, None)
+        .apply_chat_template_with_encoding(
+            &transformed_messages,
+            params,
+            assistant_prefix.as_deref(),
+        )
         .map_err(|e| format!("Failed to apply chat template: {e}"))?;
 
     // Step 7: Build ProcessedMessages
-    let stop_sequences = request
-        .stop_sequences
-        .map(|seqs| StringOrArray::Array(seqs.to_vec()));
-
     let text = anchor_rendered_markers(placeholder_tokens, &rendered.encoding, rendered.text);
     Ok((
         ProcessedMessages {
             text,
-            stop_sequences,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
+            continued_final_message: rendered.continued_final_message,
         },
         rendered.encoding,
     ))
 }
 
-/// The tools the template renders for a request: the custom tools as chat
-/// tools, narrowed by `tool_choice` the way the chat path narrows them (a
-/// forced tool renders alone, and `none` renders none unless the renderer
-/// declares the tools under `none` itself, see
-/// [`RendererCapabilities::declares_tools_under_tool_choice_none`]). Shared
-/// by the preparation stage and count_tokens so both render the same prompt.
-pub fn template_tools(
-    tools: Option<&[messages::Tool]>,
+/// The tools the template renders for a request: `chat_tools` (the custom
+/// tools as chat tools) narrowed by `tool_choice` the way the chat path
+/// narrows them (a forced tool renders alone, and `none` renders none unless
+/// the renderer declares the tools under `none` itself, see
+/// [`RendererCapabilities::declares_tools_under_tool_choice_none`]); borrowed
+/// when the choice does not narrow. Shared by the preparation stage and
+/// count_tokens so both render the same prompt.
+pub fn template_tools<'a>(
+    chat_tools: &'a [ChatTool],
     tool_choice: Option<&messages::ToolChoice>,
     capabilities: RendererCapabilities,
-) -> Vec<ChatTool> {
-    let Some(tools) = tools else {
-        return Vec::new();
-    };
+) -> Cow<'a, [ChatTool]> {
     if matches!(tool_choice, Some(messages::ToolChoice::None))
         && !capabilities.declares_tools_under_tool_choice_none
     {
-        return Vec::new();
+        return Cow::Borrowed(&[]);
     }
-    let chat_tools = extract_chat_tools(tools);
-    match tool_choice.map(convert_message_tool_choice) {
-        Some(tc) => {
-            chat_utils::filter_tools_by_tool_choice(&chat_tools, Some(&tc)).unwrap_or(chat_tools)
-        }
-        None => chat_tools,
+    match tool_choice
+        .map(ChatToolChoice::from)
+        .and_then(|choice| choice.narrow_tools(chat_tools))
+    {
+        Some(narrowed) => Cow::Owned(narrowed),
+        None => Cow::Borrowed(chat_tools),
     }
 }
 
@@ -389,9 +414,9 @@ pub(crate) enum CountError {
 
 /// The prompt tokens `/v1/messages` would send for `prompt` (a message
 /// request's or a count_tokens request's): the same tool set, media
-/// placeholders, template rendering and encoding as the preparation stage,
-/// without media processing (an image counts as the placeholder the template
-/// writes for it; the image itself is not fetched). A text or content-source
+/// placeholders, reasoning effort, template rendering and encoding as the
+/// preparation stage, without media processing (an image counts as the
+/// placeholder the template writes for it; the image itself is not fetched). A text or content-source
 /// document counts as its rendered text; a source with no text is refused,
 /// as `/v1/messages` refuses it.
 pub(crate) async fn count_input_tokens(
@@ -762,111 +787,6 @@ fn order_media_parts(parts: Vec<Value>, media_order: MediaPartOrder) -> Vec<Valu
 // Type adapters: Messages API → Chat API types
 // ============================================================================
 
-/// Convert a Messages API CustomTool to a Chat API Tool.
-///
-/// Maps `CustomTool { name, description, input_schema }` to
-/// `ChatTool { type: "function", function: Function { name, description, parameters } }`
-pub(crate) fn custom_tool_to_chat_tool(tool: &messages::CustomTool) -> ChatTool {
-    // Convert InputSchema to a JSON Value for Function.parameters
-    let parameters = input_schema_to_value(&tool.input_schema);
-
-    ChatTool {
-        tool_type: "function".to_string(),
-        function: common::Function {
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            parameters,
-            strict: None,
-            extra: Default::default(),
-        },
-    }
-}
-
-/// Convert InputSchema struct to a serde_json::Value.
-fn input_schema_to_value(schema: &messages::InputSchema) -> Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String(schema.schema_type.clone()),
-    );
-
-    if let Some(properties) = &schema.properties {
-        let props: serde_json::Map<String, Value> = properties
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        obj.insert("properties".to_string(), Value::Object(props));
-    }
-
-    if let Some(required) = &schema.required {
-        obj.insert(
-            "required".to_string(),
-            Value::Array(required.iter().map(|s| Value::String(s.clone())).collect()),
-        );
-    }
-
-    // Include any additional schema fields
-    for (key, value) in &schema.additional {
-        obj.insert(key.clone(), value.clone());
-    }
-
-    Value::Object(obj)
-}
-
-/// Convert a Messages API ToolChoice to a Chat API ToolChoice.
-///
-/// Mapping:
-/// - `Auto { .. }`    → `Value(Auto)`
-/// - `Any { .. }`     → `Value(Required)`
-/// - `Tool { name }`  → `Function { name }`
-/// - `None`           → `Value(None)`
-pub(crate) fn convert_message_tool_choice(tc: &messages::ToolChoice) -> ChatToolChoice {
-    match tc {
-        messages::ToolChoice::Auto { .. } => ChatToolChoice::Value(common::ToolChoiceValue::Auto),
-        messages::ToolChoice::Any { .. } => {
-            ChatToolChoice::Value(common::ToolChoiceValue::Required)
-        }
-        messages::ToolChoice::Tool { name, .. } => ChatToolChoice::Function {
-            tool_type: "function".to_string(),
-            function: common::FunctionChoice { name: name.clone() },
-        },
-        messages::ToolChoice::None => ChatToolChoice::Value(common::ToolChoiceValue::None),
-    }
-}
-
-/// Extract Custom tools from Messages API tool list and convert to ChatTool.
-///
-/// Only `Tool::Custom` is supported in gRPC mode. Other tool types
-/// (McpToolset, Bash, TextEditor, WebSearch, ToolSearch) are ignored
-/// since they require runtime capabilities not available in the gRPC pipeline.
-pub(crate) fn extract_chat_tools(tools: &[messages::Tool]) -> Vec<ChatTool> {
-    tools
-        .iter()
-        .filter_map(|t| match t {
-            messages::Tool::Custom(custom) => Some(custom_tool_to_chat_tool(custom)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Count the number of tool use blocks in assistant messages of the request history.
-///
-/// Parallel to `get_history_tool_calls_count` in chat_utils, but works with
-/// Messages API `InputMessage` types. Used for generating globally unique
-/// tool call IDs (e.g. KimiK2 format).
-pub(crate) fn get_history_tool_calls_count_messages(request: &CreateMessageRequest) -> usize {
-    request
-        .messages
-        .iter()
-        .filter(|msg| msg.role == messages::Role::Assistant)
-        .flat_map(|msg| match &msg.content {
-            InputContent::Blocks(blocks) => blocks.as_slice(),
-            InputContent::String(_) => &[],
-        })
-        .filter(|b| matches!(b, InputContentBlock::ToolUse(_)))
-        .count()
-}
-
 /// Anthropic-native id for a `tool_use` content block.
 ///
 /// The Messages surface should expose `toolu_`-prefixed ids — strict Anthropic
@@ -1155,63 +1075,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_choice_conversion() {
-        assert!(matches!(
-            convert_message_tool_choice(&messages::ToolChoice::Auto {
-                disable_parallel_tool_use: None
-            }),
-            ChatToolChoice::Value(common::ToolChoiceValue::Auto)
-        ));
-        assert!(matches!(
-            convert_message_tool_choice(&messages::ToolChoice::Any {
-                disable_parallel_tool_use: None
-            }),
-            ChatToolChoice::Value(common::ToolChoiceValue::Required)
-        ));
-        assert!(matches!(
-            convert_message_tool_choice(&messages::ToolChoice::None),
-            ChatToolChoice::Value(common::ToolChoiceValue::None)
-        ));
-
-        let tc = convert_message_tool_choice(&messages::ToolChoice::Tool {
-            name: "calc".to_string(),
-            disable_parallel_tool_use: None,
-        });
-        assert!(matches!(tc, ChatToolChoice::Function { .. }));
-    }
-
-    #[test]
-    fn test_custom_tool_conversion() {
-        let custom = messages::CustomTool {
-            name: "weather".to_string(),
-            tool_type: None,
-            description: Some("Get weather".to_string()),
-            input_schema: messages::InputSchema {
-                schema_type: "object".to_string(),
-                properties: Some(
-                    [("city".to_string(), json!({"type": "string"}))]
-                        .into_iter()
-                        .collect(),
-                ),
-                required: Some(vec!["city".to_string()]),
-                additional: Default::default(),
-            },
-            defer_loading: None,
-            cache_control: None,
-            extra: Default::default(),
-        };
-
-        let chat_tool = custom_tool_to_chat_tool(&custom);
-        assert_eq!(chat_tool.function.name, "weather");
-        assert_eq!(
-            chat_tool.function.description,
-            Some("Get weather".to_string())
-        );
-        assert_eq!(chat_tool.function.parameters["type"], "object");
-        assert!(chat_tool.function.parameters["properties"]["city"].is_object());
-    }
-
-    #[test]
     fn tool_schemas_render_in_the_clients_order() {
         use llm_tokenizer::chat_template::ChatTemplateProcessor;
 
@@ -1239,7 +1102,8 @@ mod tests {
         // The tools of a fresh request, rendered as `process_messages` does.
         let render = || {
             let request: CreateMessageRequest = serde_json::from_value(body.clone()).unwrap();
-            let tools: Vec<Value> = extract_chat_tools(request.tools.as_deref().unwrap())
+            let tools: Vec<Value> = request
+                .chat_tools()
                 .iter()
                 .map(|tool| serde_json::to_value(tool).unwrap())
                 .collect();
@@ -1267,85 +1131,6 @@ mod tests {
             keys,
             ["type", "properties", "required", "additionalProperties"]
         );
-    }
-
-    #[test]
-    fn test_get_history_tool_calls_count_messages() {
-        // No tool calls
-        let request = CreateMessageRequest {
-            model: "test".to_string(),
-            messages: vec![InputMessage {
-                role: Role::User,
-                content: InputContent::String("Hello".to_string()),
-            }],
-            max_tokens: 100,
-            metadata: None,
-            service_tier: None,
-            stop_sequences: None,
-            stream: None,
-            system: None,
-            temperature: None,
-            thinking: None,
-            tool_choice: None,
-            tools: None,
-            top_k: None,
-            top_p: None,
-            container: None,
-            mcp_servers: None,
-            rid: None,
-            other: serde_json::Map::new(),
-        };
-        assert_eq!(get_history_tool_calls_count_messages(&request), 0);
-
-        // With tool calls in assistant message
-        let request = CreateMessageRequest {
-            model: "test".to_string(),
-            messages: vec![
-                InputMessage {
-                    role: Role::User,
-                    content: InputContent::String("Hello".to_string()),
-                },
-                InputMessage {
-                    role: Role::Assistant,
-                    content: InputContent::Blocks(vec![
-                        InputContentBlock::Text(TextBlock {
-                            text: "Let me check.".to_string(),
-                            cache_control: None,
-                            citations: None,
-                        }),
-                        InputContentBlock::ToolUse(messages::ToolUseBlock {
-                            id: "tu_1".to_string(),
-                            name: "calc".to_string(),
-                            input: json!({"x": 1}),
-                            cache_control: None,
-                        }),
-                        InputContentBlock::ToolUse(messages::ToolUseBlock {
-                            id: "tu_2".to_string(),
-                            name: "search".to_string(),
-                            input: json!({"q": "test"}),
-                            cache_control: None,
-                        }),
-                    ]),
-                },
-            ],
-            max_tokens: 100,
-            metadata: None,
-            service_tier: None,
-            stop_sequences: None,
-            stream: None,
-            system: None,
-            temperature: None,
-            thinking: None,
-            tool_choice: None,
-            tools: None,
-            top_k: None,
-            top_p: None,
-            container: None,
-            mcp_servers: None,
-            rid: None,
-            other: serde_json::Map::new(),
-        };
-        assert_eq!(get_history_tool_calls_count_messages(&request), 2);
     }
 
     #[test]
@@ -1592,8 +1377,9 @@ mod tests {
             "messages": [{"role": "user", "content": "Weather in Paris?"}]
         }))
         .unwrap();
+        let chat_tools = request.chat_tools();
         let tools = template_tools(
-            request.tools.as_deref(),
+            &chat_tools,
             request.tool_choice.as_ref(),
             RendererCapabilities::default(),
         );
@@ -1634,15 +1420,15 @@ mod tests {
             ..RendererCapabilities::default()
         };
         let none = request(json!({"type": "none"}));
-        assert!(template_tools(none.tools.as_deref(), none.tool_choice.as_ref(), plain).is_empty());
+        assert!(template_tools(&none.chat_tools(), none.tool_choice.as_ref(), plain).is_empty());
         assert_eq!(
-            template_tools(none.tools.as_deref(), none.tool_choice.as_ref(), declaring).len(),
+            template_tools(&none.chat_tools(), none.tool_choice.as_ref(), declaring).len(),
             1,
             "the renderer that declares the tools under none gets them"
         );
         let auto = request(json!({"type": "auto"}));
         assert_eq!(
-            template_tools(auto.tools.as_deref(), auto.tool_choice.as_ref(), plain).len(),
+            template_tools(&auto.chat_tools(), auto.tool_choice.as_ref(), plain).len(),
             1
         );
     }
@@ -1669,15 +1455,16 @@ mod tests {
                 body["tool_choice"] = tool_choice;
             }
             let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
+            let chat_tools = request.chat_tools();
             let tools = template_tools(
-                request.tools.as_deref(),
+                &chat_tools,
                 request.tool_choice.as_ref(),
                 tok.renderer_capabilities(),
             );
             let tools_for_template = if tools.is_empty() {
                 None
             } else {
-                Some(tools.as_slice())
+                Some(&*tools)
             };
             let (processed, _) =
                 process_messages_with_encoding(&request, &tok, tools_for_template).unwrap();
@@ -1752,15 +1539,16 @@ mod tests {
             "messages": [{"role": "user", "content": "What is the weather in Paris?"}]
         }))
         .expect("the request");
+        let chat_tools = request.chat_tools();
         let tools = template_tools(
-            request.tools.as_deref(),
+            &chat_tools,
             request.tool_choice.as_ref(),
             tok.renderer_capabilities(),
         );
         let (processed, _) = process_messages(
             &request,
             tok.as_ref(),
-            Some(tools.as_slice()),
+            Some(&*tools),
             None,
             MediaPartOrder::MediaFirst,
         )
@@ -1886,5 +1674,278 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(failure, CountError::Encode(_)), "{failure:?}");
+    }
+
+    /// A user turn, then `assistant` as the last message.
+    fn ending_with(assistant: Value) -> CreateMessageRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "Hello"}, assistant]
+        }))
+        .unwrap()
+    }
+
+    fn render(request: &CreateMessageRequest, tokenizer: &dyn Tokenizer) -> String {
+        process_messages(request, tokenizer, None, None, MediaPartOrder::MediaFirst)
+            .unwrap()
+            .0
+            .text
+    }
+
+    /// A trailing assistant message with text is a prefill: a Jinja template
+    /// continues it inside the turn it renders for it, header included,
+    /// instead of closing it and opening a new turn.
+    #[test]
+    fn trailing_assistant_text_is_continued_inside_its_turn() {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(
+                r"
+{%- for m in messages -%}
+{%- if m.role == 'assistant' -%}{{- '<|turn|>assistant<|to|>user<|body|>' + m.content + '<|end|>' -}}
+{%- else -%}{{- '<|turn|>' + m.role + '<|body|>' + m.content + '<|end|>' -}}{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|turn|>assistant' -}}{%- endif -%}"
+                    .to_string(),
+            )
+            .unwrap();
+        let request = ending_with(json!({"role": "assistant", "content": [
+            {"type": "text", "text": "Sure"}
+        ]}));
+        assert_eq!(
+            render(&request, &tokenizer),
+            "<|turn|>user<|body|>Hello<|end|><|turn|>assistant<|to|>user<|body|>Sure"
+        );
+    }
+
+    /// A renderer without native continuation gets the prefill appended
+    /// after the generation prompt, as chat `continue_final_message` does.
+    #[test]
+    fn trailing_assistant_text_follows_the_generation_prompt_elsewhere() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let request = ending_with(json!({"role": "assistant", "content": "Sure"}));
+        assert_eq!(render(&request, &tokenizer), "user: Hello\nassistant: Sure");
+    }
+
+    /// A trailing assistant message without text (tool calls only) is not a
+    /// prefill: it is rendered as a closed turn before a new one.
+    #[test]
+    fn trailing_tool_use_still_opens_a_new_turn() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let request = ending_with(json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+        ]}));
+        assert_eq!(
+            render(&request, &tokenizer),
+            "user: Hello\nassistant: \nassistant: "
+        );
+    }
+
+    /// An assistant turn as Qwen3 renders one: reasoning before the text,
+    /// tool calls after it.
+    const REASONING_TEXT_CALLS: &str = r"
+{%- for m in messages -%}
+{{- '<|im_start|>' + m.role + '\n' -}}
+{%- if m.role == 'assistant' -%}
+{%- if m.reasoning_content -%}{{- '<think>' + m.reasoning_content + '</think>' -}}{%- endif -%}
+{{- m.content or '' -}}
+{%- for tc in m.tool_calls or [] -%}{{- '<tool_call>' + tc.function.name + '</tool_call>' -}}{%- endfor -%}
+{%- else -%}{{- m.content -}}{%- endif -%}
+{{- '<|im_end|>\n' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\n' -}}{%- endif -%}";
+
+    fn jinja(template: &str) -> llm_tokenizer::TiktokenTokenizer {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer.set_chat_template(template.to_string()).unwrap();
+        tokenizer
+    }
+
+    /// Text followed by a tool call is a closed turn: continuing after the
+    /// text would drop the call, since transformers' `continue_final_message`
+    /// cuts the prompt there.
+    #[test]
+    fn trailing_text_with_tool_use_is_a_closed_turn() {
+        let request = ending_with(json!({"role": "assistant", "content": [
+            {"type": "text", "text": "Sure"},
+            {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}
+        ]}));
+        assert_eq!(
+            render(&request, &jinja(REASONING_TEXT_CALLS)),
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n\
+             Sure<tool_call>f</tool_call><|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
+
+    /// Thinking then text is continued after the text, its reasoning kept, as
+    /// transformers continues it.
+    #[test]
+    fn trailing_thinking_and_text_is_continued_with_its_reasoning() {
+        let request = ending_with(json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "plan", "signature": "s"},
+            {"type": "text", "text": "Sure"}
+        ]}));
+        assert_eq!(
+            render(&request, &jinja(REASONING_TEXT_CALLS)),
+            "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>plan</think>Sure"
+        );
+    }
+
+    /// Without native continuation only the text would follow the generation
+    /// prompt, so a message that also has thinking or a tool call is a
+    /// closed turn and keeps them.
+    #[test]
+    fn mixed_trailing_assistant_keeps_its_fields_elsewhere() {
+        let tokenizer = llm_tokenizer::MockTokenizer::new().with_json_chat_template();
+        let thinking = json!({"type": "thinking", "thinking": "plan", "signature": "s"});
+        let text = json!({"type": "text", "text": "Sure"});
+        let tool_use = json!({"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}});
+        let cases = [
+            (
+                json!([thinking, text]),
+                json!({"role": "assistant", "content": "Sure", "reasoning_content": "plan"}),
+            ),
+            (
+                json!([text, tool_use]),
+                json!({"role": "assistant", "content": "Sure", "tool_calls": [
+                    {"id": "toolu_1", "type": "function", "function": {"name": "f", "arguments": {}}}
+                ]}),
+            ),
+        ];
+        for (content, kept) in cases {
+            let request = ending_with(json!({"role": "assistant", "content": content}));
+            let rendered = render(&request, &tokenizer);
+            let rendered: Value = serde_json::from_str(&rendered)
+                .unwrap_or_else(|_| panic!("text appended after the prompt: {rendered}"));
+            assert_eq!(rendered["add_generation_prompt"], json!(true));
+            assert_eq!(rendered["messages"][1], kept);
+        }
+    }
+
+    /// `output_config.effort` reads as a Chat `reasoning_effort` does, and
+    /// reaches the chat template as the `reasoning_effort` kwarg.
+    #[test]
+    fn output_config_effort_is_rendered_as_the_reasoning_effort() {
+        let request = |output_config: Value| -> CreateMessageRequest {
+            serde_json::from_value(json!({
+                "model": "m", "max_tokens": 8, "output_config": output_config,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .unwrap()
+        };
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(
+                "{%- for m in messages -%}{{ m.role }}: {{ m.content }} {% endfor -%}\
+                 effort={{ reasoning_effort | default('unset') }}"
+                    .to_string(),
+            )
+            .unwrap();
+        let rendered = |output_config| {
+            process_messages(
+                &request(output_config),
+                &tokenizer,
+                None,
+                None,
+                MediaPartOrder::MediaFirst,
+            )
+            .unwrap()
+            .0
+            .text
+        };
+        assert_eq!(
+            rendered(json!({"effort": "high"})),
+            "user: Hello effort=high"
+        );
+        assert_eq!(rendered(json!({"effort": 64})), "user: Hello effort=64");
+        assert_eq!(
+            rendered(json!({"effort": null})),
+            "user: Hello effort=unset"
+        );
+        assert_eq!(rendered(json!({})), "user: Hello effort=unset");
+    }
+
+    /// The reasoning parser is armed from the effort the template renders: on
+    /// a template that switches thinking through `reasoning_effort`, an
+    /// `output_config.effort` that closes the think block leaves the parser
+    /// unarmed, as the same effort does for a Chat request. Without a thinking
+    /// block, "none" turns a toggle template's thinking off, as for Chat.
+    #[test]
+    fn output_config_effort_arms_the_reasoning_parser_as_rendered() {
+        use crate::routers::grpc::utils::{
+            chat_reasoning_starts_in_prefill, messages_reasoning_starts_in_prefill,
+        };
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(
+                "{# think_begin_token #}{%- for m in messages -%}{{ m.role }}: {{ m.content }}\n{% endfor -%}\
+                 {%- if reasoning_effort is defined and reasoning_effort == 'no_think' -%}assistant: <think></think>\
+                 {%- else -%}assistant: <think>{%- endif -%}"
+                    .to_string(),
+            )
+            .unwrap();
+        for (effort, prompt_end, armed) in [
+            (json!("no_think"), "<think></think>", false),
+            (json!("high"), "<think>", true),
+            (Value::Null, "<think>", true),
+        ] {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m", "max_tokens": 8, "output_config": {"effort": effort},
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .unwrap();
+            let rendered =
+                process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
+                    .unwrap()
+                    .0
+                    .text;
+            assert_eq!(rendered, format!("user: Hello\nassistant: {prompt_end}"));
+            assert_eq!(
+                messages_reasoning_starts_in_prefill(&request, false, &tokenizer),
+                armed,
+                "{effort}"
+            );
+            let chat: openai_protocol::chat::ChatCompletionRequest =
+                serde_json::from_value(json!({
+                    "model": "m", "reasoning_effort": effort,
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .unwrap();
+            assert_eq!(
+                chat_reasoning_starts_in_prefill(&chat, &tokenizer),
+                armed,
+                "chat {effort}"
+            );
+        }
+
+        tokenizer
+            .set_chat_template(
+                "{%- for m in messages -%}{{ m.role }}: {{ m.content }} {% endfor -%}\
+                 thinking={{ enable_thinking | default('unset') }}"
+                    .to_string(),
+            )
+            .unwrap();
+        let rendered = |effort: &str| {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m", "max_tokens": 8, "output_config": {"effort": effort},
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .unwrap();
+            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
+                .unwrap()
+                .0
+                .text
+        };
+        assert_eq!(rendered("none"), "user: Hello thinking=False");
+        assert_eq!(rendered("high"), "user: Hello thinking=unset");
     }
 }

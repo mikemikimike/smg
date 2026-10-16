@@ -48,6 +48,7 @@ use crate::{
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
         error::internal_error,
+        grpc::regular::symphony::template::Templates,
     },
     worker::{
         ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
@@ -135,13 +136,12 @@ impl RequestType {
     /// decode leg recomputes the prompt locally instead of pulling the
     /// prefill leg's KV.
     pub fn sampling_n(&self) -> u32 {
-        let n = match self {
-            Self::Chat(r) => r.n,
-            Self::Completion(r) => r.n,
-            Self::Generate(r) => r.sampling_params.as_ref().and_then(|p| p.n),
-            _ => None,
-        };
-        n.filter(|&n| n > 0).unwrap_or(1)
+        match self {
+            Self::Chat(r) => r.choices(),
+            Self::Completion(r) => r.choices(),
+            Self::Generate(r) => r.choices(),
+            _ => 1,
+        }
     }
 
     /// Client-supplied backend request id (`rid`), where the protocol carries
@@ -211,9 +211,12 @@ pub(crate) struct SharedComponents {
     /// is answered 503 `tokenizer_load_failed` without a retry hint, instead
     /// of the not-ready 503 of a load in flight.
     pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
-    /// Which parser reads a chat completion's output unless the request's `X-SMG-Parser`
-    /// header says otherwise (see `regular::symphony`).
+    /// Which parser reads a chat completion's or a message's output unless the request's
+    /// `X-SMG-Parser` header says otherwise (see `regular::symphony`).
     pub parser: ParserChoice,
+    /// The tables the registered tokenizers' response templates compile into, which the parser
+    /// name `hf` selects (see `regular::symphony::template`).
+    pub templates: Arc<Templates>,
     /// The token dump, when `--token-dump-dir` enables it.
     pub token_dump: Option<Arc<TokenDump>>,
 }
@@ -225,11 +228,11 @@ pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
 
-    /// The parser for this chat completion. Chat preparation sets the request's choice, from its
-    /// `X-SMG-Parser` header or the configured default; request building then sets the parser that
-    /// reads the response, Symphony when a table takes the request and legacy otherwise, which the
-    /// response reports as `x-smg-parser`. `None` on the other endpoints, which keep the legacy
-    /// parsers.
+    /// The parser for this chat completion or message. Preparation sets the request's choice,
+    /// from its `X-SMG-Parser` header or the configured default; request building then sets the
+    /// parser that reads the response, Symphony when a table takes the request and legacy
+    /// otherwise, which the response reports as `x-smg-parser`. `None` on the other endpoints,
+    /// which keep the legacy parsers.
     pub parser: Option<ParserChoice>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
@@ -574,6 +577,10 @@ pub(crate) enum PreparationOutput {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
         tool_constraints: Option<(String, String)>,
+        /// The response spec, built by preparation: the template rendered
+        /// the view of its chat tools that `tool_choice` leaves (see
+        /// `MessagesResponseSpec`).
+        spec: Box<super::spec::MessagesResponseSpec>,
     },
     /// Transcription reuses the chat backend request shape. The chat-shaped
     /// request is synthesized here (inside the pipeline) from the family's

@@ -10,8 +10,10 @@ use serde_json::{Map, Value};
 use validator::Validate;
 
 use crate::{
-    common::{CachePartition, GenerationRequest},
+    chat::deserialize_reasoning_effort,
+    common::{self, CachePartition, GenerationRequest},
     model_card::ModelCard,
+    profile::ProviderProfile,
     validated::Normalizable,
 };
 
@@ -82,14 +84,36 @@ pub struct CreateMessageRequest {
     /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
+    /// The effort the response renders with, and the config's other keys.
+    pub output_config: Option<OutputConfig>,
+
     /// Additional fields not explicitly defined above (e.g. beta features like
-    /// context_management, output_config). Captured and forwarded to backends.
+    /// context_management). Captured and forwarded to backends.
     #[serde(flatten)]
     pub other: Map<String, Value>,
 }
 
 impl Normalizable for CreateMessageRequest {
     // Use default no-op implementation
+}
+
+/// `output_config`: `effort` is read as a Chat `reasoning_effort` is (a
+/// string, or a number as its text; another type is refused); the other
+/// keys (a `format`, beta fields) ride through.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OutputConfig {
+    #[serde(default, deserialize_with = "deserialize_reasoning_effort")]
+    pub effort: Option<String>,
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+/// The thinking preference a prompt is rendered with: the `thinking` block,
+/// else the provider profile's reading of the effort (see
+/// [`crate::chat::ChatCompletionRequest::template_thinking`]).
+fn template_thinking(model: &str, thinking: Option<bool>, effort: Option<&str>) -> Option<bool> {
+    thinking.or_else(|| ProviderProfile::for_model(model).thinking_from_reasoning_effort(effort))
 }
 
 impl CreateMessageRequest {
@@ -115,6 +139,71 @@ impl CreateMessageRequest {
         self.mcp_servers
             .as_deref()
             .filter(|servers| !servers.is_empty())
+    }
+
+    /// Whether the request's final message is an assistant prefill the
+    /// response continues (see [`continues_final_assistant`]).
+    pub fn continues_final_assistant(&self) -> bool {
+        continues_final_assistant(&self.messages)
+    }
+
+    /// `output_config.effort`, the `reasoning_effort` the template renders.
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.output_config.as_ref()?.effort.as_deref()
+    }
+
+    /// The thinking preference the `thinking` block states, none without one.
+    pub fn thinking_toggle(&self) -> Option<bool> {
+        self.thinking.as_ref().map(ThinkingConfig::enabled)
+    }
+
+    /// The thinking preference the prompt is rendered with.
+    pub fn template_thinking(&self) -> Option<bool> {
+        template_thinking(&self.model, self.thinking_toggle(), self.reasoning_effort())
+    }
+
+    /// The field the request asks for a structured output format with,
+    /// `output_format` or `output_config.format`, if any; `null` asks for none.
+    pub fn output_format_field(&self) -> Option<&'static str> {
+        let set = |value: Option<&Value>| value.is_some_and(|value| !value.is_null());
+        if set(self.other.get("output_format")) {
+            Some("output_format")
+        } else if set(self
+            .output_config
+            .as_ref()
+            .and_then(|config| config.other.get("format")))
+        {
+            Some("output_config.format")
+        } else {
+            None
+        }
+    }
+
+    /// Whether the request's `tool_choice` turns parallel tool use off.
+    pub fn disables_parallel_tool_use(&self) -> bool {
+        self.tool_choice
+            .as_ref()
+            .is_some_and(ToolChoice::disables_parallel_tool_use)
+    }
+
+    /// The request's custom tools as chat tools, the shape the templates and
+    /// the parsers read (see [`chat_tools`]).
+    pub fn chat_tools(&self) -> Vec<common::Tool> {
+        self.tools.as_deref().map(chat_tools).unwrap_or_default()
+    }
+
+    /// The tool calls the history already holds, across the assistant
+    /// messages: the index the next call continues from.
+    pub fn history_tool_calls_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .flat_map(|message| match &message.content {
+                InputContent::Blocks(blocks) => blocks.as_slice(),
+                InputContent::String(_) => &[],
+            })
+            .filter(|block| matches!(block, InputContentBlock::ToolUse(_)))
+            .count()
     }
 }
 
@@ -363,6 +452,27 @@ pub enum InputContentBlock {
     ToolSearchToolResult(ToolSearchToolResultBlock),
     /// Tool reference block
     ToolReference(ToolReferenceBlock),
+}
+
+/// Whether `messages` end with an assistant message that has text and no
+/// tool call: a prefill the response continues rather than a closed turn.
+/// A tool call ends the turn; continuing after the text would drop it, as
+/// transformers' `continue_final_message` cuts the prompt there.
+pub fn continues_final_assistant(messages: &[InputMessage]) -> bool {
+    messages.last().is_some_and(|message| {
+        message.role == Role::Assistant
+            && match &message.content {
+                InputContent::String(_) => true,
+                InputContent::Blocks(blocks) => {
+                    blocks
+                        .iter()
+                        .any(|block| matches!(block, InputContentBlock::Text(_)))
+                        && !blocks
+                            .iter()
+                            .any(|block| matches!(block, InputContentBlock::ToolUse(_)))
+                }
+            }
+    })
 }
 
 /// Text content block
@@ -751,6 +861,62 @@ pub struct InputSchema {
     pub additional: Map<String, Value>,
 }
 
+impl From<&InputSchema> for Value {
+    /// The schema as the JSON object a chat tool's `parameters` holds.
+    fn from(schema: &InputSchema) -> Self {
+        let mut object = Map::new();
+        object.insert(
+            "type".to_string(),
+            Value::String(schema.schema_type.clone()),
+        );
+        if let Some(properties) = &schema.properties {
+            object.insert("properties".to_string(), Value::Object(properties.clone()));
+        }
+        if let Some(required) = &schema.required {
+            object.insert(
+                "required".to_string(),
+                Value::Array(required.iter().cloned().map(Value::String).collect()),
+            );
+        }
+        object.extend(
+            schema
+                .additional
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        Value::Object(object)
+    }
+}
+
+impl From<&CustomTool> for common::Tool {
+    /// The chat tool a custom tool reads as: a function with the input
+    /// schema as its parameters.
+    fn from(tool: &CustomTool) -> Self {
+        Self {
+            tool_type: "function".to_string(),
+            function: common::Function {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters: Value::from(&tool.input_schema),
+                strict: None,
+                extra: Default::default(),
+            },
+        }
+    }
+}
+
+/// The custom tools among `tools` as chat tools, in order; the other kinds
+/// render and parse through their own paths.
+pub fn chat_tools(tools: &[Tool]) -> Vec<common::Tool> {
+    tools
+        .iter()
+        .filter_map(|tool| match tool {
+            Tool::Custom(custom) => Some(common::Tool::from(custom)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Bash tool for computer use
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BashTool {
@@ -838,6 +1004,39 @@ pub enum ToolChoice {
     None,
 }
 
+impl ToolChoice {
+    /// Whether the choice turns parallel tool use off (`disable_parallel_tool_use: true`).
+    pub fn disables_parallel_tool_use(&self) -> bool {
+        matches!(
+            self,
+            Self::Auto {
+                disable_parallel_tool_use: Some(true)
+            } | Self::Any {
+                disable_parallel_tool_use: Some(true)
+            } | Self::Tool {
+                disable_parallel_tool_use: Some(true),
+                ..
+            }
+        )
+    }
+}
+
+impl From<&ToolChoice> for common::ToolChoice {
+    /// The chat tool choice a Messages choice reads as: `auto`, `required` for
+    /// `any`, the named function, `none`.
+    fn from(choice: &ToolChoice) -> Self {
+        match choice {
+            ToolChoice::Auto { .. } => Self::Value(common::ToolChoiceValue::Auto),
+            ToolChoice::Any { .. } => Self::Value(common::ToolChoiceValue::Required),
+            ToolChoice::Tool { name, .. } => Self::Function {
+                tool_type: "function".to_string(),
+                function: common::FunctionChoice { name: name.clone() },
+            },
+            ToolChoice::None => Self::Value(common::ToolChoiceValue::None),
+        }
+    }
+}
+
 // ============================================================================
 // Thinking Configuration
 // ============================================================================
@@ -862,6 +1061,13 @@ pub enum ThinkingConfig {
         /// Defaults vary by model (Opus 4.7 / Mythos default to `Omitted`; others to `Summarized`).
         display: Option<ThinkingDisplay>,
     },
+}
+
+impl ThinkingConfig {
+    /// `enabled` and `adaptive` ask for thinking, `disabled` turns it off.
+    pub fn enabled(&self) -> bool {
+        matches!(self, Self::Enabled { .. } | Self::Adaptive { .. })
+    }
 }
 
 /// How thinking content is returned in API responses
@@ -1290,6 +1496,9 @@ pub struct CountMessageTokensRequest {
     /// Tool definitions
     pub tools: Option<Vec<Tool>>,
 
+    /// The effort the prompt is rendered with, and the config's other keys.
+    pub output_config: Option<OutputConfig>,
+
     /// Additional backend-specific token counting options.
     #[serde(flatten)]
     pub other: Map<String, Value>,
@@ -1297,6 +1506,30 @@ pub struct CountMessageTokensRequest {
 
 impl Normalizable for CountMessageTokensRequest {
     // Use default no-op implementation
+}
+
+impl CountMessageTokensRequest {
+    /// The request's custom tools as chat tools, as [`CreateMessageRequest::chat_tools`].
+    pub fn chat_tools(&self) -> Vec<common::Tool> {
+        self.tools.as_deref().map(chat_tools).unwrap_or_default()
+    }
+
+    /// Whether the request's final message is an assistant prefill the
+    /// response continues (see [`continues_final_assistant`]).
+    pub fn continues_final_assistant(&self) -> bool {
+        continues_final_assistant(&self.messages)
+    }
+
+    /// `output_config.effort`, the `reasoning_effort` the template renders.
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.output_config.as_ref()?.effort.as_deref()
+    }
+
+    /// The thinking preference the prompt is rendered with.
+    pub fn template_thinking(&self) -> Option<bool> {
+        let thinking = self.thinking.as_ref().map(ThinkingConfig::enabled);
+        template_thinking(&self.model, thinking, self.reasoning_effort())
+    }
 }
 
 impl GenerationRequest for CountMessageTokensRequest {
@@ -2143,6 +2376,134 @@ mod tests {
 
     use super::*;
 
+    /// A trailing assistant message is continued when it has text and no
+    /// tool call: as a string, as text blocks, with thinking before the
+    /// text. A tool call closes the turn, and so does a trailing user turn.
+    #[test]
+    fn a_trailing_assistant_message_with_text_and_no_tool_call_is_continued() {
+        let request = |last: Value| -> CreateMessageRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "Hello"}, last]
+            }))
+            .expect("a Messages request")
+        };
+        let text = json!({"type": "text", "text": "Sure"});
+        let thinking = json!({"type": "thinking", "thinking": "hm", "signature": "s"});
+        let tool_use = json!({"type": "tool_use", "id": "t1", "name": "lookup", "input": {}});
+        assert!(
+            request(json!({"role": "assistant", "content": "Sure"})).continues_final_assistant()
+        );
+        assert!(
+            request(json!({"role": "assistant", "content": [text]})).continues_final_assistant()
+        );
+        assert!(
+            request(json!({"role": "assistant", "content": [thinking, text]}))
+                .continues_final_assistant()
+        );
+        assert!(
+            !request(json!({"role": "assistant", "content": [text, tool_use]}))
+                .continues_final_assistant()
+        );
+        assert!(
+            !request(json!({"role": "assistant", "content": [tool_use]}))
+                .continues_final_assistant()
+        );
+        assert!(
+            !request(json!({"role": "user", "content": "Hello again"})).continues_final_assistant()
+        );
+
+        let count: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "assistant", "content": "Sure"}]
+        }))
+        .expect("a count_tokens request");
+        assert!(count.continues_final_assistant());
+    }
+
+    /// `output_config.effort` reads as a Chat `reasoning_effort`: a string
+    /// as given, a number as its text, null or absent as none; another type
+    /// does not parse. The config's other keys stay with it, and a request
+    /// serializes back with the config it came with.
+    #[test]
+    fn output_config_effort_reads_as_a_reasoning_effort() {
+        let body = |output_config: Value| {
+            json!({
+                "model": "m", "max_tokens": 8, "output_config": output_config,
+                "messages": [{"role": "user", "content": "Hello"}]
+            })
+        };
+        for (output_config, effort) in [
+            (json!({"effort": "high"}), Some("high")),
+            (json!({"effort": 64}), Some("64")),
+            (json!({"effort": null}), None),
+            (json!({}), None),
+            (Value::Null, None),
+        ] {
+            let request: CreateMessageRequest =
+                serde_json::from_value(body(output_config.clone())).expect("a Messages request");
+            assert_eq!(request.reasoning_effort(), effort, "{output_config}");
+            let count: CountMessageTokensRequest = serde_json::from_value(
+                json!({"model": "m", "messages": [], "output_config": output_config}),
+            )
+            .expect("a count_tokens request");
+            assert_eq!(count.reasoning_effort(), effort);
+        }
+        assert!(
+            serde_json::from_value::<CreateMessageRequest>(body(json!({"effort": ["low"]})))
+                .is_err()
+        );
+
+        let with_format = body(json!({"effort": "low", "format": {"type": "json_schema"}}));
+        let request: CreateMessageRequest =
+            serde_json::from_value(with_format.clone()).expect("a Messages request");
+        assert_eq!(
+            request
+                .output_config
+                .as_ref()
+                .and_then(|config| config.other.get("format")),
+            Some(&json!({"type": "json_schema"}))
+        );
+        let back = serde_json::to_value(&request).expect("serializes");
+        assert_eq!(back["output_config"], with_format["output_config"]);
+    }
+
+    /// A structured output format is asked for under `output_format` or
+    /// `output_config.format`; `null` under either, an `output_config`
+    /// without `format`, and no field at all ask for none.
+    #[test]
+    fn a_request_names_the_field_its_output_format_comes_under() {
+        let request = |extra: Value| -> CreateMessageRequest {
+            let mut body = json!({"model": "m", "max_tokens": 8, "messages": []});
+            body.as_object_mut()
+                .expect("an object")
+                .extend(extra.as_object().expect("an object").clone());
+            serde_json::from_value(body).expect("a Messages request")
+        };
+        let format = json!({"type": "json_schema", "schema": {"type": "object"}});
+        assert_eq!(
+            request(json!({"output_format": format})).output_format_field(),
+            Some("output_format")
+        );
+        assert_eq!(
+            request(json!({"output_config": {"format": format}})).output_format_field(),
+            Some("output_config.format")
+        );
+        for extra in [
+            json!({}),
+            json!({"output_format": null}),
+            json!({"output_config": {"format": null}}),
+            json!({"output_config": {"effort": "high"}}),
+        ] {
+            assert_eq!(
+                request(extra.clone()).output_format_field(),
+                None,
+                "{extra}"
+            );
+        }
+    }
+
     #[test]
     fn tool_use_block_carries_the_caller_the_public_api_reports() {
         // A block built without a caller (every engine-issued call) leaves
@@ -2274,6 +2635,7 @@ mod tests {
 
     fn base_request() -> CreateMessageRequest {
         CreateMessageRequest {
+            output_config: None,
             model: "claude-test".to_string(),
             messages: vec![InputMessage {
                 role: Role::User,
@@ -2853,5 +3215,155 @@ mod tests {
             v["data"][1]["display_name"], "m2",
             "the id stands in for a missing name"
         );
+    }
+
+    /// `disable_parallel_tool_use: true` turns parallel use off under
+    /// `auto`, `any` and a named tool; unset, `false`, `none` and no
+    /// `tool_choice` leave it on.
+    #[test]
+    fn a_tool_choice_says_whether_it_disables_parallel_tool_use() {
+        let request = |tool_choice: Value| -> CreateMessageRequest {
+            let mut body = json!({"model": "m", "max_tokens": 8, "messages": []});
+            if !tool_choice.is_null() {
+                body["tool_choice"] = tool_choice;
+            }
+            serde_json::from_value(body).expect("a Messages request")
+        };
+        for choice in [
+            json!({"type": "auto", "disable_parallel_tool_use": true}),
+            json!({"type": "any", "disable_parallel_tool_use": true}),
+            json!({"type": "tool", "name": "lookup", "disable_parallel_tool_use": true}),
+        ] {
+            assert!(
+                request(choice.clone()).disables_parallel_tool_use(),
+                "{choice}"
+            );
+        }
+        for choice in [
+            json!({"type": "any"}),
+            json!({"type": "any", "disable_parallel_tool_use": false}),
+            json!({"type": "none"}),
+            Value::Null,
+        ] {
+            assert!(
+                !request(choice.clone()).disables_parallel_tool_use(),
+                "{choice}"
+            );
+        }
+    }
+
+    /// A Messages tool choice reads as the chat choice the templates and
+    /// parsers know: `auto`, `required` for `any`, the named function, `none`.
+    #[test]
+    fn a_tool_choice_reads_as_a_chat_tool_choice() {
+        let choice = |body: Value| -> common::ToolChoice {
+            let choice: ToolChoice = serde_json::from_value(body).expect("a tool choice");
+            common::ToolChoice::from(&choice)
+        };
+        assert!(matches!(
+            choice(json!({"type": "auto"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::Auto)
+        ));
+        assert!(matches!(
+            choice(json!({"type": "any"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::Required)
+        ));
+        assert!(matches!(
+            choice(json!({"type": "none"})),
+            common::ToolChoice::Value(common::ToolChoiceValue::None)
+        ));
+        match choice(json!({"type": "tool", "name": "calc"})) {
+            common::ToolChoice::Function {
+                tool_type,
+                function,
+            } => {
+                assert_eq!(tool_type, "function");
+                assert_eq!(function.name, "calc");
+            }
+            other => panic!("a named tool reads as a function choice, not {other:?}"),
+        }
+    }
+
+    /// A custom tool reads as a function tool whose parameters are the input
+    /// schema, keys in the order the client wrote them; the other tool kinds
+    /// are left out of the chat tools.
+    #[test]
+    fn custom_tools_read_as_chat_tools_in_order() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 8, "messages": [],
+            "tools": [
+                {"name": "weather", "description": "Get weather", "input_schema": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                    "additionalProperties": false
+                }},
+                {"type": "web_search_20250305", "name": "web_search"},
+                {"name": "calc", "input_schema": {"type": "object"}}
+            ]
+        }))
+        .expect("a Messages request");
+        let tools = request.chat_tools();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["weather", "calc"]);
+        let weather = &tools[0];
+        assert_eq!(weather.tool_type, "function");
+        assert_eq!(weather.function.description.as_deref(), Some("Get weather"));
+        let keys: Vec<&str> = weather.function.parameters["properties"]
+            .as_object()
+            .expect("properties")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["city"]);
+        let keys: Vec<&str> = weather
+            .function
+            .parameters
+            .as_object()
+            .expect("an object schema")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["type", "properties", "required", "additionalProperties"]
+        );
+        assert_eq!(tools[1].function.parameters, json!({"type": "object"}));
+        let none: CreateMessageRequest =
+            serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": []}))
+                .expect("a Messages request");
+        assert!(none.chat_tools().is_empty());
+    }
+
+    /// The history's tool calls are the `tool_use` blocks of the assistant
+    /// turns; user turns and text blocks do not count.
+    #[test]
+    fn the_history_counts_the_assistant_tool_uses() {
+        let request = |messages: Value| -> CreateMessageRequest {
+            serde_json::from_value(json!({"model": "m", "max_tokens": 8, "messages": messages}))
+                .expect("a Messages request")
+        };
+        assert_eq!(
+            request(json!([{"role": "user", "content": "Hello"}])).history_tool_calls_count(),
+            0
+        );
+        let history = json!([
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "Let me check."},
+                {"type": "tool_use", "id": "tu_1", "name": "calc", "input": {"x": 1}},
+                {"type": "tool_use", "id": "tu_2", "name": "search", "input": {"q": "t"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "2"}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_3", "name": "calc", "input": {}}
+            ]}
+        ]);
+        assert_eq!(request(history).history_tool_calls_count(), 3);
     }
 }

@@ -38,7 +38,8 @@ use crate::{
     sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake, ZMQ_CONNECT_TIMEOUT},
     stream::ZmqGenerateStream,
     tokenspeed::{
-        fan_out_tokenspeed_requests, translate_request_tokenspeed, TokenSpeedGenerateStream,
+        fan_out_tokenspeed_requests, translate_request_tokenspeed_for, GridTensors,
+        TokenSpeedGenerateStream,
     },
     vllm::{
         fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
@@ -660,9 +661,26 @@ impl ZmqEngineClient {
     /// fan-out submitted to the engine, each sub tagged with its proto
     /// `index`, left unmerged so a caller can end one choice without the
     /// others (the gRPC servicer matches string stops per choice).
+    /// Grid tensors keep the conservative reading here ([`GridTensors::Positions`]):
+    /// the router's direct-ZMQ path, which calls this, carries no model facts, so
+    /// an item with a vision grid is refused there as before; the Rust servicer,
+    /// which knows the model, calls [`Self::generate_tokenspeed_streams_for_model`].
     pub async fn generate_tokenspeed_streams(
         &self,
         req: tokenspeed_proto::GenerateRequest,
+    ) -> Result<Vec<TokenSpeedGenerateStream>, tonic::Status> {
+        self.generate_tokenspeed_streams_for_model(req, GridTensors::Positions)
+            .await
+    }
+
+    /// [`Self::generate_tokenspeed_streams`] for the model served:
+    /// `grid_tensors` says what a multimodal item's grid tensors are (MRoPE
+    /// positions, refused on this wire, or a patch layout that passes; see
+    /// [`GridTensors`]).
+    pub async fn generate_tokenspeed_streams_for_model(
+        &self,
+        req: tokenspeed_proto::GenerateRequest,
+        grid_tensors: GridTensors,
     ) -> Result<Vec<TokenSpeedGenerateStream>, tonic::Status> {
         let ZmqBackend::TokenSpeed(client) = &self.backend else {
             return Err(tonic::Status::internal(
@@ -673,8 +691,8 @@ impl ZmqEngineClient {
         // error, which auto-aborts their engine-side requests.
         let mut streams = Vec::new();
         for (index, sub) in fan_out_tokenspeed_requests(req).into_iter().enumerate() {
-            let request =
-                translate_request_tokenspeed(sub).map_err(tonic::Status::invalid_argument)?;
+            let request = translate_request_tokenspeed_for(sub, grid_tensors)
+                .map_err(tonic::Status::invalid_argument)?;
             let stream = client.submit(request).await.map_err(zmq_status)?;
             streams.push(TokenSpeedGenerateStream::new(stream, index as u32));
         }

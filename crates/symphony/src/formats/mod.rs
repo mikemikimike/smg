@@ -10,6 +10,7 @@
 //!
 //! [`Format`]: crate::Format
 //! [`Engine`]: crate::Engine
+pub mod deepseek_v4;
 pub mod deepseek_v4_1;
 pub mod dots3;
 pub mod forced;
@@ -30,6 +31,7 @@ pub mod minicpm5;
 pub mod minimax_m2;
 pub mod minimax_m3;
 pub mod mistral_v13;
+pub mod muse_spark;
 pub mod olmo3;
 pub mod plain;
 pub mod qwen2_5;
@@ -38,6 +40,7 @@ pub mod registry;
 pub mod seed_oss;
 pub mod xlam;
 
+pub use deepseek_v4::deepseek_v4;
 pub use deepseek_v4_1::deepseek_v4_1;
 pub use dots3::dots3;
 pub use forced::forced;
@@ -58,6 +61,7 @@ pub use minicpm5::minicpm5;
 pub use minimax_m2::minimax_m2;
 pub use minimax_m3::minimax_m3;
 pub use mistral_v13::mistral_v13;
+pub use muse_spark::muse_spark;
 pub use olmo3::olmo3;
 pub use plain::plain;
 pub use qwen2_5::qwen2_5;

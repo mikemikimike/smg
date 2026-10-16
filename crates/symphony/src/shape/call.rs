@@ -10,11 +10,11 @@
 //!
 //! - **The header** is read first, with a [`Matcher`], before the call opens: the engine holds the
 //!   terminal and everything after it, and moves nothing, until the header is decided. When it
-//!   matches ([`Header::Matched`]), [`Assembler::start`] starts the call (named by the header, by
+//!   matches ([`Header::Matched`]), `Assembler::start` starts the call (named by the header, by
 //!   the template, or later by the arguments' own object) and gives back the bytes that followed
 //!   the header, for the engine to read again in the call. When it cannot match
 //!   ([`Header::Failed`]), the terminal opened no call: the engine takes back what the header
-//!   read ([`Assembler::into_header_bytes`]) and reads the terminal and those bytes again from the
+//!   read (`Assembler::into_header_bytes`) and reads the terminal and those bytes again from the
 //!   terminal's second character, as a regular expression's search goes on from the place after
 //!   one where its pattern failed. A header holds at most the shape's cap of bytes undecided; past
 //!   it, it is no match.
@@ -53,7 +53,7 @@ use crate::{
     json::{self, arguments::Strings},
     shape::{
         Arguments, CallShape, Match, Matcher, NameSource, Schema, Slot, Suffix, ValueParser,
-        ValueRead, Verdict,
+        Values, Verdict,
     },
     tagged::Declared,
 };
@@ -65,10 +65,10 @@ const TEXT_AFTER_THE_ARGUMENTS: &str = "text after a call's arguments";
 pub enum Header {
     /// More bytes can still change the answer.
     Pending,
-    /// The header matched: [`Assembler::start`] starts the call.
+    /// The header matched: `Assembler::start` starts the call.
     Matched,
     /// The header cannot match: the terminal opened no call, and
-    /// [`Assembler::into_header_bytes`] gives back what the header read.
+    /// `Assembler::into_header_bytes` gives back what the header read.
     Failed,
 }
 
@@ -79,7 +79,7 @@ pub struct Assembler {
     id: String,
     shape: &'static CallShape,
     /// How the call's values read.
-    values: &'static dyn ValueRead,
+    values: Values,
     /// The terminal's last character, which a `\b` at the header's start reads.
     before: Option<char>,
     stage: Stage,
@@ -135,17 +135,37 @@ enum JsonReader {
 }
 
 impl JsonReader {
-    /// Whether the arguments are over: the value or the object is whole.
+    /// Whether the arguments are over: the value is whole or ended where refused, or the object is
+    /// done.
     fn over(&self) -> bool {
         match self {
-            Self::Json(arguments) => arguments.whole(),
+            Self::Json(arguments) => arguments.over(),
             Self::Envelope(assembler) => assembler.done(),
         }
     }
 
-    /// Why text after the arguments that is not whitespace is malformed: the reason the JSON
-    /// syntax gives for text after a call's object, for an object that names the call.
+    /// The bytes a refused value or object took before the refusal was known, handed back once
+    /// with the character before them: what follows the arguments, for the trailer to read.
+    fn refused_tail(&mut self) -> Option<(String, Option<char>)> {
+        match self {
+            Self::Json(arguments) => arguments.refused_tail(),
+            Self::Envelope(assembler) => assembler.refused_tail(),
+        }
+    }
+
+    /// Why text after the arguments that is not whitespace is malformed: for a value or an object
+    /// that ended where its arguments were refused, its invalid arguments, since the text continues
+    /// them; else the reason the JSON syntax gives for text between a call's object and its closing
+    /// marker, for an object that names the call (one that closed after its arguments broke
+    /// included), or for text after the arguments.
     fn surplus(&self) -> MalformedReason {
+        let ended_where_refused = match self {
+            Self::Json(arguments) => arguments.ended_where_refused(),
+            Self::Envelope(assembler) => assembler.ended_where_refused(),
+        };
+        if ended_where_refused {
+            return MalformedReason::InvalidArguments;
+        }
         MalformedReason::Other(
             match self {
                 Self::Json(_) => TEXT_AFTER_THE_ARGUMENTS,
@@ -160,11 +180,11 @@ impl Assembler {
     /// An assembler for the call at `index`, with the id the format minted for it, of `shape`,
     /// whose values read with `values`, right after its region's terminal, whose last character is
     /// `before`.
-    pub fn new(
+    pub(crate) fn new(
         index: u32,
         id: impl Into<String>,
         shape: &'static CallShape,
-        values: &'static dyn ValueRead,
+        values: Values,
         before: Option<char>,
     ) -> Self {
         let matcher =
@@ -248,7 +268,16 @@ impl Assembler {
                     why: DropReason::Wrapper,
                 });
             }
-            let reader = JsonReader::Envelope(json::Assembler::new(self.index, self.id.clone()));
+            // With a trailer, an object ends where its bytes stop being a call's object (its
+            // arguments refused as JSON, or its outline stopped short of the close) and the trailer
+            // reads what follows; without one, the region's terminal closes the call wherever the
+            // object stands, and the object keeps its malformed rest as before.
+            let assembler = json::Assembler::new(self.index, self.id.clone());
+            let reader = JsonReader::Envelope(if shape.trailer.0.is_empty() {
+                assembler
+            } else {
+                assembler.ending_where_refused()
+            });
             let value = Value::new(reader, String::new(), before);
             self.stage = Stage::Body(Body::Value(Box::new(value)));
             return held[end..].to_string();
@@ -271,31 +300,22 @@ impl Assembler {
                 self.index,
                 shape,
                 (tag, ends, values),
-                (name, self.values),
+                (name, self.values.clone()),
                 before,
             ))),
-            Arguments::Json(_) | Arguments::Envelope { .. } => Body::Value(Box::new(Value::new(
-                JsonReader::Json(json::Arguments::new(self.index)),
-                name,
-                before,
-            ))),
+            // As for an envelope above: only a trailer needs the value to end where refused.
+            Arguments::Json(_) | Arguments::Envelope { .. } => {
+                let arguments = json::Arguments::new(self.index);
+                let reader = JsonReader::Json(if shape.trailer.0.is_empty() {
+                    arguments
+                } else {
+                    arguments.ending_where_refused()
+                });
+                Body::Value(Box::new(Value::new(reader, name, before)))
+            }
         };
         self.stage = Stage::Body(body);
         held[end..].to_string()
-    }
-
-    /// Whether the call has started: whether its `ToolCallStart` has been pushed.
-    pub fn started(&self) -> bool {
-        match &self.stage {
-            Stage::Body(body) => match body {
-                Body::Value(value) => match &value.reader {
-                    JsonReader::Json(_) => true,
-                    JsonReader::Envelope(assembler) => assembler.started(),
-                },
-                Body::Params(_) => true,
-            },
-            Stage::Header(_) | Stage::Matched { .. } | Stage::Done => false,
-        }
     }
 
     /// Append the next bytes of the call, after its start, and push the events they complete,
@@ -307,7 +327,7 @@ impl Assembler {
             return;
         };
         match body {
-            Body::Value(value) => value.feed(shape, (self.values, declared), bytes, out),
+            Body::Value(value) => value.feed(shape, (&self.values, declared), bytes, out),
             Body::Params(params) => params.feed(bytes, declared, out),
         }
     }
@@ -380,7 +400,7 @@ impl Assembler {
 
 /// The table's reader, asked about the members of one call's JSON arguments.
 struct Typing<'a> {
-    values: &'static dyn ValueRead,
+    values: &'a Values,
     declared: &'a Declared,
     name: &'a str,
 }
@@ -395,11 +415,14 @@ impl Typing<'_> {
 
 impl Strings for Typing<'_> {
     fn holds(&self, key: &str) -> bool {
-        !self.values.streams(&ValueParser::json(), self.schema(key))
+        !self
+            .values
+            .reader()
+            .streams(&ValueParser::json(), self.schema(key))
     }
 
     fn typed(&self, key: &str, raw: &str) -> Option<String> {
-        self.values.member(raw, self.schema(key))
+        self.values.reader().member(raw, self.schema(key))
     }
 }
 
@@ -418,11 +441,15 @@ impl Value {
     fn feed(
         &mut self,
         shape: &'static CallShape,
-        (values, declared): (&'static dyn ValueRead, &Declared),
+        (values, declared): (&Values, &Declared),
         bytes: &str,
         out: &mut Events,
     ) {
         let mut rest = bytes;
+        let handed_back;
+        // What the call took before this piece: the character before a value refused at its first
+        // byte, which has none of its own.
+        let before_feed = self.before;
         if !self.reader.over() {
             let typing = Typing {
                 values,
@@ -439,6 +466,14 @@ impl Value {
             rest = &rest[taken..];
             if !self.reader.over() {
                 return;
+            }
+            // A reader that ends where its bytes stop being a value or an object hands the bytes it
+            // took past that point back: they lead what follows, so the trailer reads them too,
+            // after the character before them.
+            if let Some((tail, before)) = self.reader.refused_tail() {
+                self.before = before.or(before_feed);
+                handed_back = format!("{tail}{rest}");
+                rest = &handed_back;
             }
         }
         if shape.trailer.0.is_empty() {
@@ -554,13 +589,17 @@ fn wrapping(text: &str, why: &MalformedReason, out: &mut Events) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::{
         engine::Engine,
         format::{CallSyntax, Emits, Format},
         input::{EngineFinish, Input, TokenSpan},
         parser::Parser,
-        shape::{intern, Atom, Class, Dialect, Duplicates, End, Path, Pattern, ShapeError},
+        shape::{
+            intern, Atom, Class, Dialect, Duplicates, End, Path, Pattern, ShapeError, ValueRead,
+        },
     };
 
     fn word() -> Class {
@@ -1058,6 +1097,154 @@ mod tests {
         );
     }
 
+    /// A value the JSON reader refuses is over where it was refused: what follows is the
+    /// trailer's to read, so the closing terminal the trailer ends before closes the call, and the
+    /// text after it is content. Without this, the refused value took every byte to the stream's
+    /// stop and the close came back as the call's text (#3145's unresolved finding).
+    #[test]
+    fn a_refused_value_hands_what_follows_to_the_trailer() {
+        let format = table(named(closing_f()));
+        assert_eq!(
+            run(&format, "<c><n=f>{\"a\": 1</f>\n</c>Done."),
+            [
+                wrapper("<c>"),
+                start("f", "<n=f>"),
+                arguments("{\"a\": 1"),
+                end("</f>\n</c>"),
+                content("Done."),
+                finish(1),
+            ]
+        );
+        // A value refused at its first byte has no character of its own before the tail: the
+        // header's last character, or the whitespace before the value, stands before the trailer,
+        // which a `\b` at its start reads.
+        let format = table(named(Pattern([Atom::Boundary, lit("END")].into())));
+        assert_eq!(
+            run(&format, "<c><n=f>END</c>Done."),
+            [
+                wrapper("<c>"),
+                start("f", "<n=f>"),
+                end("END</c>"),
+                content("Done."),
+                finish(1),
+            ]
+        );
+        assert_eq!(
+            run(&format, "<c><n=f> END</c>Done."),
+            [
+                wrapper("<c>"),
+                start("f", "<n=f>"),
+                Event::Dropped {
+                    text: Text::uncounted(" "),
+                    why: DropReason::Whitespace,
+                },
+                end("END</c>"),
+                content("Done."),
+                finish(1),
+            ]
+        );
+    }
+
+    /// The same for an object that names the call: refused inside its arguments, or its outline
+    /// stopped short of its close (the brace left off, text where a member should be, a literal
+    /// in another member running into the trailer), the call ends there, the trailer and the
+    /// terminal are the region's wrapping, and the text after is content.
+    #[test]
+    fn a_refused_envelope_hands_what_follows_to_the_trailer() {
+        let envelope = intern(CallShape {
+            header: Pattern::default(),
+            name: NameSource::Body,
+            arguments: Arguments::Envelope {
+                dialect: Dialect::default(),
+                name: Path::new(["name"]),
+                arguments: Path::new(["arguments"]),
+            },
+            trailer: closing_f(),
+            word: word(),
+            hold_cap: 64,
+        });
+        let format = table(envelope);
+        let events = run(
+            &format,
+            "<c>{\"name\": \"f\", \"arguments\": {\"a\": 1</f>\n</c>Done.",
+        );
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .expect("the call ends");
+        let content_at = events
+            .iter()
+            .position(|event| matches!(event, Event::Content(_)))
+            .expect("the text after the call is content");
+        assert!(ended < content_at, "{events:#?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "{events:#?}"
+        );
+        let shown: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(shown, "Done.", "{events:#?}");
+        assert_eq!(
+            run(
+                &format,
+                "<c>{\"name\": \"f\", \"arguments\": {\"a\": 1}</f>\n</c>Done.",
+            ),
+            [
+                wrapper("<c>"),
+                start("f", "{\"name\": \"f\", \"arguments\": "),
+                arguments("{\"a\": 1}"),
+                end(""),
+                wrapper("</f>\n</c>"),
+                content("Done."),
+                finish(1),
+            ],
+            "the brace left off"
+        );
+        assert_eq!(
+            run(
+                &format,
+                "<c>{\"name\": \"f\", \"arguments\": {\"a\": 1}, junk</f>\n</c>Done.",
+            ),
+            [
+                wrapper("<c>"),
+                start("f", "{\"name\": \"f\", \"arguments\": "),
+                arguments("{\"a\": 1}"),
+                end(", "),
+                Event::Malformed {
+                    text: Text::uncounted("junk"),
+                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
+                },
+                wrapper("</f>\n</c>"),
+                content("Done."),
+                finish(1),
+            ],
+            "text where a member should be"
+        );
+        assert_eq!(
+            run(
+                &format,
+                "<c>{\"name\": \"f\", \"arguments\": {\"a\": 1}, \"strict\": true</f>\n</c>Done.",
+            ),
+            [
+                wrapper("<c>"),
+                start("f", "{\"name\": \"f\", \"arguments\": "),
+                arguments("{\"a\": 1}"),
+                end(", \"strict\": true"),
+                wrapper("</f>\n</c>"),
+                content("Done."),
+                finish(1),
+            ],
+            "a literal in another member runs into the trailer"
+        );
+    }
+
     #[test]
     fn a_stop_closes_the_call_where_the_trailer_ends_with_the_stream() {
         let format = table(named(closing_f())).closes_at_stop("call");
@@ -1157,6 +1344,7 @@ mod tests {
             "<tool_call>\n{\"name\": \"f\", \"arguments\": {\"a\": [1, 2",
             "<tool_call>{\"name\": \"f\", \"arguments\": {}}x y</tool_call>",
             "<tool_call>{\"name\": \"f\"}<tool_call>{\"name\": \"g\", \"arguments\": 12abc}",
+            "<tool_call>{\"name\": \"f\", \"arguments\": 12abc} x</tool_call>",
             "<tool_call>{\"name\": \"f\", \"arguments\": {}}\n</tool_call>",
         ] {
             for finish in [EngineFinish::Stop, EngineFinish::Length] {
@@ -1653,8 +1841,6 @@ mod tests {
         }
     }
 
-    static STRICT: Strict = Strict;
-
     fn tools() -> Declared {
         Declared::of(&[openai_protocol::common::Tool {
             tool_type: "function".to_string(),
@@ -1673,7 +1859,7 @@ mod tests {
 
     #[test]
     fn a_tables_reader_holds_and_types_the_json_members_it_says() {
-        let format = table(named(Pattern::default())).reads_values_with(&STRICT);
+        let format = table(named(Pattern::default())).reads_values_with(Arc::new(Strict));
         let events = run_declared(
             &format,
             &tools(),
@@ -1754,7 +1940,7 @@ mod tests {
             word: word(),
             hold_cap: 64,
         });
-        let format = table(shape).reads_values_with(&STRICT);
+        let format = table(shape).reads_values_with(Arc::new(Strict));
         let events = run_declared(
             &format,
             &tools(),

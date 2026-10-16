@@ -19,9 +19,9 @@
 //! older parsers for it until its group lists the name under `also`.
 
 use super::{
-    deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest, json,
-    k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
-    mistral_v13, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest,
+    json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
+    mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -42,6 +42,8 @@ pub enum Table {
     Qwen3TaggedDirect,
     /// [`qwen2_5()`].
     Qwen2_5,
+    /// [`deepseek_v4()`].
+    DeepSeekV4,
     /// [`deepseek_v4_1()`].
     DeepSeekV4_1,
     /// [`seed_oss()`].
@@ -86,17 +88,20 @@ pub enum Table {
     Glm4,
     /// [`k2_horizon()`].
     K2Horizon,
+    /// [`muse_spark()`].
+    MuseSpark,
     /// [`plain()`].
     Plain,
 }
 
 impl Table {
     /// Every table, in this order.
-    pub const ALL: [Table; 27] = [
+    pub const ALL: [Table; 29] = [
         Self::Qwen3,
         Self::Qwen3Tagged,
         Self::Qwen3TaggedDirect,
         Self::Qwen2_5,
+        Self::DeepSeekV4,
         Self::DeepSeekV4_1,
         Self::SeedOss,
         Self::Hy4,
@@ -119,6 +124,7 @@ impl Table {
         Self::Glm,
         Self::Glm4,
         Self::K2Horizon,
+        Self::MuseSpark,
         Self::Plain,
     ];
 
@@ -130,6 +136,7 @@ impl Table {
             Self::Qwen3Tagged => "qwen3_tagged",
             Self::Qwen3TaggedDirect => "qwen3_tagged_direct",
             Self::Qwen2_5 => "qwen2.5",
+            Self::DeepSeekV4 => "deepseek_v4",
             Self::DeepSeekV4_1 => "deepseek_v4.1",
             Self::SeedOss => "seed_oss",
             Self::Hy4 => "hy4",
@@ -152,6 +159,7 @@ impl Table {
             Self::Glm => "glm",
             Self::Glm4 => "glm4",
             Self::K2Horizon => "k2_horizon",
+            Self::MuseSpark => "muse_spark",
             Self::Plain => "plain",
         }
     }
@@ -198,6 +206,7 @@ impl Table {
             Self::Qwen3Tagged => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine)),
             Self::Qwen3TaggedDirect => qwen3(CallSyntax::Tagged(Spelling::Json, Placement::Direct)),
             Self::Qwen2_5 => qwen2_5(),
+            Self::DeepSeekV4 => deepseek_v4(),
             Self::DeepSeekV4_1 => deepseek_v4_1(),
             Self::SeedOss => seed_oss(),
             Self::Hy4 => hy4(),
@@ -220,6 +229,7 @@ impl Table {
             Self::Glm => glm(),
             Self::Glm4 => glm4(),
             Self::K2Horizon => k2_horizon(),
+            Self::MuseSpark => muse_spark(),
             Self::Plain => plain(),
         }
     }
@@ -453,6 +463,12 @@ const GROUPS: &[Group] = &[
         model: "LiquidAI/d1-3B",
         also: &[],
         table: Table::Lfm2_5,
+        opener: None,
+    },
+    Group {
+        model: "deepseek-ai/DeepSeek-V4-Flash",
+        also: &[],
+        table: Table::DeepSeekV4,
         opener: None,
     },
     Group {
@@ -807,6 +823,12 @@ const GROUPS: &[Group] = &[
         model: "mistralai/Mistral-Small-4-119B-2603",
         also: &[],
         table: Table::MistralV13,
+        opener: None,
+    },
+    Group {
+        model: "meta-models/Muse-Spark-Open-816B-A42B",
+        also: &["Muse-Spark-Open-816B-A42B-NVFP4"],
+        table: Table::MuseSpark,
         opener: None,
     },
     Group {
@@ -1205,6 +1227,7 @@ pub fn groups() -> impl Iterator<Item = (&'static str, &'static [&'static str], 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::format::Emits;
 
     #[test]
     fn a_primary_resolves_by_its_id_in_any_case_with_or_without_the_organisation() {
@@ -1347,6 +1370,37 @@ mod tests {
                 assert!(!seen.contains(&lower), "{repository} is listed twice");
                 seen.push(lower);
             }
+        }
+    }
+
+    #[test]
+    fn every_tables_variants_without_reasoning_or_calls_still_validate() {
+        for table in Table::ALL {
+            let format = table.format();
+            let silent = format.clone().without_reasoning();
+            silent
+                .validate()
+                .unwrap_or_else(|e| panic!("{}: without_reasoning: {e}", table.name()));
+            assert!(
+                (0..silent.states()).all(|state| silent.emits(state) != Emits::Reasoning),
+                "{}: a thought state remains",
+                table.name()
+            );
+            let unread = format.without_calls();
+            unread
+                .validate()
+                .unwrap_or_else(|e| panic!("{}: without_calls: {e}", table.name()));
+            assert_eq!(unread.call_syntax(), None, "{}", table.name());
+            assert!(
+                (0..unread.states()).all(|state| unread.emits(state) != Emits::Arguments),
+                "{}: an arguments state remains",
+                table.name()
+            );
+            assert!(
+                (1..unread.states()).all(|state| unread.emits(state) != Emits::Wrapper),
+                "{}: a calls wrapper remains",
+                table.name()
+            );
         }
     }
 }

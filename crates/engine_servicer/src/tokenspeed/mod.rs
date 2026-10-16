@@ -61,6 +61,12 @@ pub struct TokenSpeedModelInfo {
     pub supports_multimodal: bool,
     /// `smg.grpc.common.Modality` values.
     pub supported_modalities: Vec<i32>,
+    /// Whether the language model's rotary positions are MRoPE (the text rope
+    /// config carries an `mrope_section`), which the launcher reads off the
+    /// checkpoint: a multimodal item's grid tensors then feed positions this
+    /// wire cannot derive and are refused; `Some(false)` lets a patch-layout
+    /// grid through; `None` (a launcher that does not say) refuses as before.
+    pub mrope_positions: Option<bool>,
     pub model_dtype: String,
     pub multimodal_encoder_dtype: String,
     /// TokenSpeed's `ServerArgs` as a JSON object, reported as
@@ -71,6 +77,11 @@ pub struct TokenSpeedModelInfo {
     /// `shm_namespace_id`); the handshake supplies the capacity figures.
     pub scheduler_info_json: String,
     pub tokenspeed_version: String,
+    /// The engine's declared constrained-decoding policy (`always`, `requested`,
+    /// or "" when it declares none), reported as
+    /// `GetServerInfo.constrained_decoding` for the Router's `constrained_decoding`
+    /// label.
+    pub constrained_decoding: String,
     /// The scheduler's admission window (`max_num_seqs`), reported as
     /// `max_running_requests`; the handshake's figure is the fallback.
     pub max_running_requests: i32,

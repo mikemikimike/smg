@@ -450,6 +450,62 @@ impl ChatCompletionRequest {
         self.thinking.as_ref().and_then(ThinkingParam::toggle)
     }
 
+    /// [`Self::thinking_toggle`] as the request's provider profile reads it:
+    /// a profile whose contract lets an explicit effort outrank
+    /// `thinking.type: disabled` ([`ProviderProfile::effort_outranks_thinking_disabled`])
+    /// drops that toggle from a request that carries an effort.
+    pub fn effective_thinking_toggle(&self) -> Option<bool> {
+        let toggle = self.thinking_toggle();
+        if toggle == Some(false)
+            && self.effective_reasoning_effort().is_some()
+            && ProviderProfile::for_model(&self.model).effort_outranks_thinking_disabled()
+        {
+            return None;
+        }
+        toggle
+    }
+
+    /// The thinking preference the prompt is rendered with: the effective
+    /// typed toggle, else the provider profile's reading of the effective
+    /// `reasoning_effort` ([`ProviderProfile::thinking_from_reasoning_effort`]).
+    pub fn template_thinking(&self) -> Option<bool> {
+        self.effective_thinking_toggle().or_else(|| {
+            ProviderProfile::for_model(&self.model)
+                .thinking_from_reasoning_effort(self.effective_reasoning_effort())
+        })
+    }
+
+    /// Whether `continue_final_message` applies: it is set and the request
+    /// ends with an assistant message.
+    pub fn continues_final_assistant(&self) -> bool {
+        self.continue_final_message
+            && matches!(self.messages.last(), Some(ChatMessage::Assistant { .. }))
+    }
+
+    /// Whether `parallel_tool_calls: false` asks for one tool call at most.
+    pub fn disables_parallel_tool_calls(&self) -> bool {
+        self.parallel_tool_calls == Some(false)
+    }
+
+    /// The choices the request asks for: `n`, one when absent or zero.
+    pub fn choices(&self) -> u32 {
+        self.n.filter(|&n| n > 0).unwrap_or(1)
+    }
+
+    /// The tool calls the history already holds, across the assistant
+    /// messages: the index the next call continues from.
+    pub fn history_tool_calls_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::Assistant { tool_calls, .. } => {
+                    tool_calls.as_ref().map(|calls| calls.len())
+                }
+                _ => None,
+            })
+            .sum()
+    }
+
     /// `thinking.effort` when present, else the top-level `reasoning_effort`.
     pub fn effective_reasoning_effort(&self) -> Option<&str> {
         self.thinking
@@ -471,6 +527,8 @@ impl ChatCompletionRequest {
 /// so the lowest OpenAI level is the closest available "do not reason".
 /// Level values return `None` — no opinion, defer to the template default or an
 /// explicit thinking kwarg.
+/// The default reading; a provider profile may read the field by its own
+/// contract ([`ProviderProfile::thinking_from_reasoning_effort`]).
 pub fn thinking_from_reasoning_effort(reasoning_effort: Option<&str>) -> Option<bool> {
     match reasoning_effort {
         Some("none") | Some("minimal") => Some(false),
@@ -478,7 +536,9 @@ pub fn thinking_from_reasoning_effort(reasoning_effort: Option<&str>) -> Option<
     }
 }
 
-fn deserialize_reasoning_effort<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+pub(crate) fn deserialize_reasoning_effort<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -1055,6 +1115,22 @@ mod tests {
         ThinkingType,
     };
 
+    /// `parallel_tool_calls: false` asks for one call; `true` and absent do not.
+    #[test]
+    fn a_chat_request_says_whether_it_disables_parallel_tool_calls() {
+        let request = |body: Value| -> ChatCompletionRequest {
+            serde_json::from_value(body).expect("a chat request")
+        };
+        let base = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert!(!request(base.clone()).disables_parallel_tool_calls());
+        let mut on = base.clone();
+        on["parallel_tool_calls"] = json!(true);
+        assert!(!request(on).disables_parallel_tool_calls());
+        let mut off = base;
+        off["parallel_tool_calls"] = json!(false);
+        assert!(request(off).disables_parallel_tool_calls());
+    }
+
     fn request_with_output_fields(fields: &[(&str, Value)]) -> ChatCompletionRequest {
         let mut value = json!({
             "model": "test-model",
@@ -1121,6 +1197,72 @@ mod tests {
         assert!(!back.skip_special_tokens);
         assert!(!back.separate_reasoning);
         assert!(!back.stream_reasoning);
+    }
+
+    /// The MiniMax contract reads `reasoning_effort` by its own rule: `none`
+    /// (the default depth) and `minimal` (`low`) keep thinking on, and an
+    /// explicit effort outranks `thinking.type: disabled`; every other
+    /// profile keeps the OpenAI reading and honours the toggle.
+    #[test]
+    fn minimax_profile_keeps_thinking_on_for_every_effort() {
+        let request = |model: &str, fields: Value| -> ChatCompletionRequest {
+            let mut value = json!({"model": model, "messages": []});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().cloned().unwrap_or_default());
+            serde_json::from_value(value).unwrap()
+        };
+        for effort in ["none", "minimal", "low", "high", "max"] {
+            assert_eq!(
+                request("MiniMax-M3", json!({"reasoning_effort": effort})).template_thinking(),
+                None,
+                "MiniMax {effort}: the template's default, thinking on"
+            );
+            assert_eq!(
+                request(
+                    "MiniMax-M3",
+                    json!({"reasoning_effort": effort, "thinking": {"type": "disabled"}})
+                )
+                .template_thinking(),
+                None,
+                "MiniMax {effort} outranks thinking.disabled"
+            );
+        }
+        assert_eq!(
+            request("MiniMax-M3", json!({"thinking": {"type": "disabled"}})).template_thinking(),
+            Some(false),
+            "thinking.disabled alone switches thinking off"
+        );
+        assert_eq!(
+            request(
+                "MiniMax-M3",
+                json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}})
+            )
+            .template_thinking(),
+            Some(true)
+        );
+        for model in ["self-hosted-model", "kimi-k3", "deepseek-v4.1"] {
+            assert_eq!(
+                request(model, json!({"reasoning_effort": "none"})).template_thinking(),
+                Some(false),
+                "{model}: the OpenAI reading, none switches thinking off"
+            );
+            assert_eq!(
+                request(
+                    model,
+                    json!({"reasoning_effort": "high", "thinking": {"type": "disabled"}})
+                )
+                .template_thinking(),
+                Some(false),
+                "{model}: thinking.disabled wins"
+            );
+            assert_eq!(
+                request(model, json!({"reasoning_effort": "high"})).template_thinking(),
+                None,
+                "{model}"
+            );
+        }
     }
 
     #[test]
@@ -1427,6 +1569,46 @@ mod tests {
         .expect("parse");
         let value = serde_json::to_value(&message).expect("serialize");
         assert_eq!(value["annotations"], sent, "{value}");
+    }
+
+    /// `n` is the number of choices; absent and zero both mean one.
+    #[test]
+    fn a_chat_request_asks_for_at_least_one_choice() {
+        let request = |body: Value| -> ChatCompletionRequest {
+            serde_json::from_value(body).expect("a chat request")
+        };
+        let base = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(request(base.clone()).choices(), 1);
+        let mut zero = base.clone();
+        zero["n"] = json!(0);
+        assert_eq!(request(zero).choices(), 1);
+        let mut three = base;
+        three["n"] = json!(3);
+        assert_eq!(request(three).choices(), 3);
+    }
+
+    /// The history's tool calls are the assistant messages' `tool_calls`,
+    /// summed in order; user, system and tool messages do not count.
+    #[test]
+    fn the_history_counts_the_assistant_tool_calls() {
+        let request = |messages: Value| -> ChatCompletionRequest {
+            serde_json::from_value(json!({"model": "m", "messages": messages}))
+                .expect("a chat request")
+        };
+        assert_eq!(
+            request(json!([{"role": "user", "content": "hi"}])).history_tool_calls_count(),
+            0
+        );
+        let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "calc", "arguments": "{}"}});
+        let history = json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [call("c1"), call("c2")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "2"},
+            {"role": "assistant", "content": "done"},
+            {"role": "assistant", "content": null, "tool_calls": [call("c3")]}
+        ]);
+        assert_eq!(request(history).history_tool_calls_count(), 3);
     }
 }
 

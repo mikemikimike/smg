@@ -550,12 +550,16 @@ impl RequestPipeline {
         &self,
         dctx: &mut DispatchContext,
         plan: &mut Option<ExecutionPlan>,
-        spec: &ResponseSpec,
+        spec: &mut Option<ResponseSpec>,
         stamp: &AttemptStamp,
         attempt: u32,
         last_attempt: bool,
     ) -> Result<Option<Response>, Response> {
         dctx.attempt = attempt;
+        let consumed = || {
+            error!(function = "run_attempt", "Execution plan already consumed");
+            error::internal_error("execution_plan_consumed", "Execution plan already consumed")
+        };
         if attempt > 0 {
             // Fresh worker selection per attempt; the retained plan is
             // re-stamped (engine ids, sampling defaults, the forced tool
@@ -580,10 +584,7 @@ impl RequestPipeline {
                 )
                 .await?,
             );
-            let retained = plan.as_mut().ok_or_else(|| {
-                error!(function = "run_attempt", "Execution plan already consumed");
-                error::internal_error("execution_plan_consumed", "Execution plan already consumed")
-            })?;
+            let retained = plan.as_mut().ok_or_else(consumed)?;
             helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
             if let Some(decoder) = dctx.response.stop_decoder.as_mut() {
                 decoder.reset();
@@ -591,23 +592,20 @@ impl RequestPipeline {
             dctx.response.execution_result = None;
         }
 
-        if let ResponseSpec::Decisions(spec) = spec {
+        if let Some(ResponseSpec::Decisions(spec)) = spec {
             if let Some(workers) = dctx.workers.as_ref() {
                 enforce_decisions_context_length(spec.max_input_tokens, workers, &dctx.model_id)?;
             }
         }
 
-        // The last allowed attempt moves the plan (no clone); earlier
-        // attempts dispatch a clone and retain the original for replay.
-        let attempt_plan = if last_attempt {
-            plan.take()
+        // The last allowed attempt moves the plan and the spec (no clone);
+        // earlier attempts dispatch a clone and retain the originals for replay.
+        let (attempt_plan, attempt_spec) = if last_attempt {
+            plan.take().zip(spec.take())
         } else {
-            plan.clone()
+            plan.clone().zip(spec.clone())
         }
-        .ok_or_else(|| {
-            error!(function = "run_attempt", "Execution plan already consumed");
-            error::internal_error("execution_plan_consumed", "Execution plan already consumed")
-        })?;
+        .ok_or_else(consumed)?;
 
         dctx.dispatch = Some(prepare_dispatch_metadata(
             &attempt_plan,
@@ -618,7 +616,7 @@ impl RequestPipeline {
         execute_plan(dctx, attempt_plan, last_attempt).await?;
         self.stages
             .response_processing
-            .process(dctx, spec.clone())
+            .process(dctx, attempt_spec)
             .await
             .inspect_err(|response| {
                 error!(
@@ -691,6 +689,7 @@ impl RequestPipeline {
 
         let max_attempts = retry_config.map_or(1, |config| config.max_retries.max(1));
         let mut plan = Some(plan);
+        let mut spec = Some(spec);
         let mut attempt: u32 = 0;
         loop {
             if attempt > 0 {
@@ -702,7 +701,14 @@ impl RequestPipeline {
 
             let last_attempt = attempt + 1 >= max_attempts;
             let mut failure = match self
-                .run_attempt(&mut dctx, &mut plan, &spec, &stamp, attempt, last_attempt)
+                .run_attempt(
+                    &mut dctx,
+                    &mut plan,
+                    &mut spec,
+                    &stamp,
+                    attempt,
+                    last_attempt,
+                )
                 .await
             {
                 Ok(Some(response)) => {
@@ -1624,6 +1630,7 @@ mod alias_pipeline_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
+        routers::grpc::regular::symphony::template::Templates,
         worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
     };
 
@@ -1673,6 +1680,7 @@ mod alias_pipeline_tests {
         );
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
@@ -1764,6 +1772,7 @@ mod request_release_tests {
                 SUPPORTS_VISION_LABEL,
             },
             proto_wrapper::ENGINE_ERROR_MESSAGE,
+            regular::symphony::template::Templates,
             utils::tonic_ext::TonicStatusExt,
         },
         worker::{
@@ -2195,6 +2204,7 @@ mod request_release_tests {
             )
         });
         Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
@@ -3745,6 +3755,7 @@ mod request_release_tests {
             )
         });
         Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
@@ -4224,6 +4235,7 @@ mod request_release_tests {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
         let components = Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(Arc::new(TokenizerRegistry::new()))),
             tokenizer_registry: Arc::new(TokenizerRegistry::new()),
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
@@ -4305,6 +4317,7 @@ mod rate_limit_reserve_tests {
     use crate::{
         config::types::RouterConfig,
         rate_limit::{RateLimitManager, Reservation, ReserveRequest},
+        routers::grpc::regular::symphony::template::Templates,
         tenant::TenantKey,
     };
 
@@ -4324,6 +4337,7 @@ mod rate_limit_reserve_tests {
             .await
             .unwrap();
         Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
