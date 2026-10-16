@@ -483,6 +483,43 @@ impl Said {
     }
 }
 
+/// How many bytes of a channel or an argument the report shows of a difference.
+const BRIEF: usize = 240;
+
+/// `text` cut to [`BRIEF`] bytes on a character boundary, with how much was cut.
+fn brief(text: &str) -> String {
+    if text.len() <= BRIEF {
+        return format!("{text:?}");
+    }
+    let cut = text
+        .char_indices()
+        .map(|(at, _)| at)
+        .take_while(|&at| at <= BRIEF)
+        .last()
+        .unwrap_or(0);
+    format!("{:?}… (+{} bytes)", &text[..cut], text.len() - cut)
+}
+
+impl fmt::Display for Said {
+    /// The report's rendering: each channel and argument cut to [`BRIEF`] bytes, so a report of a
+    /// long output stays readable and a run of a benchmark-scale set stays in memory.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let channel =
+            |part: &Option<String>| part.as_deref().map_or_else(|| "None".to_string(), brief);
+        write!(
+            f,
+            "content: {}, reasoning: {}, calls: [",
+            channel(&self.content),
+            channel(&self.reasoning)
+        )?;
+        for (at, (name, arguments)) in self.calls.iter().enumerate() {
+            let separator = if at == 0 { "" } else { ", " };
+            write!(f, "{separator}({name:?}, {})", brief(arguments))?;
+        }
+        write!(f, "], finish: {:?}", self.finish)
+    }
+}
+
 /// Whether two call lists name the same tools with the same arguments, the arguments compared as
 /// JSON values where both parse and as text otherwise.
 fn calls_equal(a: &[(String, String)], b: &[(String, String)]) -> bool {
@@ -1103,8 +1140,10 @@ fn model_in(manifest: &str) -> Option<String> {
 }
 
 /// Reads every `.jsonl` set under `dir`, in the files' order, every `every`-th case of each
-/// recorded set and the common set whole.
-fn read_fixtures(dir: &Path, every: usize) -> Result<Vec<Fixture>, String> {
+/// recorded set and the common set whole, and hands each case to `each` as it is read, so that a
+/// run holds one case of a set at a time however many models are in flight; how many it handed
+/// over.
+fn each_fixture(dir: &Path, every: usize, each: &mut dyn FnMut(Fixture)) -> Result<usize, String> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
         .filter_map(Result::ok)
@@ -1112,7 +1151,7 @@ fn read_fixtures(dir: &Path, every: usize) -> Result<Vec<Fixture>, String> {
         .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
         .collect();
     files.sort();
-    let mut fixtures = Vec::new();
+    let mut cases = 0;
     for file in files {
         let step = if file.file_stem().is_some_and(|stem| stem == COMMON_SET) {
             1
@@ -1127,13 +1166,14 @@ fn read_fixtures(dir: &Path, every: usize) -> Result<Vec<Fixture>, String> {
             if line.trim().is_empty() || !index.is_multiple_of(step) {
                 continue;
             }
-            fixtures.push(
+            each(
                 serde_json::from_str(&line)
                     .map_err(|e| format!("{}:{}: {e}", file.display(), index + 1))?,
             );
+            cases += 1;
         }
     }
-    Ok(fixtures)
+    Ok(cases)
 }
 
 /// The sample's step from [`SAMPLE_ENV`]: 1 when it is unset or empty.
@@ -1192,19 +1232,16 @@ fn replay_model(
     let Some(prompt) = Prompt::of(&slug) else {
         return Err(Skipped::NoPromptRow(slug, table));
     };
-    let fixtures = read_fixtures(&recorded.parse, every).unwrap_or_else(|e| panic!("{e}"));
     let factories = Factories::new().unwrap_or_else(|e| panic!("{e}"));
     let reach = Reach::of(legacy);
     let markers = think_markers(table);
-    let mut counts = Counts {
-        cases: fixtures.len(),
-        ..Counts::default()
-    };
+    let mut counts = Counts::default();
     let mut report = String::new();
     let mut shown = Shown::default();
     let mut failures = Vec::new();
     let mut equivalents_shown = 0;
-    for fixture in &fixtures {
+    let cases = each_fixture(&recorded.parse, every, &mut |fixture: Fixture| {
+        let fixture = &fixture;
         let text = fixture.reference.text.as_str();
         let tools = fixture.request.tools.as_slice();
         let tail = prompt.tail(&fixture.request, markers);
@@ -1273,7 +1310,7 @@ fn replay_model(
                     case.counts.legacy_drift.count(kind);
                     case.details.push_str(&format!(
                         "    {plan}: the legacy stream differs from the legacy whole parse\n      \
-                         whole:    {whole:?}\n      streamed: {streamed:?}\n"
+                         whole:    {whole}\n      streamed: {streamed}\n"
                     ));
                 }
             }
@@ -1282,7 +1319,7 @@ fn replay_model(
                     case.counts.symphony_drift.count(kind);
                     case.details.push_str(&format!(
                         "    {plan}: the table's stream differs from its whole parse\n      \
-                         whole:    {whole:?}\n      streamed: {streamed:?}\n"
+                         whole:    {whole}\n      streamed: {streamed}\n"
                     ));
                 }
             }
@@ -1294,7 +1331,9 @@ fn replay_model(
             report.push_str(&case.details);
             shown.differs(whole_verdict, &line, &case.details);
         }
-    }
+    })
+    .unwrap_or_else(|e| panic!("{e}"));
+    counts.cases = cases;
     let summary = format!("{slug} ({}, legacy {legacy:?}):\n{counts}", table.name());
     report.push_str(&summary);
     Ok(Replayed {
@@ -1362,8 +1401,8 @@ impl Case<'_> {
         if verdict.differs() || show_equivalent {
             if let (Some(symphony), Some(legacy)) = (&symphony, &legacy) {
                 self.details.push_str(&format!(
-                    "    {plan}: {}\n      symphony:  {symphony:?}\n      legacy:    {legacy:?}\n      \
-                     reference: {:?}\n",
+                    "    {plan}: {}\n      symphony:  {symphony}\n      legacy:    {legacy}\n      \
+                     reference: {}\n",
                     verdict.name(),
                     self.reference
                 ));
