@@ -580,10 +580,15 @@ impl WorkerMonitor {
             record.engine_reports_steps.unwrap_or(false),
             record.prefill_pending_tokens.map(u64::from),
         );
-        let single: HashMap<String, WorkerLoadResponse> =
-            HashMap::from([(url.clone(), (*response).clone())]);
-        for policy in self.policy_registry.get_all_load_aware_policies() {
-            policy.update_loads(&single);
+        // The registry keeps this list built; a record costs its walk, and
+        // the report's copy only when a policy takes it.
+        let load_aware_policies = self.policy_registry.get_all_load_aware_policies();
+        if !load_aware_policies.is_empty() {
+            let single: HashMap<String, WorkerLoadResponse> =
+                HashMap::from([(url.clone(), (*response).clone())]);
+            for policy in load_aware_policies.iter() {
+                policy.update_loads(&single);
+            }
         }
         Metrics::record_engine_load(&url, worker.model_id(), &response);
         // The DP-rank token cache takes a report with absolute token counts,
@@ -1539,7 +1544,7 @@ async fn poll_group_once(
         polled.len()
     );
 
-    for policy in &load_aware_policies {
+    for policy in load_aware_policies.iter() {
         policy.update_loads(&group_loads);
     }
     monitor.worker_load_manager.update_dp_loads(&group_dp_loads);
@@ -1661,7 +1666,7 @@ mod worker_monitor_tests {
     use crate::{
         config::types::PolicyConfig,
         observability::metrics::test_support::render_with_recorder,
-        policies::PolicyRegistry,
+        policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
         worker::{overload::OverloadThresholds, BasicWorkerBuilder, ConnectionMode, WorkerType},
     };
 
@@ -2059,6 +2064,71 @@ mod worker_monitor_tests {
         record.engine_silence_ms = None;
         monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
         assert!(worker.stall_reason().is_none(), "the engine produces again");
+    }
+
+    /// A policy that takes load reports and records them: the worker's URL
+    /// and the running count of each.
+    #[derive(Debug, Default)]
+    struct LoadRecorder(Mutex<Vec<(String, i32)>>);
+
+    impl LoadBalancingPolicy for LoadRecorder {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            (!workers.is_empty()).then_some(0)
+        }
+
+        fn update_loads(&self, loads: &HashMap<String, WorkerLoadResponse>) {
+            let mut seen = self.0.lock();
+            for (url, report) in loads {
+                seen.push((url.clone(), report.loads[0].num_running_reqs));
+            }
+        }
+
+        fn needs_backend_loads(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "load_recorder"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Every pushed record reaches each policy that takes load reports, in
+    /// the order pushed, and a policy the registry gains after the first
+    /// records gets the ones pushed from then on.
+    #[tokio::test]
+    async fn pushed_records_reach_the_load_aware_policies_in_order() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let first = Arc::new(LoadRecorder::default());
+        monitor
+            .policy_registry
+            .set_prefill_policy(Arc::clone(&first) as Arc<dyn LoadBalancingPolicy>);
+        for running in [3, 5] {
+            monitor.apply_pushed_load(&worker, 0, &pushed(running), Instant::now());
+        }
+        let second = Arc::new(LoadRecorder::default());
+        monitor
+            .policy_registry
+            .set_decode_policy(Arc::clone(&second) as Arc<dyn LoadBalancingPolicy>);
+        for running in [8, 13] {
+            monitor.apply_pushed_load(&worker, 0, &pushed(running), Instant::now());
+        }
+        let seen = |recorder: &LoadRecorder| recorder.0.lock().clone();
+        let report = |running: i32| ("grpc://w1:9000".to_string(), running);
+        assert_eq!(
+            seen(&first),
+            vec![report(3), report(5), report(8), report(13)]
+        );
+        assert_eq!(seen(&second), vec![report(8), report(13)]);
     }
 
     /// The overload veto's edges are INFO lines with the report's figures:

@@ -87,6 +87,9 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Whether routing consumes backend load snapshots, pushed via
     /// [`Self::update_loads`] or read from the monitor's watch feed. The
     /// `WorkerMonitor` skips backend load polling while no policy needs it.
+    /// The registry reads the answer when it builds its list of load-aware
+    /// policies, once per change of the registry, so it must hold for the
+    /// policy's lifetime.
     fn needs_backend_loads(&self) -> bool {
         false
     }

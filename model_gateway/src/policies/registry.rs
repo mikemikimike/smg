@@ -3,9 +3,10 @@ use std::{
     sync::{Arc, OnceLock, Weak},
 };
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use http::{header::HeaderName, HeaderMap};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 /// Policy Registry for managing model-to-policy mappings
@@ -52,6 +53,15 @@ impl RequestCompletionSink for PolicyCompletionSink {
 }
 
 /// Registry for managing model-to-policy mappings
+/// The policies that take backend load reports, kept built: the list under
+/// an `ArcSwap` for lock-free reads, and the lock that serialises its
+/// rebuilds, so of two registry changes that overlap the list that stays is
+/// the later rebuild's, which saw both.
+struct LoadAwareCache {
+    policies: ArcSwap<Vec<Arc<dyn LoadBalancingPolicy>>>,
+    rebuild: Mutex<()>,
+}
+
 #[derive(Clone)]
 pub struct PolicyRegistry {
     /// Model ID -> Policy instance mapping (lock-free reads via DashMap)
@@ -59,6 +69,12 @@ pub struct PolicyRegistry {
 
     /// Model ID -> Worker count for cleanup tracking (lock-free reads via DashMap)
     model_worker_counts: Arc<DashMap<String, usize>>,
+
+    /// The policies that take backend load reports, rebuilt when a policy
+    /// is added or removed and handed out as is in between: the load path
+    /// reads it once per pushed record, from every engine, many times a
+    /// second.
+    load_aware: Arc<LoadAwareCache>,
 
     /// Default policy instance (cached, immutable after creation)
     default_policy: Arc<dyn LoadBalancingPolicy>,
@@ -169,9 +185,13 @@ impl PolicyRegistry {
                 }
             })
             .collect();
-        Self {
+        let registry = Self {
             model_policies: Arc::new(DashMap::new()),
             model_worker_counts: Arc::new(DashMap::new()),
+            load_aware: Arc::new(LoadAwareCache {
+                policies: ArcSwap::from_pointee(Vec::new()),
+                rebuild: Mutex::new(()),
+            }),
             default_policy,
             default_policy_config,
             prefill_policy: Arc::new(OnceLock::new()),
@@ -184,7 +204,9 @@ impl PolicyRegistry {
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
-        }
+        };
+        registry.rebuild_load_aware();
+        registry
     }
 
     /// Set how strictly PD placement pairs prefill and decode descriptors.
@@ -586,6 +608,7 @@ impl PolicyRegistry {
             self.model_policies
                 .insert(model_id.to_string(), Arc::clone(&policy));
         });
+        self.rebuild_load_aware();
 
         policy
     }
@@ -643,6 +666,7 @@ impl PolicyRegistry {
                     policy.name(),
                     model_id
                 );
+                self.rebuild_load_aware();
             }
         }
     }
@@ -766,6 +790,7 @@ impl PolicyRegistry {
     pub fn clear(&self) {
         self.model_policies.clear();
         self.model_worker_counts.clear();
+        self.rebuild_load_aware();
     }
 
     /// Set the prefill policy for PD mode (set once at startup).
@@ -780,6 +805,7 @@ impl PolicyRegistry {
             // the policy should only be set once at startup
             let _ = self.prefill_policy.set(Arc::clone(&policy));
         });
+        self.rebuild_load_aware();
     }
 
     pub fn set_dp_rank_policy(&self, policy: Arc<dyn DPRankLoadPolicy>) {
@@ -805,6 +831,7 @@ impl PolicyRegistry {
             // the policy should only be set once at startup
             let _ = self.decode_policy.set(Arc::clone(&policy));
         });
+        self.rebuild_load_aware();
     }
 
     /// Set the encode policy for EPD mode (set once at startup).
@@ -819,6 +846,7 @@ impl PolicyRegistry {
             // the policy should only be set once at startup
             let _ = self.encode_policy.set(Arc::clone(&policy));
         });
+        self.rebuild_load_aware();
     }
 
     /// Get the prefill policy for PD mode, or default if not set (lock-free)
@@ -873,13 +901,34 @@ impl PolicyRegistry {
                 .any(|entry| needs_text(entry.value()))
     }
 
-    /// Get all load-aware policies that need periodic load updates (lock-free).
+    /// The policies that take backend load reports, shared: built when a
+    /// policy is added or removed (the default policy at construction, a
+    /// model's policy with its first and last worker, a PD or EPD leg when
+    /// set) and handed out as is in between, so the load path, which asks
+    /// once per pushed record from every engine, allocates nothing here.
     ///
     /// Membership is policy-reported via
-    /// [`LoadBalancingPolicy::needs_backend_loads`]: `power_of_two` and
-    /// `least_load` always consume load reports; `cache_aware` does when its
-    /// pressure knobs are configured.
-    pub fn get_all_load_aware_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+    /// [`LoadBalancingPolicy::needs_backend_loads`], read when the list is
+    /// built: `power_of_two`, `least_load` and `cache_aware` consume load
+    /// reports.
+    pub fn get_all_load_aware_policies(&self) -> Arc<Vec<Arc<dyn LoadBalancingPolicy>>> {
+        self.load_aware.policies.load_full()
+    }
+
+    /// Rebuild the shared load-aware list from the registry's policies,
+    /// after one of them changed. Rebuilds are serialised: the list that
+    /// stays is the last rebuild's, which began after every change whose
+    /// rebuild came before it.
+    fn rebuild_load_aware(&self) {
+        let _serial = self.load_aware.rebuild.lock();
+        let policies = self.collect_load_aware_policies();
+        self.load_aware.policies.store(Arc::new(policies));
+    }
+
+    /// Walk the policies for those that take backend load reports: the
+    /// default policy, the PD and EPD legs, then the per-model policies,
+    /// each instance once.
+    fn collect_load_aware_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
         let mut policies = Vec::new();
 
         if self.default_policy.needs_backend_loads() {
@@ -1017,7 +1066,7 @@ impl PolicyRegistry {
     /// without this their caches would grow unbounded under worker churn.
     /// Called on worker removal alongside the cache-aware cleanup above.
     pub fn remove_worker_from_load_aware(&self, worker_url: &str) {
-        for policy in self.get_all_load_aware_policies() {
+        for policy in self.get_all_load_aware_policies().iter() {
             policy.remove_worker(worker_url);
         }
     }
@@ -2167,6 +2216,59 @@ mod tests {
             let registry = PolicyRegistry::new(pressured);
             assert_eq!(registry.get_all_load_aware_policies().len(), 1);
         }
+    }
+
+    /// The load-aware list is handed out as is between changes of the
+    /// registry and follows them: a model's policy that takes load reports
+    /// joins it with the model's first worker and leaves it with the last,
+    /// a PD leg joins it when set, and `clear` drops the per-model part.
+    #[test]
+    fn the_load_aware_list_is_shared_and_follows_the_registry() {
+        use crate::policies::PowerOfTwoPolicy;
+
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let empty = registry.get_all_load_aware_policies();
+        assert!(empty.is_empty());
+        assert!(
+            Arc::ptr_eq(&empty, &registry.get_all_load_aware_policies()),
+            "the same list between changes"
+        );
+
+        let first = registry.on_worker_added("m1", Some("power_of_two"));
+        let with_first = registry.get_all_load_aware_policies();
+        assert_eq!(with_first.len(), 1);
+        assert!(Arc::ptr_eq(&with_first[0], &first));
+
+        // A second worker of the model, and a model on a policy that reads
+        // no loads, leave the list's members as they are.
+        registry.on_worker_added("m1", Some("power_of_two"));
+        registry.on_worker_added("m2", Some("round_robin"));
+        let unchanged = registry.get_all_load_aware_policies();
+        assert_eq!(unchanged.len(), 1);
+        assert!(Arc::ptr_eq(&unchanged[0], &first));
+
+        let leg: Arc<dyn LoadBalancingPolicy> = Arc::new(PowerOfTwoPolicy::new());
+        registry.set_prefill_policy(Arc::clone(&leg));
+        let with_leg = registry.get_all_load_aware_policies();
+        assert_eq!(with_leg.len(), 2);
+        assert!(with_leg.iter().any(|p| Arc::ptr_eq(p, &leg)));
+
+        registry.on_worker_removed("m1");
+        assert!(
+            Arc::ptr_eq(&with_leg, &registry.get_all_load_aware_policies()),
+            "one worker of the model left"
+        );
+        registry.on_worker_removed("m1");
+        let after_last = registry.get_all_load_aware_policies();
+        assert_eq!(after_last.len(), 1);
+        assert!(Arc::ptr_eq(&after_last[0], &leg));
+
+        registry.on_worker_added("m3", Some("power_of_two"));
+        assert_eq!(registry.get_all_load_aware_policies().len(), 2);
+        registry.clear();
+        let cleared = registry.get_all_load_aware_policies();
+        assert_eq!(cleared.len(), 1);
+        assert!(Arc::ptr_eq(&cleared[0], &leg));
     }
 
     #[test]
