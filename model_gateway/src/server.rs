@@ -2178,9 +2178,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let handle = axum_server::Handle::new();
     let handle_clone = handle.clone();
+    let data_stop = handle.clone();
     // The admin listener's handle: it drains with the data listener's.
     let admin_handle = axum_server::Handle::new();
     let admin_handle_clone = admin_handle.clone();
+    let admin_stop = admin_handle.clone();
     let inflight_tracker = app_context.inflight_tracker.clone();
     let grace = Duration::from_secs(config.shutdown_grace_period_secs);
     // Keep accepting for a short settle window before gating, so requests still
@@ -2294,8 +2296,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 .serve(app),
         )
     };
-    let (server_result, admin_result) = tokio::join!(data_serving, admin_serving);
-    if let Err(e) = admin_result {
+    // Until both listeners have stopped; one that fails stops the other
+    // (see `serve_together`), so the gateway is never half-served.
+    let (server_result, admin_result) = serve_together(
+        data_serving,
+        admin_serving,
+        move || data_stop.graceful_shutdown(Some(drain_timeout)),
+        move || admin_stop.graceful_shutdown(Some(drain_timeout)),
+    )
+    .await;
+    if let Err(e) = &admin_result {
         error!("Admin listener stopped with an error: {e}");
     }
 
@@ -2312,8 +2322,128 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     info!("Cleanup complete. Process exiting.");
 
-    // Return original server error if any, otherwise Ok
-    server_result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    // The data listener's error if any, else the admin listener's, else Ok.
+    match (server_result, admin_result) {
+        (Err(e), _) | (Ok(()), Err(e)) => Err(Box::new(e) as Box<dyn std::error::Error>),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+/// Both listeners, until both have stopped. The normal end is the shutdown
+/// signal, which closes both handles together, so each ends by itself. A
+/// listener that stops on its own with an error (its accept loop failed)
+/// must not leave the gateway half-served, the data routes up with the
+/// control plane gone or the other way round: `stop_data` / `stop_admin`
+/// (a graceful shutdown of the other handle) is called, the other listener
+/// is awaited, and both results come back for the caller to report.
+async fn serve_together(
+    data: Serving,
+    admin: Serving,
+    stop_data: impl FnOnce(),
+    stop_admin: impl FnOnce(),
+) -> (std::io::Result<()>, std::io::Result<()>) {
+    tokio::pin!(data);
+    tokio::pin!(admin);
+    tokio::select! {
+        data_result = &mut data => {
+            if data_result.is_err() {
+                stop_admin();
+            }
+            (data_result, admin.await)
+        }
+        admin_result = &mut admin => {
+            if admin_result.is_err() {
+                stop_data();
+            }
+            (data.await, admin_result)
+        }
+    }
+}
+
+#[cfg(test)]
+mod serve_together_tests {
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use tokio::sync::oneshot;
+
+    use super::{serve_together, Serving};
+
+    /// A listener that fails at once, one that ends when told to, and one
+    /// that ends by itself a moment later.
+    fn failing() -> Serving {
+        Box::pin(async { Err(std::io::Error::other("accept failed")) })
+    }
+    fn until_stopped() -> (Serving, oneshot::Sender<()>) {
+        let (tx, rx) = oneshot::channel::<()>();
+        let serving: Serving = Box::pin(async move {
+            let _ = rx.await;
+            Ok(())
+        });
+        (serving, tx)
+    }
+    fn ending_by_itself() -> Serving {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(())
+        })
+    }
+
+    /// The failing listener's error comes back with the other's clean end,
+    /// after the other was told to stop.
+    #[tokio::test]
+    async fn a_listener_that_fails_stops_the_other() {
+        for data_fails in [true, false] {
+            let (other, stop) = until_stopped();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let told = {
+                let stopped = Arc::clone(&stopped);
+                move || {
+                    stopped.store(true, Ordering::SeqCst);
+                    let _ = stop.send(());
+                }
+            };
+            let not_told = || panic!("the failing listener is not the one to stop");
+            let (data, admin) = if data_fails {
+                serve_together(failing(), other, not_told, told).await
+            } else {
+                serve_together(other, failing(), told, not_told).await
+            };
+            let (failed, clean) = if data_fails {
+                (data, admin)
+            } else {
+                (admin, data)
+            };
+            assert_eq!(
+                failed.expect_err("the failure").to_string(),
+                "accept failed",
+                "data_fails = {data_fails}"
+            );
+            clean.expect("the other listener ended cleanly once told");
+            assert!(stopped.load(Ordering::SeqCst), "data_fails = {data_fails}");
+        }
+    }
+
+    /// A listener that ends cleanly (the shutdown signal's doing) tells the
+    /// other nothing; the other ends by itself, as the signal closes both.
+    #[tokio::test]
+    async fn a_clean_end_leaves_the_other_to_end_by_itself() {
+        let ready: Serving = Box::pin(async { Ok(()) });
+        let (data, admin) = serve_together(
+            ready,
+            ending_by_itself(),
+            || panic!("nothing to stop"),
+            || panic!("nothing to stop"),
+        )
+        .await;
+        data.expect("clean");
+        admin.expect("ended by itself");
+    }
 }
 
 /// The plain-HTTP acceptor: Nagle buffering disabled on accepted sockets so

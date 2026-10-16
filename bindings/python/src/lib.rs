@@ -924,8 +924,11 @@ impl Router {
         };
         let has_discovery = discovery.is_some();
 
-        let metrics = self.prometheus_port.map(|port| MetricsConfig {
-            port,
+        // The metrics listener `start` creates: its port when unset is the
+        // exporter's default, so the validator's port checks (the admin,
+        // probe and data ports against it) see the listener that will bind.
+        let metrics = Some(MetricsConfig {
+            port: self.prometheus_port.unwrap_or(29000),
             host: self.metrics_host(),
         });
 
