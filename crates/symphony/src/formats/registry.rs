@@ -18,6 +18,8 @@
 //! renamed checkpoint (`Qwen3-8B-FP8`) is not matched and gives `None`, so the gateway keeps its
 //! older parsers for it until its group lists the name under `also`.
 
+use std::{collections::HashMap, sync::OnceLock};
+
 use super::{
     deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest,
     json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
@@ -256,12 +258,6 @@ impl Group {
     /// The group's checkpoints, by repository name: the primary first.
     fn repositories(&self) -> impl Iterator<Item = &'static str> {
         std::iter::once(repository(self.model)).chain(self.also.iter().map(|also| repository(also)))
-    }
-
-    /// Whether `repository` names one of the group's checkpoints, in any case.
-    fn holds(&self, repository: &str) -> bool {
-        self.repositories()
-            .any(|own| own.eq_ignore_ascii_case(repository))
     }
 }
 
@@ -1193,13 +1189,32 @@ const GROUPS: &[Group] = &[
     },
 ];
 
+/// The groups by the lower-cased repository names they hold, built once: the
+/// first group in [`GROUPS`] that holds a name keeps it, as the scan it
+/// replaces found the first. A lookup on every request used to walk all the
+/// groups and split each of their names again.
+fn groups_by_repository() -> &'static HashMap<String, &'static Group> {
+    static INDEX: OnceLock<HashMap<String, &'static Group>> = OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut index = HashMap::new();
+        for group in GROUPS {
+            for name in group.repositories() {
+                index.entry(name.to_ascii_lowercase()).or_insert(group);
+            }
+        }
+        index
+    })
+}
+
 /// The group that holds `model`, by its repository name.
 fn group_for(model: &str) -> Option<&'static Group> {
     let repository = repository(model);
     if repository.is_empty() {
         return None;
     }
-    GROUPS.iter().find(|group| group.holds(repository))
+    groups_by_repository()
+        .get(&repository.to_ascii_lowercase())
+        .copied()
 }
 
 /// The table that reads `model`'s output, with the model's own turn opener where its template has
