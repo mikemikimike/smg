@@ -22,7 +22,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+reasoning-parser.workspace = true
 regex = "1.12"
+tokio = { workspace = true, features = ["rt"] }
+tool-parser.workspace = true
 
 [lints]
 workspace = true

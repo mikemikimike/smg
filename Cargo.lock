@@ -8151,10 +8151,13 @@ name = "smg-symphony"
 version = "0.1.0"
 dependencies = [
  "openai-protocol",
+ "reasoning-parser",
  "regex",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
+ "tool-parser",
 ]
 
 [[package]]
