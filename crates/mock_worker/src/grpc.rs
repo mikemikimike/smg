@@ -218,10 +218,9 @@ impl TokenSpeedScheduler for MockScheduler {
                 }
             }
             let cut = injected.and_then(|fault| {
-                let end = if fault.finish_error {
-                    CutEnd::EngineError
-                } else {
-                    CutEnd::Status(injected_status(fault.status))
+                let end = match fault.finish {
+                    Some(reason) => CutEnd::Finish(reason),
+                    None => CutEnd::Status(injected_status(fault.status)),
                 };
                 fault
                     .after_tokens
@@ -514,9 +513,10 @@ fn injected_status(status: u16) -> Status {
 enum CutEnd {
     /// The gRPC status the stream ends with.
     Status(Status),
-    /// A `Complete` whose finish reason is `error`, as an engine that failed
-    /// the request sends it: the output so far, no status.
-    EngineError,
+    /// A `Complete` of this finish reason, as an engine that failed the
+    /// request (`error`) or a worker stopped under it (`abort`) sends it: the
+    /// output so far, no status.
+    Finish(&'static str),
 }
 
 /// The generate stream's state between items.
@@ -598,15 +598,15 @@ fn generate_stream(
                         if st.output_ids.len() > *after as usize {
                             let item = match end {
                                 CutEnd::Status(status) => Err(status.clone()),
-                                CutEnd::EngineError => {
+                                CutEnd::Finish(reason) => {
                                     // The output the engine had produced
-                                    // before it failed: the tokens it sent.
+                                    // before the end: the tokens it sent.
                                     st.output_ids.truncate(*after as usize);
                                     Ok(ts::GenerateResponse {
                                         request_id: st.request_id.clone(),
                                         response: Some(GenResp::Complete(ts::GenerateComplete {
                                             output_ids: std::mem::take(&mut st.output_ids),
-                                            finish_reason: "error".to_string(),
+                                            finish_reason: reason.to_string(),
                                             prompt_tokens,
                                             completion_tokens: *after,
                                             cached_tokens,
@@ -1052,7 +1052,7 @@ mod tests {
         tx.send(done(4)).unwrap();
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
-        let cut = Some((2, CutEnd::EngineError, Arc::clone(&cuts)));
+        let cut = Some((2, CutEnd::Finish("error"), Arc::clone(&cuts)));
         let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);

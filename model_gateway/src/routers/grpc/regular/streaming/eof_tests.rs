@@ -23,7 +23,10 @@ use tool_parser::types::ToolCallItem;
 
 use super::*;
 use crate::{
-    routers::{common::sse::SseReceiver, grpc::regular::processor::ResponseProcessor},
+    routers::{
+        common::sse::SseReceiver,
+        grpc::{proto_wrapper::ENGINE_ABORT_MESSAGE, regular::processor::ResponseProcessor},
+    },
     worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         BasicWorkerBuilder, Worker, WorkerRegistry,
@@ -3375,6 +3378,16 @@ async fn chat_stream_cut_by_the_engine_is_an_upstream_failure_with_the_tokens_so
 /// worker the stream was read from (its breaker opens on the first failure).
 async fn frames_of_a_chat_stream_cut_with(status: tonic::Status) -> (Vec<String>, Arc<dyn Worker>) {
     let (stream, server) = cut_stream(vec![chunk(0, "Hi")], status).await;
+    frames_of_a_chat_stream(stream, server).await
+}
+
+/// The SSE frames the client read from `stream` through
+/// `process_streaming_response`, and the worker the stream was read from
+/// (its breaker opens on the first failure).
+async fn frames_of_a_chat_stream(
+    stream: ProtoStream,
+    server: JoinHandle<()>,
+) -> (Vec<String>, Arc<dyn Worker>) {
     let worker = breaker_worker();
     let selection = context::WorkerSelection::Single {
         worker: Arc::clone(&worker),
@@ -3435,6 +3448,66 @@ async fn chat_stream_cut_by_the_engine_ends_with_a_stream_error_event_then_done(
     );
     // The worker that ended the stream is charged the failure.
     assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+}
+
+#[tokio::test]
+async fn chat_stream_aborted_by_the_engine_ends_with_a_stream_error_event_then_done() {
+    // The worker was stopped under the request: its stream ends with a
+    // Complete of finish reason `abort` and the output so far. The client
+    // gets the worker's failure, not a finish chunk it could not tell from a
+    // short answer's.
+    let (stream, server) = scripted_stream(vec![chunk(0, "Hi"), complete(0, "abort")], "0").await;
+    let (frames, worker) = frames_of_a_chat_stream(stream, server).await;
+    let error = error_event_before_done(&frames);
+    assert_eq!(error["error"]["type"], "stream_error");
+    assert_eq!(
+        error["error"]["message"],
+        format!("Stream error: {ENGINE_ABORT_MESSAGE}")
+    );
+    assert!(
+        frames
+            .iter()
+            .all(|frame| !frame.contains("\"finish_reason\":\"abort\"")),
+        "no finish chunk of reason abort: {frames:?}"
+    );
+    assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+}
+
+#[tokio::test]
+async fn chat_whole_answer_aborted_by_the_engine_is_the_workers_failure_not_a_completion() {
+    // The same stream read into a whole answer: the status's class, a 503
+    // with an error body, as a request the stopped worker never started gets.
+    let (stream, server) = scripted_stream(vec![chunk(0, "Hel"), complete(0, "abort")], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, false);
+    let response = ResponseProcessor::new(
+        ToolParserFactory::new(),
+        ReasoningParserFactory::new(),
+        utils::ParserResolver::disabled(),
+    )
+    .process_non_streaming_chat_response(
+        context::ExecutionResult::Single { stream },
+        chat_spec(false),
+        dispatch(),
+        tokenizer,
+        &mut decoder,
+        false,
+    )
+    .await
+    .expect_err("an aborted request is not a completion");
+    server.abort();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("the error body");
+    let body: Value = serde_json::from_slice(&body).expect("a JSON error body");
+    assert_eq!(body["error"]["code"], "worker_stream_failed", "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        format!("Single stream failed: {ENGINE_ABORT_MESSAGE}"),
+        "{body}"
+    );
+    assert!(body.get("choices").is_none(), "{body}");
 }
 
 #[tokio::test]

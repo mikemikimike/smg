@@ -2065,26 +2065,39 @@ impl ProtoGenerateResponse {
 
     /// Whether this is a `Complete` the engine finished with reason `"error"`.
     pub fn engine_error(&self) -> bool {
+        self.completed_with("error")
+    }
+
+    /// Whether this is a `Complete` the engine finished with reason
+    /// `"abort"`: the request was aborted at the engine before it completed
+    /// (its worker stopped or restarted under it, or ended it on an abort),
+    /// with whatever output it had by then.
+    pub fn engine_abort(&self) -> bool {
+        self.completed_with("abort")
+    }
+
+    /// Whether this is a `Complete` whose finish reason is `reason`.
+    fn completed_with(&self, reason: &str) -> bool {
         match self {
             Self::Sglang(resp) => matches!(
                 &resp.response,
-                Some(sglang::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+                Some(sglang::generate_response::Response::Complete(c)) if c.finish_reason == reason
             ),
             Self::Vllm(resp) => matches!(
                 &resp.response,
-                Some(vllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+                Some(vllm::generate_response::Response::Complete(c)) if c.finish_reason == reason
             ),
             Self::Trtllm(resp) => matches!(
                 &resp.response,
-                Some(trtllm::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+                Some(trtllm::generate_response::Response::Complete(c)) if c.finish_reason == reason
             ),
             Self::Mlx(resp) => matches!(
                 &resp.response,
-                Some(mlx::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+                Some(mlx::generate_response::Response::Complete(c)) if c.finish_reason == reason
             ),
             Self::TokenSpeed(resp) => matches!(
                 &resp.response,
-                Some(tokenspeed::generate_response::Response::Complete(c)) if c.finish_reason == "error"
+                Some(tokenspeed::generate_response::Response::Complete(c)) if c.finish_reason == reason
             ),
         }
     }
@@ -3279,13 +3292,28 @@ mod tracked_tests {
 pub(crate) const ENGINE_ERROR_MESSAGE: &str =
     "engine finished the request with an error (see engine logs)";
 
-/// Surface an engine-side failure (`finish_reason == "error"`) as a stream error, like the ZMQ lane.
+/// The message of the `Unavailable` status a stream ends with when the
+/// engine aborted the request before it completed: its worker was stopped or
+/// restarted under the request, or ended it on an abort. The client gets the
+/// status's class (a 503, retryable, as a request the stopped worker never
+/// started gets), not a completed answer with `finish_reason: "abort"`,
+/// which no client can tell from a short one.
+pub(crate) const ENGINE_ABORT_MESSAGE: &str =
+    "engine aborted the request before it completed (the worker was stopped or restarted)";
+
+/// Surface an engine-side failure as a stream error, like the ZMQ lane: a
+/// `Complete` with finish reason `error` (the engine failed the request) and
+/// one with `abort` (the engine aborted it before it completed) are the end
+/// of a request that did not complete, not answers.
 fn reject_engine_error(
     item: Result<ProtoGenerateResponse, tonic::Status>,
 ) -> Result<ProtoGenerateResponse, tonic::Status> {
     match item {
         Ok(response) if response.engine_error() => {
             Err(tonic::Status::internal(ENGINE_ERROR_MESSAGE))
+        }
+        Ok(response) if response.engine_abort() => {
+            Err(tonic::Status::unavailable(ENGINE_ABORT_MESSAGE))
         }
         item => item,
     }
@@ -4157,6 +4185,38 @@ mod engine_error_tests {
         }
         let passed = reject_engine_error(Err(tonic::Status::unavailable("leg died")));
         assert!(matches!(passed, Err(status) if status.code() == tonic::Code::Unavailable));
+    }
+
+    #[test]
+    fn engine_abort_is_true_only_for_complete_with_abort_finish_reason() {
+        assert!(completes("abort")
+            .iter()
+            .all(ProtoGenerateResponse::engine_abort));
+        for reason in ["stop", "length", "error", ""] {
+            assert!(!completes(reason)
+                .iter()
+                .any(ProtoGenerateResponse::engine_abort));
+        }
+    }
+
+    #[test]
+    fn reject_engine_error_turns_abort_complete_into_unavailable_status() {
+        // The request did not complete: the worker was stopped under it, or
+        // the engine ended it on an abort. Its end is the stream's failure,
+        // of the class a request the stopped worker never started gets, not
+        // a completion a client would read as a short answer.
+        for response in completes("abort") {
+            let Err(status) = reject_engine_error(Ok(response)) else {
+                panic!("an aborted request must not pass through as a completion");
+            };
+            assert_eq!(status.code(), tonic::Code::Unavailable);
+            assert_eq!(status.message(), ENGINE_ABORT_MESSAGE);
+        }
+        for reason in ["stop", "length"] {
+            for response in completes(reason) {
+                assert!(reject_engine_error(Ok(response)).is_ok());
+            }
+        }
     }
 }
 

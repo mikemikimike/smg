@@ -147,7 +147,7 @@ fn status_json(e: &Engine) -> Value {
         "fail_pending": fail_pending,
         "fail_secs_left": fail_secs_left,
         "fail_after_tokens": fail.and_then(|f| f.after_tokens),
-        "fail_finish_error": fail.is_some_and(|f| f.finish_error),
+        "fail_finish": fail.and_then(|f| f.finish),
         "fail_stall_ms": fail.map_or(0, |f| f.stall.as_millis() as u64),
         "failed_total": s.failed_total,
         "cut_total": s.cut_total,
@@ -193,22 +193,27 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
     let secs: Option<f64> = optional(q, "secs")?;
     let mut after_tokens: Option<u32> = optional(q, "after_tokens")?;
     let stall_ms: u64 = optional(q, "stall_ms")?.unwrap_or(0);
-    let finish_error = match q.get("finish").map(String::as_str) {
-        None => false,
-        Some("error") => true,
-        Some(other) => return Err(format!("finish must be \"error\", got {other}")),
+    let finish = match q.get("finish").map(String::as_str) {
+        None => None,
+        Some("error") => Some("error"),
+        Some("abort") => Some("abort"),
+        Some(other) => {
+            return Err(format!(
+                "finish must be \"error\" or \"abort\", got {other}"
+            ))
+        }
     };
     if status != 0 && !(400..=599).contains(&status) {
         return Err(format!(
             "status must be 0 or an error status (400-599), got {status}"
         ));
     }
-    if finish_error {
+    if finish.is_some() {
         after_tokens = Some(after_tokens.unwrap_or(0));
     } else if status == 0 && after_tokens.is_some() {
         return Err("after_tokens needs a status to cut the stream with".to_string());
     }
-    if status == 0 && stall_ms == 0 && !finish_error {
+    if status == 0 && stall_ms == 0 && finish.is_none() {
         return Ok(None);
     }
     let scope = match (count, secs) {
@@ -227,7 +232,7 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
         status,
         stall: Duration::from_millis(stall_ms),
         after_tokens,
-        finish_error,
+        finish,
         scope,
     }))
 }
