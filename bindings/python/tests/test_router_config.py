@@ -542,3 +542,28 @@ class TestControlPlaneAuthHalfJwt:
         with pytest.raises(ValueError, match="jwt-issuer"):
             build_control_plane_auth_config({"jwt_audience": "aud"})
         assert build_control_plane_auth_config({}) is None
+
+
+class TestDataPlaneJwt:
+    """The data-plane JWT check needs the JWT configuration it validates with,
+    and reaches the Rust router as keyword arguments after the positional ones."""
+
+    def test_the_check_without_a_jwt_configuration_is_refused(self):
+        with pytest.raises(ValueError, match="data_plane_jwt needs jwt_issuer"):
+            build_control_plane_auth_config({"data_plane_jwt": True})
+        config = build_control_plane_auth_config(
+            {
+                "data_plane_jwt": True,
+                "jwt_issuer": "https://issuer.example",
+                "jwt_audience": "aud",
+            }
+        )
+        assert config is not None and config.jwt is not None
+
+    def test_keyword_arguments_are_accepted(self):
+        import inspect
+
+        params = inspect.signature(_Router).parameters
+        assert params["data_plane_jwt"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params["jwt_tenant_claim"].kind is inspect.Parameter.KEYWORD_ONLY
+        _Router(worker_urls=[], data_plane_jwt=True, jwt_tenant_claim="org")

@@ -293,6 +293,7 @@ impl ConfigValidator {
         Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
+        Self::validate_data_plane_jwt(config)?;
         Self::validate_memory_history(config)?;
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
@@ -636,6 +637,26 @@ impl ConfigValidator {
             }
         }
 
+        Ok(())
+    }
+
+    /// Validates `data_plane_jwt`: the tenant claim is a claim name
+    /// (non-empty, without whitespace). That a JWT issuer and audience are
+    /// configured with it is checked where the control-plane configuration is
+    /// in view, by `server::startup` on every construction path.
+    fn validate_data_plane_jwt(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(jwt) = &config.data_plane_jwt else {
+            return Ok(());
+        };
+        let claim = &jwt.tenant_claim;
+        if claim.is_empty() || claim.chars().any(char::is_whitespace) {
+            return Err(ConfigError::InvalidValue {
+                field: "data_plane_jwt.tenant_claim".to_string(),
+                value: claim.clone(),
+                reason: "the tenant claim must be a claim name: non-empty, without whitespace"
+                    .to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -2823,6 +2844,37 @@ mod tests {
                 Err(ConfigError::ValidationFailed { ref reason })
                     if reason.contains("routing_key_override.headers")
             ));
+        }
+    }
+
+    /// The tenant claim of the data-plane JWT check is a claim name.
+    #[test]
+    fn the_data_plane_jwt_tenant_claim_is_a_claim_name() {
+        use crate::config::DataPlaneJwtConfig;
+
+        let mut config = regular_mode_config();
+        config.data_plane_jwt = Some(DataPlaneJwtConfig::default());
+        assert!(
+            ConfigValidator::validate(&config).is_ok(),
+            "the default claim"
+        );
+        config.data_plane_jwt = Some(DataPlaneJwtConfig {
+            tenant_claim: "https://claims.example.com/org".to_string(),
+        });
+        assert!(
+            ConfigValidator::validate(&config).is_ok(),
+            "a namespaced claim"
+        );
+
+        for claim in ["", " ", "ten ant", "tenant\n"] {
+            config.data_plane_jwt = Some(DataPlaneJwtConfig {
+                tenant_claim: claim.to_string(),
+            });
+            let err = ConfigValidator::validate(&config).expect_err(claim);
+            assert!(
+                matches!(&err, ConfigError::InvalidValue { field, .. } if field == "data_plane_jwt.tenant_claim"),
+                "{claim:?}: {err}"
+            );
         }
     }
 

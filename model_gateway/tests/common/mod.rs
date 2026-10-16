@@ -2,6 +2,7 @@
 #![allow(dead_code, clippy::allow_attributes, clippy::large_futures)]
 
 pub mod gateway_launch;
+pub mod jwks;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;

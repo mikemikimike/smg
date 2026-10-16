@@ -21,6 +21,7 @@ use std::{
 
 use jsonwebtoken::{
     decode, decode_header,
+    errors::ErrorKind,
     jwk::{AlgorithmParameters, Jwk},
     Algorithm, DecodingKey, TokenData, Validation,
 };
@@ -72,6 +73,71 @@ pub enum JwtValidatorError {
 
     #[error("Token replay detected: JTI '{0}' has already been used")]
     TokenReplay(String),
+}
+
+/// Why a token was refused, in terms a client may be told: the categories a
+/// caller can act on (renew an expired token, wait for one not yet valid,
+/// obtain one for this audience or from this issuer, present one signed by a
+/// published key) and one for everything else, whose reason stays in the
+/// server's log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JwtRefusal {
+    /// `exp` has passed, leeway included.
+    Expired,
+    /// `nbf` lies ahead, leeway included.
+    NotYetValid,
+    /// The audience is not the configured one.
+    Audience,
+    /// The issuer is not the configured one.
+    Issuer,
+    /// The token names no key, or one the key set does not publish.
+    UnknownKey,
+    /// Anything else: a bad signature, a malformed token, an algorithm the
+    /// key does not allow.
+    Rejected,
+}
+
+impl JwtRefusal {
+    /// The category as a short phrase.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "token expired",
+            Self::NotYetValid => "token not yet valid",
+            Self::Audience => "audience not accepted",
+            Self::Issuer => "issuer not accepted",
+            Self::UnknownKey => "signing key not known",
+            Self::Rejected => "token rejected",
+        }
+    }
+}
+
+impl std::fmt::Display for JwtRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl JwtValidatorError {
+    /// The category of this refusal (see [`JwtRefusal`]).
+    pub fn refusal(&self) -> JwtRefusal {
+        match self {
+            Self::DecodeFailed(e) => match e.kind() {
+                ErrorKind::ExpiredSignature => JwtRefusal::Expired,
+                ErrorKind::ImmatureSignature => JwtRefusal::NotYetValid,
+                ErrorKind::InvalidAudience => JwtRefusal::Audience,
+                ErrorKind::InvalidIssuer => JwtRefusal::Issuer,
+                _ => JwtRefusal::Rejected,
+            },
+            Self::MissingKid | Self::KeyError(_) => JwtRefusal::UnknownKey,
+            Self::InvalidFormat
+            | Self::UnsupportedAlgorithm(_)
+            | Self::ValidationFailed(_)
+            | Self::RoleExtractionFailed
+            | Self::NoRoleMapping(_)
+            | Self::AlgorithmMismatch { .. }
+            | Self::TokenReplay(_) => JwtRefusal::Rejected,
+        }
+    }
 }
 
 /// Standard JWT claims we extract.
@@ -157,6 +223,31 @@ pub struct ValidatedToken {
 
     /// Display name if present
     pub name: Option<String>,
+
+    /// The token's claims by name, as carried: the registered `sub`, `iss`
+    /// and `jti`, the common `email`, `name` and `preferred_username`, and
+    /// every claim beyond those (roles, groups, a tenant, scopes).
+    claims: HashMap<String, serde_json::Value>,
+}
+
+impl ValidatedToken {
+    /// The claim `name` as the token carried it, `None` when absent. The
+    /// registered time claims (`exp`, `iat`, `nbf`) and the audience were
+    /// checked at validation and are not kept.
+    pub fn claim(&self, name: &str) -> Option<&serde_json::Value> {
+        self.claims.get(name)
+    }
+}
+
+/// Whether a validation reads the role claim: the control plane maps it to
+/// a gateway role; the serving routes have no roles, so a token without one
+/// is nothing to remark on there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoleSource {
+    /// The role claim and its mapping, `User` when neither names a role.
+    Claims,
+    /// No role is read; the token's role is `User`.
+    NotRead,
 }
 
 /// JTI (JWT ID) cache entry with expiration tracking.
@@ -262,8 +353,27 @@ impl JwtValidator {
         ))
     }
 
-    /// Validate a JWT token and extract claims.
+    /// Validate a JWT token and extract claims, the role among them.
     pub async fn validate(&self, token: &str) -> Result<ValidatedToken, JwtValidatorError> {
+        self.validate_with(token, RoleSource::Claims).await
+    }
+
+    /// Validate a JWT token for its identity only: the same signature,
+    /// issuer, audience and time checks as [`Self::validate`], without reading
+    /// a role (the token's role is `User`). For callers that map a claim to
+    /// an identity and have no roles, such as the serving routes.
+    pub async fn validate_identity(
+        &self,
+        token: &str,
+    ) -> Result<ValidatedToken, JwtValidatorError> {
+        self.validate_with(token, RoleSource::NotRead).await
+    }
+
+    async fn validate_with(
+        &self,
+        token: &str,
+        role_source: RoleSource,
+    ) -> Result<ValidatedToken, JwtValidatorError> {
         // Decode header to get kid and algorithm
         let header = decode_header(token)?;
         let kid = header.kid.ok_or(JwtValidatorError::MissingKid)?;
@@ -327,19 +437,46 @@ impl JwtValidator {
             .unwrap_or_else(|| self.config.issuer.clone());
 
         // Extract role
-        let role = self.extract_role(&claims);
+        let role = match role_source {
+            RoleSource::Claims => self.extract_role(&claims),
+            RoleSource::NotRead => Role::User,
+        };
 
         debug!(
             "JWT validated: subject={}, issuer={}, role={:?}",
             subject, issuer, role
         );
 
+        let StandardClaims {
+            sub,
+            iss,
+            jti,
+            email,
+            name,
+            preferred_username,
+            mut extra,
+            ..
+        } = claims;
+        for (claim, value) in [
+            ("sub", sub),
+            ("iss", iss),
+            ("jti", jti),
+            ("email", email.clone()),
+            ("name", name.clone()),
+            ("preferred_username", preferred_username),
+        ] {
+            if let Some(value) = value {
+                extra.insert(claim.to_string(), serde_json::Value::String(value));
+            }
+        }
+
         Ok(ValidatedToken {
             subject,
             issuer,
             role,
-            email: claims.email.clone(),
-            name: claims.name.clone(),
+            email,
+            name,
+            claims: extra,
         })
     }
 
@@ -621,22 +758,61 @@ mod tests {
 
     /// An admin token good for an hour, with the given `nbf`.
     fn token(nbf: Option<u64>) -> String {
+        let mut claims = json!({ "roles": ["admin"], "tenant": "team-red" });
+        if let Some(nbf) = nbf {
+            claims["nbf"] = json!(nbf);
+        }
+        signed(claims, KID)
+    }
+
+    /// A token signed by the test key under `kid`: the issuer, the audience
+    /// and an hour of validity, with `claims` on top (overriding any of them).
+    fn signed(claims: serde_json::Value, kid: &str) -> String {
         let now = now();
-        let mut claims = json!({
+        let mut all = json!({
             "iss": ISSUER,
             "aud": AUDIENCE,
             "sub": "alice",
             "iat": now,
             "exp": now + 3600,
-            "roles": ["admin"],
         });
-        if let Some(nbf) = nbf {
-            claims["nbf"] = json!(nbf);
+        for (name, value) in claims.as_object().unwrap() {
+            all[name] = value.clone();
         }
         let mut header = Header::new(Algorithm::RS256);
-        header.kid = Some(KID.to_string());
+        header.kid = Some(kid.to_string());
         let key = EncodingKey::from_rsa_pem(TEST_KEYS.private_key_pem.as_bytes()).unwrap();
-        encode(&header, &claims, &key).unwrap()
+        encode(&header, &all, &key).unwrap()
+    }
+
+    /// Each refusal is categorised in the client's terms; the categories
+    /// are what a caller can act on.
+    #[tokio::test]
+    async fn refusals_are_categorised_for_the_client() {
+        let validator = validator().await;
+        let now = now();
+        for (token, refusal) in [
+            (
+                signed(json!({ "exp": now - 3600 }), KID),
+                JwtRefusal::Expired,
+            ),
+            (
+                signed(json!({ "nbf": now + 600 }), KID),
+                JwtRefusal::NotYetValid,
+            ),
+            (signed(json!({ "aud": "other" }), KID), JwtRefusal::Audience),
+            (
+                signed(json!({ "iss": "https://other.example.com" }), KID),
+                JwtRefusal::Issuer,
+            ),
+            (signed(json!({}), "unpublished-key"), JwtRefusal::UnknownKey),
+            (format!("{}x", signed(json!({}), KID)), JwtRefusal::Rejected),
+            ("not.a.jwt".to_string(), JwtRefusal::Rejected),
+        ] {
+            let err = validator.validate_identity(&token).await.unwrap_err();
+            assert_eq!(err.refusal(), refusal, "{err}");
+        }
+        assert_eq!(JwtRefusal::Expired.to_string(), "token expired");
     }
 
     #[tokio::test]
@@ -655,6 +831,62 @@ mod tests {
                     if matches!(e.kind(), ErrorKind::ImmatureSignature)
             ),
             "expected ImmatureSignature, got {err:?}"
+        );
+    }
+
+    /// The claims come out by name, as carried: the registered and the
+    /// common ones next to the rest; a claim the token lacks is `None`.
+    #[tokio::test]
+    async fn the_validated_token_carries_its_claims_by_name() {
+        let validator = validator().await;
+
+        let validated = validator.validate(&token(None)).await.unwrap();
+
+        assert_eq!(
+            validated.claim("tenant").and_then(|v| v.as_str()),
+            Some("team-red")
+        );
+        assert_eq!(
+            validated.claim("sub").and_then(|v| v.as_str()),
+            Some("alice")
+        );
+        assert_eq!(
+            validated.claim("iss").and_then(|v| v.as_str()),
+            Some(ISSUER)
+        );
+        assert_eq!(validated.claim("roles"), Some(&json!(["admin"])));
+        assert_eq!(validated.claim("email"), None);
+        assert_eq!(validated.claim("exp"), None, "the time claims are not kept");
+    }
+
+    /// An identity-only validation runs the same checks and reads no role.
+    #[tokio::test]
+    async fn an_identity_validation_checks_the_token_and_reads_no_role() {
+        let validator = validator().await;
+
+        let validated = validator.validate_identity(&token(None)).await.unwrap();
+        assert_eq!(validated.subject, "alice");
+        assert_eq!(
+            validated.role,
+            Role::User,
+            "the admin role claim is not read"
+        );
+        assert_eq!(
+            validated.claim("tenant").and_then(|v| v.as_str()),
+            Some("team-red")
+        );
+
+        let err = validator
+            .validate_identity(&token(Some(now() + 60)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                JwtValidatorError::DecodeFailed(e)
+                    if matches!(e.kind(), ErrorKind::ImmatureSignature)
+            ),
+            "the time checks still apply: {err:?}"
         );
     }
 

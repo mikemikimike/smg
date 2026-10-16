@@ -28,12 +28,13 @@ use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
         bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, CacheIndexKind,
-        CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, FileDiscoveryConfig,
-        HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, ManualAssignmentMode,
-        MemoryConfig, MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig,
-        PostgresConfig, PowerOfTwoLoadMetric, RedisConfig, RetryConfig, RouterConfig,
-        RoutingKeyOverrideConfig, RoutingMode, SchemaConfig, TenantApiKeyEntry,
-        TokenizerCacheConfig, TraceConfig, DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
+        CircuitBreakerConfig, ConfigError, ConfigResult, DataPlaneJwtConfig, DiscoveryConfig,
+        FileDiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
+        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
+        PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
+        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
+        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_JWT_TENANT_CLAIM,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::{
@@ -1597,6 +1598,24 @@ struct CliArgs {
     #[arg(long = "tenant-api-key", action = ArgAction::Append, help_heading = "Data Plane Authentication")]
     tenant_api_keys: Vec<String>,
 
+    /// Also authenticate bearer JWTs on the serving routes, with the control plane's JWT
+    /// configuration (--jwt-issuer, --jwt-audience, --jwt-jwks-uri; one JWKS cache for both
+    /// planes): a token that validates is the tenant its --jwt-tenant-claim claim names, the
+    /// identity a --tenant-api-key for the same id resolves to. The API keys keep working next
+    /// to it; a JWT that fails is refused, never tried as a key.
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "jwt_issuer",
+        help_heading = "Data Plane Authentication"
+    )]
+    data_plane_jwt: bool,
+
+    /// The JWT claim whose string value is the caller's tenant under --data-plane-jwt
+    /// (default: tenant; the token's `sub` when it lacks the claim)
+    #[arg(long, help_heading = "Data Plane Authentication")]
+    jwt_tenant_claim: Option<String>,
+
     // ==================== Mesh Server ====================
     #[arg(long, default_value_t = false)]
     enable_mesh: bool,
@@ -1829,6 +1848,17 @@ impl CliArgs {
             jwt,
             api_keys,
             audit_enabled: !self.disable_audit_logging,
+        })
+    }
+
+    /// The data-plane JWT check, when `--data-plane-jwt` is set: the tenant
+    /// claim given, or the default.
+    fn data_plane_jwt_config(&self) -> Option<DataPlaneJwtConfig> {
+        self.data_plane_jwt.then(|| DataPlaneJwtConfig {
+            tenant_claim: self
+                .jwt_tenant_claim
+                .clone()
+                .unwrap_or_else(|| DEFAULT_JWT_TENANT_CLAIM.to_string()),
         })
     }
 
@@ -2388,6 +2418,10 @@ impl CliArgs {
                     "without --priority-scheduler-enabled",
                 ),
             ),
+            (
+                self.jwt_tenant_claim.is_some() && !self.data_plane_jwt,
+                ignored("--jwt-tenant-claim", "without --data-plane-jwt"),
+            ),
         ];
         warnings
             .into_iter()
@@ -2742,6 +2776,7 @@ impl CliArgs {
             .log_level(&self.log_level)
             .maybe_api_key(self.api_key.as_ref())
             .tenant_api_keys(tenant_api_keys)
+            .maybe_data_plane_jwt(self.data_plane_jwt_config())
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
@@ -3514,6 +3549,80 @@ mod tests {
             err.to_string().contains("mesh_tls_key"),
             "the error names the flag: {err}"
         );
+    }
+
+    /// `--data-plane-jwt` puts the JWT check on the serving routes with the
+    /// claim given (the default without one); without the flag nothing is
+    /// configured, and the flag needs the JWT issuer it validates with.
+    #[test]
+    fn data_plane_jwt_flags_configure_the_serving_check() {
+        let jwt = [
+            "--jwt-issuer",
+            "https://issuer.example",
+            "--jwt-audience",
+            "smg",
+        ];
+        fn with<'a>(base: &[&'a str], rest: &[&'a str]) -> Vec<&'a str> {
+            base.iter().chain(rest).copied().collect()
+        }
+
+        let config = cli_args_from(&with(&jwt, &["--data-plane-jwt"]))
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(
+            config.data_plane_jwt,
+            Some(DataPlaneJwtConfig {
+                tenant_claim: "tenant".to_string()
+            })
+        );
+
+        let config = cli_args_from(&with(
+            &jwt,
+            &["--data-plane-jwt", "--jwt-tenant-claim", "org"],
+        ))
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert_eq!(
+            config.data_plane_jwt.map(|jwt| jwt.tenant_claim).as_deref(),
+            Some("org")
+        );
+
+        let config = cli_args_from(&with(&jwt, &[]))
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(config.data_plane_jwt, None, "the control plane alone");
+
+        let err = cli_args_from(&with(
+            &jwt,
+            &["--data-plane-jwt", "--jwt-tenant-claim", " "],
+        ))
+        .to_router_config(vec![], vec![])
+        .expect_err("a blank claim name");
+        assert!(
+            matches!(&err, ConfigError::InvalidValue { field, .. } if field == "data_plane_jwt.tenant_claim"),
+            "{err}"
+        );
+
+        let err = Cli::try_parse_from(["smg", "--data-plane-jwt"])
+            .expect_err("the flag needs the JWT issuer");
+        assert!(
+            err.to_string().contains("--jwt-issuer"),
+            "the error names the issuer flag: {err}"
+        );
+
+        let ignored = cli_args_from(&["--jwt-tenant-claim", "org"]).ignored_companions(&[], &[]);
+        assert!(
+            ignored
+                .iter()
+                .any(|m| m.starts_with("--jwt-tenant-claim") && m.contains("--data-plane-jwt")),
+            "{ignored:?}"
+        );
+        let paired = cli_args_from(&with(
+            &jwt,
+            &["--data-plane-jwt", "--jwt-tenant-claim", "org"],
+        ))
+        .ignored_companions(&[], &[]);
+        assert!(paired.is_empty(), "{paired:?}");
     }
 
     /// With no `--prometheus-host`, the metrics listener follows the serving

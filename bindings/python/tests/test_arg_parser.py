@@ -1831,6 +1831,8 @@ class TestRouterArgsFieldOrder:
         "history_memory_max_items",
         "history_memory_retention_secs",
         "parser",
+        "data_plane_jwt",
+        "jwt_tenant_claim",
     ]
 
     def test_complete_field_sequence_is_frozen(self):
@@ -1906,6 +1908,41 @@ class TestRouterArgsFieldOrder:
                 f"{appended} must be appended after worker_startup_delay to "
                 "preserve positional callers"
             )
+
+
+class TestDataPlaneJwtArgs:
+    """Bearer JWTs on the serving routes: off by default, the tenant claim
+    `tenant` unless another is named, in the plain and the prefixed spelling."""
+
+    def test_defaults(self):
+        args = parse_router_args([])
+        assert args.data_plane_jwt is False
+        assert args.jwt_tenant_claim == "tenant"
+
+    def test_flags_parse(self):
+        args = parse_router_args(
+            [
+                "--jwt-issuer",
+                "https://issuer.example",
+                "--jwt-audience",
+                "smg",
+                "--data-plane-jwt",
+                "--jwt-tenant-claim",
+                "org",
+            ]
+        )
+        assert args.data_plane_jwt is True
+        assert args.jwt_tenant_claim == "org"
+
+    def test_router_prefixed_flags_parse(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        args = RouterArgs.from_cli_args(
+            parser.parse_args(["--router-data-plane-jwt", "--router-jwt-tenant-claim", "org"]),
+            use_router_prefix=True,
+        )
+        assert args.data_plane_jwt is True
+        assert args.jwt_tenant_claim == "org"
 
 
 class TestConnectionTimeouts:

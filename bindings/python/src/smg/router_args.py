@@ -407,6 +407,12 @@ class RouterArgs:
     # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
     # X-SMG-Parser header overrides it; appended last for the same reason
     parser: str = "legacy"
+    # Bearer JWTs on the serving routes (--data-plane-jwt), validated with the control
+    # plane's JWT settings (jwt_issuer, jwt_audience, jwt_jwks_uri); the claim named by
+    # jwt_tenant_claim is the caller's tenant (the token's sub when it lacks the claim);
+    # appended last for the same reason
+    data_plane_jwt: bool = False
+    jwt_tenant_claim: str = "tenant"
 
     @staticmethod
     def add_cli_args(
@@ -2287,6 +2293,28 @@ class RouterArgs:
                 " tenant identity. Stored responses and conversations are scoped to the"
                 " tenant that created them: another tenant's id answers 404; records"
                 " stored without a tenant identity stay readable by every caller."
+            ),
+        )
+        dp_auth_group.add_argument(
+            f"--{prefix}data-plane-jwt",
+            action="store_true",
+            default=False,
+            help=(
+                "Also authenticate bearer JWTs on the serving routes, with the control"
+                " plane's JWT settings (--jwt-issuer, --jwt-audience, --jwt-jwks-uri; one"
+                " JWKS cache for both planes): a token that validates is the tenant its"
+                " --jwt-tenant-claim claim names, the identity a --tenant-api-key for the"
+                " same id resolves to. The API keys keep working next to it; a JWT that"
+                " fails is refused, never tried as a key."
+            ),
+        )
+        dp_auth_group.add_argument(
+            f"--{prefix}jwt-tenant-claim",
+            type=str,
+            default="tenant",
+            help=(
+                "The JWT claim whose string value is the caller's tenant under"
+                " --data-plane-jwt (the token's sub when it lacks the claim)."
             ),
         )
         auth_group.add_argument(

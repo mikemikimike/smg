@@ -122,7 +122,8 @@ pub fn create_test_app(
     let serving_auth_config = AuthConfig::with_tenant_keys(
         router_config.api_key.clone(),
         &router_config.tenant_api_keys,
-    );
+    )
+    .with_data_plane_jwt(router_config.data_plane_jwt.as_ref(), None);
     let admin_auth_config = AuthConfig::new(router_config.api_key.clone());
 
     // Use the actual server's build_app function
@@ -199,6 +200,10 @@ pub fn create_test_app_with_context_and_auth(
     let serving_auth_config = AuthConfig::with_tenant_keys(
         router_config.api_key.clone(),
         &router_config.tenant_api_keys,
+    )
+    .with_data_plane_jwt(
+        router_config.data_plane_jwt.as_ref(),
+        control_plane_auth.as_ref(),
     );
     let admin_auth_config = AuthConfig::new(router_config.api_key.clone());
 

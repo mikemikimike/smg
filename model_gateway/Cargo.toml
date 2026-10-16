@@ -277,6 +277,11 @@ name = "kv_index_decision"
 harness = false
 path = "benches/kv_index_decision.rs"
 
+[[bench]]
+name = "data_plane_auth"
+harness = false
+path = "benches/data_plane_auth.rs"
+
 [lints]
 workspace = true
 

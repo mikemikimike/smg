@@ -4,11 +4,11 @@ use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use smg_mcp::McpConfig;
 
 use super::{
-    CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig, MetricsConfig,
-    OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig, RedisConfig,
-    RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, TenantApiKeyEntry,
-    TokenizerCacheConfig, TraceConfig,
+    CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DataPlaneJwtConfig,
+    DiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
+    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig,
+    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
 
@@ -532,6 +532,17 @@ impl RouterConfigBuilder {
 
     pub fn tenant_api_keys(mut self, keys: Vec<TenantApiKeyEntry>) -> Self {
         self.config.tenant_api_keys = keys;
+        self
+    }
+
+    /// Bearer JWTs on the serving routes, the named claim as the tenant.
+    pub fn data_plane_jwt(mut self, config: DataPlaneJwtConfig) -> Self {
+        self.config.data_plane_jwt = Some(config);
+        self
+    }
+
+    pub fn maybe_data_plane_jwt(mut self, config: Option<DataPlaneJwtConfig>) -> Self {
+        self.config.data_plane_jwt = config;
         self
     }
 

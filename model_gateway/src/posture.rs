@@ -154,7 +154,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::config::TenantApiKeyEntry;
+    use crate::config::{DataPlaneJwtConfig, TenantApiKeyEntry};
 
     fn unkeyed() -> AuthConfig {
         AuthConfig::new(None)
@@ -209,6 +209,23 @@ mod tests {
                 "{needle} missing from:\n{message}"
             );
         }
+    }
+
+    /// The data-plane JWT check is a credential requirement of its own: with
+    /// it on and no key configured, the serving routes are not open.
+    #[test]
+    fn a_data_plane_jwt_check_closes_the_data_plane() {
+        let serving = unkeyed().with_data_plane_jwt(Some(&DataPlaneJwtConfig::default()), None);
+        let open = OpenSurfaces::judge(&serving, &unkeyed(), true, None);
+        assert_eq!(
+            open,
+            OpenSurfaces {
+                control_plane: false,
+                data_plane: false,
+                mesh_without_tls: None,
+            }
+        );
+        assert!(open_posture_warning(open, None).is_none());
     }
 
     #[test]

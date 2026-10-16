@@ -350,6 +350,11 @@ pub struct RouterConfig {
     /// [`TenantResolutionConfig`]).
     #[serde(default)]
     pub tenant_api_keys: Vec<TenantApiKeyEntry>,
+    /// Bearer JWTs on the serving routes, with the claim that names the
+    /// tenant (see [`DataPlaneJwtConfig`]); `None`, the default, leaves the
+    /// serving check to the keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_plane_jwt: Option<DataPlaneJwtConfig>,
     #[serde(default, deserialize_with = "deserialize_discovery")]
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
@@ -568,6 +573,35 @@ impl std::fmt::Debug for TenantApiKeyEntry {
             .field("tenant_id", &self.tenant_id)
             .field("key", &"<redacted>")
             .finish()
+    }
+}
+
+/// The claim that names the tenant of a bearer JWT on the serving routes
+/// unless another is configured.
+pub const DEFAULT_JWT_TENANT_CLAIM: &str = "tenant";
+
+/// Bearer JWTs on the serving routes (`--data-plane-jwt`). A bearer token in
+/// the shape of a JWT that is not a configured API key is validated with the
+/// control plane's JWT configuration (`--jwt-issuer`, `--jwt-audience`,
+/// `--jwt-jwks-uri`; the two planes share one validator and one JWKS
+/// cache), and the string claim named here is the caller's tenant: the
+/// identity `auth:<claim>`, the one a `--tenant-api-key` for the same id
+/// resolves to, so the tenant limits and the stored-state scoping apply to
+/// it the same way. The API keys keep working next to it. Off unless
+/// configured; a JWT issuer and audience must be configured with it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DataPlaneJwtConfig {
+    /// The claim whose string value names the tenant; the token's `sub`
+    /// when it does not carry the claim.
+    pub tenant_claim: String,
+}
+
+impl Default for DataPlaneJwtConfig {
+    fn default() -> Self {
+        Self {
+            tenant_claim: DEFAULT_JWT_TENANT_CLAIM.to_string(),
+        }
     }
 }
 
@@ -1675,6 +1709,7 @@ impl Default for RouterConfig {
             dp_minimum_tokens_scheduler: false,
             api_key: None,
             tenant_api_keys: Vec::new(),
+            data_plane_jwt: None,
             discovery: None,
             metrics: None,
             trace_config: None,

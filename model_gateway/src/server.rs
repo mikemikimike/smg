@@ -1436,6 +1436,27 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         )?;
     }
 
+    // The data-plane JWT check validates with the control plane's JWT
+    // configuration; without one it would have no issuer, audience or key
+    // set, so asking for it is a configuration error, refused before
+    // anything binds. The validator is not part of `RouterConfig`, so this
+    // is the one place the CLI, the Python binding and a library caller all
+    // pass.
+    if config.router_config.data_plane_jwt.is_some()
+        && !config
+            .control_plane_auth
+            .as_ref()
+            .is_some_and(|auth| auth.has_jwt())
+    {
+        return Err(
+            "data_plane_jwt is set without a JWT configuration: the serving routes would \
+                    have no issuer, audience or key set to validate bearer JWTs against; give \
+                    --jwt-issuer and --jwt-audience (and --jwt-jwks-uri when the issuer has no \
+                    discovery document), or unset --data-plane-jwt"
+                .into(),
+        );
+    }
+
     // The TLS material is parsed before anything binds: a certificate or key
     // file the gateway could read but not use used to fail at the HTTP bind,
     // after the metrics listener was up.
@@ -1905,12 +1926,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // keys when falling back to simple API-key auth (no control-plane auth
     // configured) — a tenant credential must not be able to reach
     // `/workers`, `/flush_cache`, etc. Only the shared gateway-wide key does.
-    let serving_auth_config = app_context.gateway_auth.clone();
     let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
 
     // Initialize control plane authentication if configured
     let control_plane_auth_state =
         smg_auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
+
+    // With `--data-plane-jwt`, the serving check validates bearer JWTs with
+    // the control plane's validator (one issuer, audience and JWKS cache for
+    // both planes) next to the keys.
+    let serving_auth_config = app_context.gateway_auth.clone().with_data_plane_jwt(
+        config.router_config.data_plane_jwt.as_ref(),
+        control_plane_auth_state.as_ref(),
+    );
 
     // Name what this start leaves open, once, before the listener opens:
     // an unauthenticated gateway is a decision, not an omission.

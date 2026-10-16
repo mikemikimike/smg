@@ -624,6 +624,10 @@ struct Router {
     mesh_tls_cert: Option<String>,
     mesh_tls_key: Option<String>,
     power_of_two_load_metric: String,
+    /// Keyword-only: bearer JWTs on the serving routes, validated with the
+    /// control plane's JWT configuration, and the claim that names the tenant.
+    data_plane_jwt: bool,
+    jwt_tenant_claim: String,
 }
 
 /// Read the keyword-only `discovery` mapping by the same rules as
@@ -1114,6 +1118,9 @@ impl Router {
                     })
                     .collect(),
             )
+            .maybe_data_plane_jwt(self.data_plane_jwt.then(|| config::DataPlaneJwtConfig {
+                tenant_claim: self.jwt_tenant_claim.clone(),
+            }))
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
@@ -1396,6 +1403,8 @@ impl Router {
         mesh_tls_cert = None,
         mesh_tls_key = None,
         power_of_two_load_metric = String::from("expected_wait"),
+        data_plane_jwt = false,
+        jwt_tenant_claim = String::from("tenant"),
         discovery = None,
     ))]
     #[expect(clippy::too_many_arguments)]
@@ -1597,6 +1606,8 @@ impl Router {
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
         power_of_two_load_metric: String,
+        data_plane_jwt: bool,
+        jwt_tenant_claim: String,
         discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
@@ -1827,6 +1838,8 @@ impl Router {
             mesh_tls_cert,
             mesh_tls_key,
             power_of_two_load_metric,
+            data_plane_jwt,
+            jwt_tenant_claim,
         })
     }
 

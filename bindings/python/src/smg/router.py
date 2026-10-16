@@ -108,6 +108,14 @@ def build_control_plane_auth_config(
     has_api_keys = bool(api_keys)
     has_jwt = jwt_issuer is not None and jwt_audience is not None
 
+    # The data-plane JWT check validates with this JWT configuration: asked
+    # for without one, it would have no issuer, audience or key set.
+    if args_dict.get("data_plane_jwt") and not has_jwt:
+        raise ValueError(
+            "data_plane_jwt needs jwt_issuer and jwt_audience: the serving routes would "
+            "have no issuer, audience or key set to validate bearer JWTs against"
+        )
+
     if not has_api_keys and not has_jwt:
         return None
 
@@ -328,6 +336,13 @@ class Router:
             provided). Default: None
         server_cert_path: Path to server TLS certificate (PEM format). Default: None
         server_key_path: Path to server TLS private key (PEM format). Default: None
+        data_plane_jwt: Also authenticate bearer JWTs on the serving routes, with the
+            control plane's JWT settings (jwt_issuer, jwt_audience, jwt_jwks_uri); a
+            token that validates is the tenant its jwt_tenant_claim claim names.
+            Default: False
+        jwt_tenant_claim: The JWT claim whose string value is the caller's tenant
+            under data_plane_jwt (the token's sub when it lacks the claim).
+            Default: 'tenant'
     """
 
     def __init__(self, router: _Router):
