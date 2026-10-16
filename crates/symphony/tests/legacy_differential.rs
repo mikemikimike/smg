@@ -40,8 +40,11 @@
 //! legacy parsers are named per table ([`Legacy::of`]), and the way its template ends the
 //! generation prompt per slug ([`PROMPTS`]), as the corpus tests state it. The per-case report,
 //! one verdict line per case and the two sides and the reference of every difference, goes to
-//! `legacy_differential.txt` under `BELLWETHER_REPORT_DIR`, or under the build's `target/tmp`;
-//! stdout shows each model's summary and the per-table totals.
+//! `legacy_differential.txt` under `BELLWETHER_REPORT_DIR`, or under the build's `target/tmp`:
+//! one verdict line per case, and the two sides, the reference and the first differing byte of
+//! the first [`REPORTED`] replays of each class and kind of cut per model (a whole run of a
+//! benchmark-scale set differs on more than a million character-plan replays); stdout shows each
+//! model's summary and the per-table totals.
 
 #[expect(
     dead_code,
@@ -87,9 +90,10 @@ const COMMON_SET: &str = "common";
 const CHARACTER_PLAN_UP_TO: usize = 512;
 /// How many differences of a class stdout shows per model.
 const SHOWN: usize = 5;
-/// How many differences of a class and kind of cut the report shows in full per model; the rest
-/// are counted in the model's summary (a whole run of a benchmark-scale set differs on more than
-/// a million character-plan replays, each a legacy stream that lost a marker cut in two).
+/// How many replays of a class (a verdict, or a side's stream drifting from its whole parse) and
+/// kind of cut the report shows in full per model; the rest are counted in the model's summary (a
+/// whole run of a benchmark-scale set differs on more than a million character-plan replays, each
+/// a legacy stream that lost a marker cut in two).
 const REPORTED: usize = 100;
 
 /// The legacy parsers that read a table's family: the names the gateway's `--tool-call-parser`
@@ -342,9 +346,9 @@ struct Fixture {
 #[derive(Default, Deserialize)]
 struct Request {
     /// The declared tools. The gateway's request normalization sets `tool_choice` to `none` for
-    /// an empty list, so its tool parser runs only on a non-empty one ([`Request::declared`]).
-    #[serde(default)]
-    tools: Vec<Tool>,
+    /// an empty list declared without a choice, so its tool parser runs on an empty list only
+    /// with an explicit `auto` ([`Request::declared`]).
+    tools: Option<Vec<Tool>>,
     /// A `tool_choice` other than `auto` takes the gateway's legacy path elsewhere (`none` runs no
     /// tool parser, a forced or named choice reads with the JSON schema parser): a case that sets
     /// one is not routed here, and counted. The recorded corpus sets none.
@@ -354,10 +358,11 @@ struct Request {
 }
 
 impl Request {
-    /// The tools the gateway's tool parser is given: the declared list when it is not empty, as
-    /// the request normalization reads an empty one as `tool_choice: none`.
+    /// The tools the gateway's tool parser is given: the declared list, unless it is empty and the
+    /// request sets no `tool_choice`, which the request normalization reads as `tool_choice: none`.
     fn declared(&self) -> Option<&[Tool]> {
-        (!self.tools.is_empty()).then_some(self.tools.as_slice())
+        let tools = self.tools.as_deref()?;
+        (self.tool_choice.is_some() || !tools.is_empty()).then_some(tools)
     }
 
     /// Whether the case takes the legacy path this test runs: no `tool_choice`, or `auto`, which
@@ -500,7 +505,7 @@ impl Said {
         let trim = |part: &Option<String>| {
             part.as_deref()
                 .map(|text| text.trim_matches('\n'))
-                .filter(|text| !text.trim().is_empty())
+                .filter(|text| !text.is_empty())
                 .map(str::to_string)
         };
         Self {
@@ -675,7 +680,7 @@ impl Verdict {
         }
     }
 
-    /// Whether the verdict is a difference the report shows in full.
+    /// Whether the verdict is a difference, which the report shows in full up to its budget.
     fn differs(self) -> bool {
         matches!(
             self,
@@ -1099,6 +1104,15 @@ impl fmt::Display for Tally {
     }
 }
 
+/// A class of replay the report shows in full up to a budget: a verdict, or a side's stream that
+/// drifts from its whole parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Line {
+    Verdict(Verdict),
+    LegacyDrift,
+    SymphonyDrift,
+}
+
 /// The kinds of replay: whole, at the recorded tokens' boundaries, and at characters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Cuts {
@@ -1206,7 +1220,8 @@ fn caught<T>(side: &str, parse: impl FnOnce() -> T) -> Result<T, String> {
 }
 
 /// One model replayed: its slug, table and legacy pair, the counts, the report (one line per
-/// case, every difference in full) and the failures (a legacy-right case, a table's panic).
+/// case, the first [`REPORTED`] differences of each class and kind of cut in full) and the
+/// failures (a legacy-right case, a table's panic).
 struct Replayed {
     slug: String,
     table: Table,
@@ -1379,7 +1394,7 @@ fn replay_model(
         }
         let text = fixture.reference.text.as_str();
         let declared = fixture.request.declared();
-        let tools = fixture.request.tools.as_slice();
+        let tools = fixture.request.tools.as_deref().unwrap_or_default();
         let tail = prompt.tail(&fixture.request, markers);
         let opened = format.reasoning_open(&tail);
         let finish = engine_finish(&fixture.reference.finish_reason);
@@ -1446,19 +1461,23 @@ fn replay_model(
             if let (Some(whole), Some(streamed)) = (&legacy_whole_said, &legacy_streamed_said) {
                 if !whole.equivalent(streamed) {
                     case.counts.legacy_drift.count(kind);
-                    case.details.push_str(&format!(
-                        "    {plan}: the legacy stream differs from the legacy whole parse\n      \
-                         whole:    {whole}\n      streamed: {streamed}\n"
-                    ));
+                    if case.show(Line::LegacyDrift, kind) {
+                        case.details.push_str(&format!(
+                            "    {plan}: the legacy stream differs from the legacy whole parse\n      \
+                             whole:    {whole}\n      streamed: {streamed}\n"
+                        ));
+                    }
                 }
             }
             if let (Some(whole), Some(streamed)) = (&symphony_whole, &symphony_streamed) {
                 if !whole.equivalent(streamed) {
                     case.counts.symphony_drift.count(kind);
-                    case.details.push_str(&format!(
-                        "    {plan}: the table's stream differs from its whole parse\n      \
-                         whole:    {whole}\n      streamed: {streamed}\n"
-                    ));
+                    if case.show(Line::SymphonyDrift, kind) {
+                        case.details.push_str(&format!(
+                            "    {plan}: the table's stream differs from its whole parse\n      \
+                             whole:    {whole}\n      streamed: {streamed}\n"
+                        ));
+                    }
                 }
             }
         }
@@ -1486,22 +1505,40 @@ fn replay_model(
 }
 
 /// One case under comparison: the reference, what the legacy pair reaches, the model's counts
-/// and failures, and the case's own record (each plan's verdict and every difference in full).
+/// and failures, and the case's own record (each plan's verdict, and the differences the report's
+/// budget still shows in full).
 struct Case<'a> {
     id: &'a str,
     reference: Said,
     reach: Reach,
     counts: &'a mut Counts,
     failures: &'a mut Vec<String>,
-    /// How many replays of each verdict and kind of cut the model's report has shown in full:
-    /// the first [`REPORTED`] of a class say what it is, and the first [`SHOWN`] equivalent-only
-    /// replays say what the two paths keep differently at the channels' edges.
-    reported: &'a mut BTreeMap<(Verdict, Cuts), usize>,
+    /// How many replays of each shown class and kind of cut the model's report holds in full:
+    /// the first [`REPORTED`] of a class say what it is, the first [`SHOWN`] equivalent-only
+    /// replays per kind of cut say what the two paths keep differently at the channels' edges;
+    /// the rest are counted. A stream that drifts from its side's whole parse is a class of its
+    /// own here.
+    reported: &'a mut BTreeMap<(Line, Cuts), usize>,
     plans: Vec<String>,
     details: String,
 }
 
 impl Case<'_> {
+    /// Whether the report still shows a replay of `class` under `cuts` in full, counting it.
+    fn show(&mut self, class: Line, cuts: Cuts) -> bool {
+        let budget = match class {
+            Line::Verdict(Verdict::Equivalent) => SHOWN,
+            _ => REPORTED,
+        };
+        let reported = self.reported.entry((class, cuts)).or_default();
+        if *reported < budget {
+            *reported += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Compare the two sides of one replay: the verdict, counted and recorded, and the two
     /// `Said`s where the sides did not panic.
     fn compare(
@@ -1534,16 +1571,8 @@ impl Case<'_> {
                 (Verdict::Panicked, symphony.ok(), legacy.ok())
             }
         };
-        let reported = self.reported.entry((verdict, cuts)).or_default();
-        let budget = if verdict == Verdict::Equivalent {
-            SHOWN
-        } else {
-            REPORTED
-        };
-        let shown = (verdict.differs() || verdict == Verdict::Equivalent) && *reported < budget;
-        if shown {
-            *reported += 1;
-        }
+        let shown = (verdict.differs() || verdict == Verdict::Equivalent)
+            && self.show(Line::Verdict(verdict), cuts);
         if shown {
             if let (Some(symphony), Some(legacy)) = (&symphony, &legacy) {
                 self.details.push_str(&format!(
@@ -1589,7 +1618,8 @@ impl Shown {
         for (class, count) in self.by_class {
             if count > SHOWN {
                 text.push_str(&format!(
-                    "  ... and {} more {class} cases, every one in the report\n",
+                    "  ... and {} more {class} cases; the report shows the first {REPORTED} \
+                     replays of each class and kind of cut in full and counts the rest\n",
                     count - SHOWN
                 ));
             }
@@ -1916,6 +1946,26 @@ fn the_verdict_grades_the_agreement_and_names_the_right_side() {
             reach
         ),
         Verdict::Equivalent
+    );
+    // Content of whitespace alone is not absent: a side that holds it differs.
+    assert_eq!(
+        verdict(
+            "m/parse/x",
+            &Said {
+                content: Some(" ".to_string()),
+                ..reference.clone()
+            },
+            &Said {
+                content: None,
+                ..reference.clone()
+            },
+            &Said {
+                content: None,
+                ..reference.clone()
+            },
+            reach
+        ),
+        Verdict::LegacyRight
     );
     // Any other whitespace at an edge is a difference, judged by the reference.
     assert_eq!(
