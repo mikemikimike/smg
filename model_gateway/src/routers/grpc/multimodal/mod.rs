@@ -87,8 +87,9 @@ pub(crate) use plan::{
 };
 pub(crate) use process::process_multimodal_plan;
 pub(crate) use refs::{
-    assemble_media_refs, ensure_selection_supports_media_refs, resolve_mm_processing,
-    worker_accepts_media_refs, MmProcessing, MmRefsError,
+    assemble_media_refs, ensure_selection_supports_media_refs, models_without_media_processing,
+    resolve_mm_processing, vision_worker_without_media_processing, worker_accepts_media_refs,
+    MmProcessing, MmRefsError,
 };
 pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};

@@ -432,8 +432,7 @@ impl WorkerSelectionStage {
                 // Encode workers never process references: refuse strict
                 // worker mode here rather than silently bypass the encode fleet.
                 if media_refs {
-                    let err = multimodal::MmRefsError::EncodeNotSupported;
-                    return Err(error::bad_request(err.code(), err.to_string()));
+                    return Err(multimodal::MmRefsError::EncodeNotSupported.into_response());
                 }
                 let encode_item_hashes = match encode_item_hashes(intermediate) {
                     Ok(hashes) => hashes,
@@ -494,7 +493,7 @@ impl WorkerSelectionStage {
 
         if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
             if let Err(err) = multimodal::ensure_selection_supports_media_refs(&workers, plan) {
-                return Err(error::bad_request(err.code(), err.to_string()));
+                return Err(err.into_response());
             }
         }
 
@@ -1037,7 +1036,7 @@ impl WorkerSelectionStage {
                 .filter(|w| !media.media_refs || accepts_media_refs(w.as_ref()))
                 .collect();
             if capable.is_empty() {
-                return self.media_refs_shed(model_id);
+                return Self::media_refs_shed(model_id);
             }
             match placement::failure_from(
                 &capable,
@@ -1058,24 +1057,21 @@ impl WorkerSelectionStage {
         error::model_not_found(model_id)
     }
 
-    /// Workers serve the model but none advertises worker-side multimodal
-    /// processing. Terminal: capability cannot change within a retry window.
-    fn media_refs_shed(&self, model_id: &str) -> Response {
-        error!(
-            function = "WorkerSelectionStage::execute",
-            mode = ?self.mode,
-            model_id = %model_id,
-            "No worker advertising worker-side multimodal processing"
-        );
-        let mut response = error::service_unavailable(
-            "no_media_ref_capable_worker",
-            format!(
-                "model {model_id} has vLLM gRPC workers but none advertises mm_processor; set \
-                 SMG_VLLM_MM_PROCESSOR on the workers or SMG_MM_PROCESSING=router on the router"
-            ),
-        );
-        mark_non_retryable(&mut response);
-        response
+    /// Workers serve the model but none of the leg's workers processes media
+    /// references. Preparation answers this verdict for the pool as
+    /// registered (`multimodal::resolve_mm_processing`); here it is the
+    /// backstop for a pool that changed in between, or a disaggregated leg
+    /// none of whose workers does. Terminal: capability cannot change within
+    /// a retry window. Its one rate-limited line is written by
+    /// [`Self::report_refusal`] at the stage's entry points, like the pool's
+    /// other refusals, not here.
+    fn media_refs_shed(model_id: &str) -> Response {
+        placement::no_media_ref_capable_worker(format!(
+            "no worker of model '{model_id}' processes media references (none advertises an \
+             mm_processor), so a request whose media is forwarded to the worker cannot be \
+             served: start the workers with worker-side media processing, or run the router \
+             with --mm-processing auto or router"
+        ))
     }
 
     /// Workers serve the model but none can take the request right now
@@ -1405,7 +1401,7 @@ impl WorkerSelectionStage {
                 _ => &pairs.decode_pool,
             };
             if !pool.is_empty() && !pool.iter().any(|w| accepts_media_refs(w.as_ref())) {
-                return self.media_refs_shed(model_id);
+                return Self::media_refs_shed(model_id);
             }
         }
         self.pair_failure(model_id, failure)
