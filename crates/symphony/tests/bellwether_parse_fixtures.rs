@@ -592,7 +592,7 @@ impl Recorded for Table {
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
             // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5, MiniMax M2,
-            // MiniCPM5, dots3 and Llama Nemotron read `</think>` but not `<tool_call>`.
+            // MiniCPM5, dots3, Llama Nemotron and Kimi K2 read `</think>` but not `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest
             | Self::DeepSeekV4
@@ -601,7 +601,8 @@ impl Recorded for Table {
             | Self::MinimaxM2
             | Self::MiniCpm5
             | Self::Dots3
-            | Self::LlamaNemotron => KNOWN_REASONING_PROBE,
+            | Self::LlamaNemotron
+            | Self::KimiK2 => KNOWN_REASONING_PROBE,
             Self::MinimaxM3 => KNOWN_M3_DIFFERENCES,
         };
         // A template that writes no thought for the probe's request leaves the reasoning out, so
