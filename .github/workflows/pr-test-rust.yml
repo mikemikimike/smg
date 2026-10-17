@@ -1011,8 +1011,15 @@ jobs:
               - 'grpc_servicer/smg_grpc_servicer/vllm/**'
               - '.github/actions/setup-vllm/**'
               - 'scripts/ci_install_vllm.sh'
-              # the servicer tests that import the engine itself (see sglang)
-              - 'grpc_servicer/tests/test_vllm_*.py'
+              # the servicer tests that import the engine itself (see sglang;
+              # the other test_vllm_* files run on CPU in python-unit-tests)
+              - 'grpc_servicer/tests/test_vllm_error_codes.py'
+              - 'grpc_servicer/tests/test_vllm_kv_events.py'
+              - 'grpc_servicer/tests/test_vllm_mm_processor.py'
+              - 'grpc_servicer/tests/test_vllm_mm_sidecar.py'
+              - 'grpc_servicer/tests/test_vllm_package_init.py'
+              - 'grpc_servicer/tests/test_vllm_pd_media_identity.py'
+              - 'grpc_servicer/tests/test_vllm_rust_servicer.py'
             trtllm: &trtllm
               - '.github/actions/setup-trtllm/**'
               - 'scripts/ci_install_trtllm.sh'
