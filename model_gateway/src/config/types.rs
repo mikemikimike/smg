@@ -1125,9 +1125,13 @@ impl PowerOfTwoLoadMetric {
     }
 }
 
-/// Policy configuration for routing
+/// Policy configuration for routing.
+///
+/// `Deserialize` and `Serialize` are the derived ones behind one check: the
+/// per-policy `load_check_interval_secs` of earlier releases is refused by
+/// name (see [`RETIRED_POLICY_INTERVAL_KEY`]), not read and ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(tag = "type", remote = "Self")]
 pub enum PolicyConfig {
     #[serde(rename = "random")]
     Random,
@@ -1209,13 +1213,10 @@ pub enum PolicyConfig {
     /// Power-of-two choices policy: samples two workers and routes to the one
     /// with the lower expected wait, scored like `least_load`
     /// (`(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`).
-    /// TODO: Implement per-policy load monitoring intervals.
-    /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
-    /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
-    /// future support of different polling cadences per policy.
+    /// The worker loads it reads are polled at the gateway's one cadence,
+    /// `load_monitor_interval_secs`.
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
-        load_check_interval_secs: u64,
         #[serde(default)]
         load_metric: PowerOfTwoLoadMetric,
     },
@@ -1226,12 +1227,6 @@ pub enum PolicyConfig {
     /// from the load monitor with in-flight correction. See `policies/least_load.rs`.
     #[serde(rename = "least_load")]
     LeastLoad {
-        /// TODO: Implement per-policy load monitoring intervals.
-        /// Currently, load_check_interval_secs is populated from RouterConfig.load_monitor_interval_secs,
-        /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
-        /// future support of different polling cadences per policy.
-        #[serde(default = "default_least_load_interval")]
-        load_check_interval_secs: u64,
         /// KV-pressure weight `λ_t` (seconds): the time-cost of KV contention,
         /// commensurate with the expected-queue-wait term.
         #[serde(default = "default_least_load_kv_pressure_weight")]
@@ -1388,10 +1383,6 @@ fn default_manual_max_idle_secs() -> u64 {
     4 * 3600
 }
 
-fn default_least_load_interval() -> u64 {
-    10
-}
-
 fn default_least_load_kv_pressure_weight() -> f64 {
     0.15
 }
@@ -1402,6 +1393,30 @@ fn default_least_load_mean_prefill() -> u32 {
 
 fn default_least_load_throughput() -> f64 {
     2000.0
+}
+
+/// The per-policy poll interval of earlier releases. The load monitor has one
+/// cadence, `load_monitor_interval_secs`; a policy configuration that still
+/// sets this key is refused with that knob named, never silently ignored.
+pub const RETIRED_POLICY_INTERVAL_KEY: &str = "load_check_interval_secs";
+
+impl<'de> Deserialize<'de> for PolicyConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get(RETIRED_POLICY_INTERVAL_KEY).is_some() {
+            return Err(de::Error::custom(format!(
+                "`{RETIRED_POLICY_INTERVAL_KEY}` is no longer a policy setting: the load monitor \
+                 polls every worker at `load_monitor_interval_secs`; remove the key"
+            )));
+        }
+        PolicyConfig::deserialize(value).map_err(de::Error::custom)
+    }
+}
+
+impl Serialize for PolicyConfig {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        PolicyConfig::serialize(self, serializer)
+    }
 }
 
 impl PolicyConfig {
@@ -2566,7 +2581,6 @@ mod tests {
         assert_eq!(cache_aware.name(), "cache_aware");
 
         let power_of_two = PolicyConfig::PowerOfTwo {
-            load_check_interval_secs: 60,
             load_metric: Default::default(),
         };
         assert_eq!(power_of_two.name(), "power_of_two");
@@ -2601,12 +2615,11 @@ mod tests {
         assert!(json.contains("\"balance_abs_threshold\":10"));
 
         let power_of_two = PolicyConfig::PowerOfTwo {
-            load_check_interval_secs: 60,
             load_metric: Default::default(),
         };
         let json = serde_json::to_string(&power_of_two).unwrap();
         assert!(json.contains("\"type\":\"power_of_two\""));
-        assert!(json.contains("\"load_check_interval_secs\":60"));
+        assert!(!json.contains("load_check_interval_secs"));
     }
 
     #[test]
@@ -2756,16 +2769,12 @@ mod tests {
     #[test]
     fn test_power_of_two_parameters() {
         let power_of_two = PolicyConfig::PowerOfTwo {
-            load_check_interval_secs: 120,
-            load_metric: Default::default(),
+            load_metric: PowerOfTwoLoadMetric::LeastRequests,
         };
 
         match power_of_two {
-            PolicyConfig::PowerOfTwo {
-                load_check_interval_secs,
-                ..
-            } => {
-                assert_eq!(load_check_interval_secs, 120);
+            PolicyConfig::PowerOfTwo { load_metric } => {
+                assert!(matches!(load_metric, PowerOfTwoLoadMetric::LeastRequests));
             }
             _ => panic!("Expected PowerOfTwo"),
         }
@@ -3174,7 +3183,7 @@ discovery:
                     "http://decode2:8000".to_string(),
                 ],
             )
-            .power_of_two_policy(30)
+            .power_of_two_policy()
             .host("0.0.0.0")
             .port(3000)
             .max_payload_size(1048576)
@@ -3325,7 +3334,6 @@ discovery:
                 selection_accounting_ttl_ms: 0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 60,
                 load_metric: Default::default(),
             }),
         };
@@ -3388,7 +3396,6 @@ discovery:
             decode_urls: vec!["http://decode1".to_string()],
             prefill_policy: None,
             decode_policy: Some(PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 60,
                 load_metric: Default::default(),
             }),
         };
@@ -3469,5 +3476,36 @@ discovery:
             PolicyConfig::RoundRobin => {}
             _ => panic!("Expected RoundRobin for regular mode"),
         }
+    }
+
+    /// A configuration that still sets the per-policy poll interval is
+    /// refused by name, with the one cadence knob named; the same
+    /// configuration without the key reads as before.
+    #[test]
+    fn a_retired_per_policy_interval_is_refused_with_the_global_knob_named() {
+        for (yaml, policy) in [
+            (
+                "type: least_load\nload_check_interval_secs: 3\n",
+                "least_load",
+            ),
+            (
+                "type: power_of_two\nload_check_interval_secs: 3\n",
+                "power_of_two",
+            ),
+        ] {
+            let err = serde_yaml::from_str::<PolicyConfig>(yaml)
+                .expect_err("the retired key is refused")
+                .to_string();
+            assert!(err.contains("load_check_interval_secs"), "{policy}: {err}");
+            assert!(
+                err.contains("load_monitor_interval_secs"),
+                "{policy}: {err}"
+            );
+        }
+        let least_load: PolicyConfig = serde_yaml::from_str("type: least_load\n").unwrap();
+        assert_eq!(least_load.name(), "least_load");
+        let json: PolicyConfig =
+            serde_json::from_value(serde_json::json!({"type": "power_of_two"})).unwrap();
+        assert_eq!(json.name(), "power_of_two");
     }
 }

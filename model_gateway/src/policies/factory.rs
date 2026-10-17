@@ -20,8 +20,6 @@ impl PolicyFactory {
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Passthrough => Arc::new(PassthroughPolicy::new()),
             PolicyConfig::PowerOfTwo { load_metric, .. } => {
-                // TODO: Pass load_check_interval_secs to WorkerMonitor for per-policy polling intervals.
-                // Currently, WorkerMonitor uses RouterConfig.load_monitor_interval_secs globally.
                 Arc::new(PowerOfTwoPolicy::with_load_metric(*load_metric))
             }
             PolicyConfig::LeastLoad {
@@ -30,16 +28,12 @@ impl PolicyFactory {
                 default_throughput,
                 max_waiting_requests,
                 ..
-            } => {
-                // TODO: Pass load_check_interval_secs to WorkerMonitor for per-policy polling intervals.
-                // Currently, WorkerMonitor uses RouterConfig.load_monitor_interval_secs globally.
-                Arc::new(LeastLoadPolicy::with_params(
-                    *kv_pressure_weight,
-                    *mean_prefill_tokens,
-                    *default_throughput,
-                    *max_waiting_requests,
-                ))
-            }
+            } => Arc::new(LeastLoadPolicy::with_params(
+                *kv_pressure_weight,
+                *mean_prefill_tokens,
+                *default_throughput,
+                *max_waiting_requests,
+            )),
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
@@ -154,7 +148,6 @@ mod tests {
         assert_eq!(policy.name(), "passthrough");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PowerOfTwo {
-            load_check_interval_secs: 60,
             load_metric: Default::default(),
         });
         assert_eq!(policy.name(), "power_of_two");

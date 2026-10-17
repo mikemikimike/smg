@@ -151,9 +151,8 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn power_of_two_policy(mut self, load_check_interval_secs: u64) -> Self {
+    pub fn power_of_two_policy(mut self) -> Self {
         self.config.policy = PolicyConfig::PowerOfTwo {
-            load_check_interval_secs,
             load_metric: Default::default(),
         };
         self
@@ -1223,7 +1222,7 @@ mod tests {
                 vec![("http://prefill:8000".to_string(), Some(8001))],
                 vec!["http://decode:8000".to_string()],
             )
-            .power_of_two_policy(60)
+            .power_of_two_policy()
             .build()
             .unwrap();
 

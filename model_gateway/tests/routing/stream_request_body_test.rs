@@ -64,7 +64,6 @@ async fn spawn_capture_worker() -> (String, Captured) {
 
 fn least_load_policy() -> PolicyConfig {
     PolicyConfig::LeastLoad {
-        load_check_interval_secs: 10,
         kv_pressure_weight: 0.15,
         mean_prefill_tokens: 1024,
         default_throughput: 2000.0,

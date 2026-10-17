@@ -2196,7 +2196,6 @@ mod tests {
         }
 
         let registry = PolicyRegistry::new(PolicyConfig::PowerOfTwo {
-            load_check_interval_secs: 60,
             load_metric: Default::default(),
         });
         let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
@@ -2328,7 +2327,6 @@ mod tests {
     #[test]
     fn hinted_policy_inherits_operator_least_load_config() {
         let registry = PolicyRegistry::new(PolicyConfig::LeastLoad {
-            load_check_interval_secs: 10,
             kv_pressure_weight: 0.4,
             mean_prefill_tokens: 2048,
             default_throughput: 555.0,

@@ -1003,33 +1003,13 @@ impl ConfigValidator {
                     ));
                 }
             }
-            PolicyConfig::PowerOfTwo {
-                load_check_interval_secs,
-                ..
-            } => {
-                if *load_check_interval_secs == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "load_check_interval_secs",
-                        load_check_interval_secs,
-                        "Must be > 0",
-                    ));
-                }
-            }
+            PolicyConfig::PowerOfTwo { .. } => {}
             PolicyConfig::LeastLoad {
-                load_check_interval_secs,
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
                 max_waiting_requests: _,
             } => {
-                if *load_check_interval_secs == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "load_check_interval_secs",
-                        load_check_interval_secs,
-                        "Must be > 0",
-                    ));
-                }
-
                 if !kv_pressure_weight.is_finite() || *kv_pressure_weight < 0.0 {
                     return Err(ConfigError::invalid_value(
                         "kv_pressure_weight",
@@ -3808,7 +3788,6 @@ mod tests {
                 ],
             },
             PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 60,
                 load_metric: Default::default(),
             },
         );
@@ -3847,7 +3826,6 @@ mod tests {
                     selection_accounting_ttl_ms: 0,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 60,
                     load_metric: Default::default(),
                 }),
             },
@@ -3868,7 +3846,6 @@ mod tests {
                     "http://decode2:8000".to_string(),
                 ],
                 prefill_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 60,
                     load_metric: Default::default(),
                 }), // Requires 2+ workers
                 decode_policy: None,
@@ -3904,7 +3881,6 @@ mod tests {
                     bucket_adjust_interval_secs: 5,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 60,
                     load_metric: Default::default(),
                 }),
             },
@@ -3998,7 +3974,6 @@ mod tests {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
                 encode_policy: Some(PolicyConfig::LeastLoad {
-                    load_check_interval_secs: 5,
                     kv_pressure_weight: 0.15,
                     mean_prefill_tokens: 1024,
                     default_throughput: 2000.0,

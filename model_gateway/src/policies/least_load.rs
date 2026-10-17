@@ -145,8 +145,6 @@ impl SincePollDispatch {
 /// - `mean_prefill_tokens` (p̄, default `1024`) — per-request token estimate for
 ///   the in-flight term when the request's token count is unknown at routing
 ///   (the HTTP path; ignored when tokens are known, i.e. gRPC).
-/// - `load_check_interval_secs` (default `10`) — worker-load poll period; the
-///   in-flight correction absorbs staleness between polls.
 /// - `max_waiting_requests` (default `0` = disabled) — per-worker waiting-queue
 ///   cap: a worker whose reported waiting requests, plus requests dispatched to
 ///   it since its last poll and the requests the router holds on it beyond

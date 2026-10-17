@@ -2467,11 +2467,9 @@ impl CliArgs {
                 selection_accounting_ttl_ms: self.routing.selection_accounting_ttl_ms,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 5,
                 load_metric: self.routing.power_of_two_load_metric,
             },
             "least_load" => PolicyConfig::LeastLoad {
-                load_check_interval_secs: 5,
                 kv_pressure_weight: self.routing.least_load_kv_pressure_weight,
                 mean_prefill_tokens: self.routing.least_load_mean_prefill_tokens,
                 default_throughput: self.routing.least_load_default_throughput,

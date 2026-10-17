@@ -42,7 +42,7 @@ mod pd_routing_tests {
                     "http://127.0.0.1:19803".to_string(),
                 ],
             )
-            .power_of_two_policy(1)
+            .power_of_two_policy()
             .host("127.0.0.1")
             .port(3800)
             .max_payload_size(256 * 1024 * 1024)
