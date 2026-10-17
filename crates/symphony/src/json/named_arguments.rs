@@ -171,7 +171,7 @@ impl Arguments {
             return;
         }
         self.fragments.send_held(&self.text, self.index, out);
-        if !self.fragments.refused() && !is_complete(&self.text) {
+        if !self.fragments.refused() && !is_complete(&self.fragments.escaped(0, &self.text)) {
             out.push(Event::Malformed {
                 text: Text::default(),
                 why: MalformedReason::UnterminatedRegion,

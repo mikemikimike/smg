@@ -20,6 +20,8 @@
 //! past the depth limit, and anything after the value. Inside a string the only error is a broken
 //! surrogate pair; a string cut anywhere else is a prefix.
 
+use std::borrow::Cow;
+
 /// The nesting the prefix parser allows, which is [`PartialJson::DEFAULT_MAX_DEPTH`].
 const DEEPEST: usize = 32;
 
@@ -38,6 +40,19 @@ pub struct Prefix {
     invalid: Option<usize>,
     /// Where the top-level value ended, once something ended it.
     ended: Option<usize>,
+    /// The raw control characters met inside strings, in order: JSON forbids them there, and an
+    /// assembler writes the fragment that carries one with its escape ([`Self::escaped`]).
+    /// Empty for all but the rare output that has one.
+    controls: Vec<Control>,
+}
+
+/// A raw control character (U+0000..U+001F) inside a string.
+#[derive(Clone, Copy, Debug)]
+struct Control {
+    /// Its byte offset in the whole text.
+    at: usize,
+    /// Whether a backslash stood right before it, which then opens the escape written for it.
+    escaped: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +143,7 @@ impl Default for Prefix {
             at: 0,
             invalid: None,
             ended: None,
+            controls: Vec::new(),
         }
     }
 }
@@ -221,6 +237,52 @@ impl Prefix {
         .into_iter()
         .flatten()
         .min()
+    }
+
+    /// `fragment`, the judged bytes from offset `from` on, with every raw control character the
+    /// judge met inside a string there written as its JSON escape: `\n`, `\t`, `\r`, `\b`, `\f`
+    /// or `\u00XX`, and after a backslash the escape without its own backslash, which already
+    /// stands (`\` and a newline read as a newline, and are written `\n`). The bytes themselves,
+    /// borrowed, where it met none, which is nearly every fragment. An assembler sends the result
+    /// as the fragment's `json` and keeps the model's bytes as its `source`: what a client
+    /// assembles is then JSON a strict reader accepts, which a raw control character is not.
+    pub fn escaped<'a>(&self, from: usize, fragment: &'a str) -> Cow<'a, str> {
+        let end = from + fragment.len();
+        let first = self.controls.partition_point(|control| control.at < from);
+        if self
+            .controls
+            .get(first)
+            .is_none_or(|control| control.at >= end)
+        {
+            return Cow::Borrowed(fragment);
+        }
+        let mut out = String::with_capacity(fragment.len() + 8);
+        let mut copied = 0;
+        for control in self.controls[first..]
+            .iter()
+            .take_while(|control| control.at < end)
+        {
+            let at = control.at - from;
+            out.push_str(&fragment[copied..at]);
+            if !control.escaped {
+                out.push('\\');
+            }
+            match fragment.as_bytes()[at] {
+                b'\n' => out.push('n'),
+                b'\t' => out.push('t'),
+                b'\r' => out.push('r'),
+                0x08 => out.push('b'),
+                0x0c => out.push('f'),
+                byte => {
+                    out.push_str("u00");
+                    out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+                    out.push(char::from_digit(u32::from(byte & 0xf), 16).unwrap_or('0'));
+                }
+            }
+            copied = at + 1;
+        }
+        out.push_str(&fragment[copied..]);
+        Cow::Owned(out)
     }
 
     /// One character, at byte offset `at` of the whole text.
@@ -366,6 +428,12 @@ impl Prefix {
                     }
                     return;
                 }
+                // JSON forbids a raw control character here; the parser reads it as the string's
+                // text, as the old crate did, and the fragment that carries it is written escaped.
+                c if c < ' ' => {
+                    self.controls.push(Control { at, escaped: false });
+                    Str::Text
+                }
                 _ => Str::Text,
             },
             Str::Escape => match c {
@@ -373,6 +441,12 @@ impl Prefix {
                     digits: 0,
                     value: 0,
                 },
+                // An escape JSON lacks reads as the character itself: a backslash and a raw
+                // newline are a newline, written `\n` with the backslash that already stands.
+                c if c < ' ' => {
+                    self.controls.push(Control { at, escaped: true });
+                    Str::Text
+                }
                 _ => Str::Text,
             },
             Str::Unicode { digits, value } => match c.to_digit(16) {
@@ -674,6 +748,41 @@ mod tests {
                 assert_eq!(answer, whole, "{text:?} split at {cut}");
             }
         }
+    }
+
+    /// A raw control character inside a string is written as its escape, in a key or a value,
+    /// after a backslash as the escape's own letter; between tokens a newline is whitespace and
+    /// stays; a fragment with none is the bytes themselves, borrowed; and the pieces, each
+    /// written from its own offset, join to what the whole gives.
+    #[test]
+    fn a_raw_control_character_inside_a_string_is_written_as_its_escape() {
+        let text = "{\"a\nb\": \"x\ty\u{12}\u{7f}\", \"c\": [1,\n2], \"d\": \"\\\n\"}";
+        let expected = "{\"a\\nb\": \"x\\ty\\u0012\u{7f}\", \"c\": [1,\n2], \"d\": \"\\n\"}";
+        let mut whole = Prefix::default();
+        assert_eq!(whole.feed(text), None);
+        let escaped = whole.escaped(0, text);
+        assert_eq!(escaped, expected);
+        assert!(serde_json::from_str::<serde_json::Value>(&escaped).is_ok());
+        assert!(matches!(
+            Prefix::default().escaped(0, "{\"a\": 1}"),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(whole.escaped(0, "{\"a"), Cow::Borrowed(_)));
+        let mut by_char = Prefix::default();
+        let mut joined = String::new();
+        for (at, c) in text.char_indices() {
+            let piece = &text[at..at + c.len_utf8()];
+            assert_eq!(by_char.feed(piece), None);
+            joined.push_str(&by_char.escaped(at, piece));
+        }
+        assert_eq!(joined, expected);
+        let mut halves = Prefix::default();
+        let cut = text.find('y').map_or(0, |at| at + 1);
+        assert_eq!(halves.feed(&text[..cut]), None);
+        assert_eq!(halves.feed(&text[cut..]), None);
+        let mut joined = halves.escaped(0, &text[..cut]).into_owned();
+        joined.push_str(&halves.escaped(cut, &text[cut..]));
+        assert_eq!(joined, expected);
     }
 
     #[test]

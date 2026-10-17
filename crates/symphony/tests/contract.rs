@@ -1308,6 +1308,7 @@ const MISTRAL_OUTPUTS: &[&str] = &[
     "[TOOL_CALLS]get_weather[ARGS]{} trailing",
     "[THINK]Only a thought.[/THINK]",
     "Hello!",
+    "[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Pa\nris\"}",
 ];
 
 /// Llama Nemotron's calls: one JSON list between `<TOOLCALL>` and `</TOOLCALL>`, content before
@@ -1360,6 +1361,7 @@ const FORCED_OUTPUTS: &[&str] = &[
     "{}",
     "   ",
     "[1, 2]",
+    "{\"city\": \"Pa\nris\"}",
 ];
 
 /// Seed-OSS: the tagged syntax under its own markers, a value as Python's repr, and Qwen's
@@ -1596,6 +1598,11 @@ const QWEN3_OUTPUTS: &[&str] = &[
     "<tool_call>\n{\"name\": \"ch\", \"arguments\":\"dname\n<tool_call>",
     "<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": \"x</tool_call>",
     "<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": [1, 2</tool_call>done",
+    // Raw control characters inside strings, in a value, a key and after a backslash: escaped
+    // in the fragments, so the whole is JSON a strict reader accepts; between tokens a newline
+    // stays.
+    "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Pa\nris\", \"days\": 3}}\n</tool_call>",
+    "<tool_call>{\"name\": \"f\", \"arguments\": {\"k\u{12}\": \"\\\n\u{1}\",\n\"t\": \"a\tb\"}}</tool_call>",
 ];
 
 /// The outputs bellwether's common set records for MiMo-V2.5 (Qwen 3.5's tags, the value between

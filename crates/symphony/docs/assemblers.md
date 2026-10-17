@@ -24,6 +24,16 @@ instead, nothing already emitted being revised. The prefix parser tolerates what
 tolerated (a literal's prefix, a bracket closed by the wrong kind where the parent can take it), so
 the promise is exactly as strong as that parser.
 
+A raw control character inside a string (U+0000..U+001F: a newline in a multi-line value, a tab
+in code), which JSON forbids there and no strict reader accepts, is written in the fragment as its
+escape (`\n`, `\t`, `\r`, `\b`, `\f` or `\u00XX`; after a backslash the escape's own letter, since
+the backslash already stands), while the fragment's `source` keeps the model's bytes: the fragments
+stay a valid prefix and the whole is JSON a strict reader accepts, which is what the engines' own
+servers hand out for the same bytes once they re-serialize what their partial reader took. The
+prefix judge notes where it met one (`Prefix::escaped`), so a fragment with none costs nothing
+more. The value reader (`json::arguments`) and the Mistral object reader (`json::named_arguments`)
+write their fragments the same way.
+
 Every byte is read once. The outline is taken by a `Scanner` that keeps its place between pieces,
 and the prefix is judged on the bytes that arrived, so a call's cost is linear in its length however
 the text is cut: the first version read the whole text again on every piece, and a 259 KB argument

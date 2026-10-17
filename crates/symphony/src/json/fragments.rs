@@ -9,6 +9,8 @@
 //! ([`Assembler`](super::Assembler), [`named_arguments`](super::named_arguments)) keep their
 //! accounting here, so that the two say the same of the same bytes.
 
+use std::borrow::Cow;
+
 use crate::{
     event::{Event, Events, MalformedReason, Text},
     json::prefix::Prefix,
@@ -33,6 +35,13 @@ impl Fragments {
         self.invalid_from.is_some()
     }
 
+    /// `fragment`, the judged bytes from offset `from` on, with every raw control character the
+    /// judge met inside a string written as its JSON escape ([`Prefix::escaped`]): the bytes as a
+    /// client assembles them, which is what a reader checks for a whole value.
+    pub(super) fn escaped<'a>(&self, from: usize, fragment: &'a str) -> Cow<'a, str> {
+        self.prefix.escaped(from, fragment)
+    }
+
     /// The bytes of `value` that arrived since the last call, judged, and the part that keeps the
     /// value a valid JSON prefix sent as a fragment of the call at `index`. Bytes the judge may
     /// still go back to (a word being spelled, `nu`; a surrogate escape awaiting its low half; the
@@ -41,8 +50,10 @@ impl Fragments {
     /// They go once the next bytes settle them, with the value's end, or when no more bytes can
     /// come ([`Self::send_held`]), as the prefix they are then. A string where the value should
     /// be streams as written, the one shape where the pieces may say more than the whole
-    /// (`Prefix::held_from`). Where the sent bytes end, the held ones excluded; `None` when every
-    /// byte of `value` was accounted for already.
+    /// (`Prefix::held_from`). A fragment carries the bytes as the model wrote them, but for a raw
+    /// control character inside a string, which JSON forbids and the fragment writes as its escape
+    /// ([`Prefix::escaped`]); the fragment's `source` keeps the byte. Where the sent bytes end, the
+    /// held ones excluded; `None` when every byte of `value` was accounted for already.
     pub(super) fn send(
         &mut self,
         value: &str,
@@ -73,7 +84,7 @@ impl Fragments {
             let fresh = &value[self.emitted..valid_end];
             out.push(Event::ToolCallArguments {
                 index,
-                json: fresh.to_string(),
+                json: self.prefix.escaped(self.emitted, fresh).into_owned(),
                 source: Text::uncounted(fresh),
             });
             self.emitted = valid_end;
@@ -100,7 +111,7 @@ impl Fragments {
             let held = &value[self.emitted..];
             out.push(Event::ToolCallArguments {
                 index,
-                json: held.to_string(),
+                json: self.prefix.escaped(self.emitted, held).into_owned(),
                 source: Text::uncounted(held),
             });
             self.emitted = value.len();
@@ -171,5 +182,16 @@ mod tests {
         assert_eq!(said(&out.drain()), ["fragment tr"]);
         fragments.send_held(value, 0, &mut out);
         assert!(out.drain().is_empty(), "sent once");
+    }
+
+    #[test]
+    fn a_raw_control_character_inside_a_string_is_sent_as_its_escape() {
+        let mut fragments = Fragments::default();
+        let mut out = Events::new();
+        let value = "{\"a\": \"x\ny\"}";
+        assert_eq!(fragments.send(value, false, 0, &mut out), Some(value.len()));
+        assert_eq!(said(&out.drain()), ["fragment {\"a\": \"x\\ny\"}"]);
+        assert_eq!(fragments.escaped(0, value), "{\"a\": \"x\\ny\"}");
+        assert!(!fragments.refused());
     }
 }

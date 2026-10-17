@@ -297,7 +297,9 @@ impl Arguments {
         self.value.push_str(rest);
         let refused = self.prefix.feed(rest);
         if let Some(end) = self.prefix.ended() {
-            if self.invalid_from.is_none() && is_complete(&self.value[..end]) {
+            if self.invalid_from.is_none()
+                && is_complete(&self.prefix.escaped(0, &self.value[..end]))
+            {
                 self.whole = Some(end);
             }
         }
@@ -342,7 +344,7 @@ impl Arguments {
         if self.whole.is_none()
             && self.started
             && self.invalid_from.is_none()
-            && is_complete(&self.value)
+            && is_complete(&self.prefix.escaped(0, &self.value))
         {
             self.whole = Some(self.value.len());
         }
@@ -383,7 +385,7 @@ impl Arguments {
             let typed = strings.typed(&key, raw);
             out.push(Event::ToolCallArguments {
                 index: self.index,
-                json: typed.unwrap_or_else(|| raw.to_string()),
+                json: typed.unwrap_or_else(|| self.prefix.escaped(start, raw).into_owned()),
                 source: Text::uncounted(raw),
             });
             self.emitted = close;
@@ -398,13 +400,14 @@ impl Arguments {
         }
     }
 
-    /// The value's bytes from what was sent up to `upto`, as a fragment of the model's bytes.
+    /// The value's bytes from what was sent up to `upto`, as a fragment of the model's bytes, a
+    /// raw control character inside a string written as its escape.
     fn fragment(&mut self, upto: usize, out: &mut Events) {
         if self.emitted < upto {
             let fresh = &self.value[self.emitted..upto];
             out.push(Event::ToolCallArguments {
                 index: self.index,
-                json: fresh.to_string(),
+                json: self.prefix.escaped(self.emitted, fresh).into_owned(),
                 source: Text::uncounted(fresh),
             });
             self.emitted = upto;
@@ -562,6 +565,35 @@ mod tests {
             })
             .collect();
         (fragments(&events), malformed)
+    }
+
+    /// A raw control character inside a string is written as its escape, in a streamed string and
+    /// in a held one the typing could not read (a strict reader refuses the raw character, so the
+    /// model's bytes are written, escaped), and the value is whole where the model closed it.
+    #[test]
+    fn a_raw_control_character_inside_a_string_is_written_as_its_escape() {
+        let text = "{\"s\": \"a\nb\", \"n\": \"5\t\"}";
+        let expected = (
+            "{\"s\": \"a\\nb\", \"n\": \"5\\t\"}".to_string(),
+            String::new(),
+        );
+        assert_eq!(held(&[text]), expected);
+        for cut in (1..text.len()).filter(|&cut| text.is_char_boundary(cut)) {
+            assert_eq!(
+                held(&[&text[..cut], &text[cut..]]),
+                expected,
+                "cut at {cut}"
+            );
+        }
+        let mut arguments = Arguments::new(0);
+        let mut out = Events::new();
+        assert_eq!(
+            arguments.feed("{\"s\": \"a\nb\"} rest", &AsWritten, &mut out),
+            "{\"s\": \"a\nb\"}".len(),
+            "the value is whole at its brace"
+        );
+        assert!(arguments.whole());
+        assert_eq!(fragments(&out.drain()), "{\"s\": \"a\\nb\"}");
     }
 
     #[test]

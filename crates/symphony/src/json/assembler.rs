@@ -5,7 +5,9 @@
 //! arguments value has begun (or the object has closed without one), `ToolCallArguments` for every
 //! run of new argument bytes, `ToolCallEnd` when the object closes. The fragments are the model's
 //! own bytes: what a client receives, concatenated, is exactly what the model wrote as the
-//! arguments value, spacing included, and no fragment ever has to be revised; an object that ends
+//! arguments value, spacing included, but for a raw control character inside a string, which JSON
+//! forbids and the fragment writes as its escape (`Prefix::escaped`), and no fragment ever has to
+//! be revised; an object that ends
 //! without an arguments member is a call with none, `{}`, one fragment of no bytes, as every
 //! other syntax writes a call with nothing in it. The old crate had no
 //! equivalent; it parsed the partial object on every chunk, re-serialized the arguments and emitted
@@ -293,7 +295,7 @@ impl Assembler {
     /// one, or none came and `{}` stands for them ([`Self::no_arguments`]).
     fn arguments_whole(&self, arguments: Option<&Span>) -> bool {
         match arguments {
-            Some(span) => is_complete(span.text(&self.text)),
+            Some(span) => is_complete(&self.fragments.escaped(0, span.text(&self.text))),
             None => !self.scanner.found().arguments_named,
         }
     }
@@ -742,11 +744,12 @@ mod tests {
             )
         };
         let cases = [
+            // The raw newlines the model wrote inside the strings reach the client escaped.
             (
                 "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Par\n",
-                "{\"city\": \"Par\n",
+                "{\"city\": \"Par\\n",
             ),
-            ("{\"name\": \"ch\", \"arguments\":\"dname\n", "\"dname\n"),
+            ("{\"name\": \"ch\", \"arguments\":\"dname\n", "\"dname\\n"),
             (
                 r#"{"name": "f", "arguments": {"a": [1, 2"#,
                 r#"{"a": [1, 2"#,
@@ -783,6 +786,48 @@ mod tests {
                 .filter(|event| matches!(event, Event::Malformed { .. }))
                 .count(),
             1
+        );
+    }
+
+    /// A raw control character inside a string, which JSON forbids: the fragment writes it as its
+    /// escape, the source keeps the model's bytes, and the arguments a client assembles are JSON a
+    /// strict reader accepts, whole and in pieces alike. A newline between tokens is whitespace
+    /// and stays; a call cut after one is still said to be cut.
+    #[test]
+    fn a_raw_control_character_inside_a_string_reaches_the_client_escaped() {
+        let object = "{\"name\": \"f\", \"arguments\": {\"city\": \"Pa\nris\", \"k\u{12}\": \"\\\n\",\n\"days\": 3}}";
+        let expected = "{\"city\": \"Pa\\nris\", \"k\\u0012\": \"\\n\",\n\"days\": 3}";
+        let per_char: Vec<&str> = object
+            .char_indices()
+            .map(|(i, c)| &object[i..i + c.len_utf8()])
+            .collect();
+        for (how, events) in [("whole", run(&[object])), ("per character", run(&per_char))] {
+            assert_eq!(arguments(&events), expected, "{how}");
+            assert_eq!(sources(&events), object, "{how}");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&arguments(&events)).is_ok(),
+                "{how}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })),
+                "{how}: {events:?}"
+            );
+        }
+        let cut = run(&["{\"name\": \"f\", \"arguments\": {\"city\": \"Pa\nris\", \"days\": 3"]);
+        assert_eq!(arguments(&cut), "{\"city\": \"Pa\\nris\", \"days\": 3");
+        assert!(matches!(
+            &cut[cut.len() - 2..],
+            [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
+        ));
+        let whole_value = run(&["{\"name\": \"f\", \"arguments\": {\"city\": \"Pa\nris\"}"]);
+        assert_eq!(arguments(&whole_value), "{\"city\": \"Pa\\nris\"}");
+        assert!(
+            !whole_value
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "whole arguments, the object's brace missing: no word"
         );
     }
 
