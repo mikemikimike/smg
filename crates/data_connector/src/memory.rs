@@ -953,7 +953,12 @@ impl ResponseStorage for MemoryResponseStorage {
             .values()
             .filter(|response| response.is_open_background())
             .collect();
-        open.sort_by_key(|response| response.created_at);
+        open.sort_by_key(|response| {
+            (
+                response.background_lease_expires_at().unwrap_or(i64::MAX),
+                response.created_at,
+            )
+        });
         Ok(open.into_iter().take(limit).cloned().collect())
     }
 
@@ -1457,7 +1462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_background_responses_are_listed_oldest_first() {
+    async fn open_background_responses_are_listed_by_the_lease_that_runs_out_first() {
         let store = MemoryResponseStorage::new();
         let record = |id: &str, raw: serde_json::Value, created_at: i64| {
             let mut response = StoredResponse::new(None);
@@ -1467,15 +1472,24 @@ mod tests {
             response
         };
         for response in [
+            // Created last, but its lease runs out first: listed first, so a
+            // batch reaches it however many older records are still running.
             record(
                 "resp_in_progress",
-                json!({"background": true, "status": "in_progress", "_lease": {"owner": "gw_a", "expires_at": 20}}),
+                json!({"background": true, "status": "in_progress", "_lease": {"owner": "gw_a", "expires_at": 15}}),
                 20,
             ),
             record(
                 "resp_queued",
-                json!({"background": true, "status": "queued", "_lease": {"owner": "gw_a", "expires_at": 10}}),
+                json!({"background": true, "status": "queued", "_lease": {"owner": "gw_a", "expires_at": 25}}),
                 10,
+            ),
+            // A lease that names no expiry sorts last: the reaper leaves it,
+            // and it must not stand in front of the expired ones.
+            record(
+                "resp_lease_without_expiry",
+                json!({"background": true, "status": "queued", "_lease": {"owner": "gw_b"}}),
+                3,
             ),
             record(
                 "resp_done",
@@ -1499,9 +1513,16 @@ mod tests {
             responses.into_iter().map(|r| r.id.0).collect::<Vec<_>>()
         };
         let open = store.list_open_background_responses(10).await.unwrap();
-        assert_eq!(ids(open), ["resp_queued", "resp_in_progress"]);
+        assert_eq!(
+            ids(open),
+            [
+                "resp_in_progress",
+                "resp_queued",
+                "resp_lease_without_expiry"
+            ]
+        );
         let one = store.list_open_background_responses(1).await.unwrap();
-        assert_eq!(ids(one), ["resp_queued"]);
+        assert_eq!(ids(one), ["resp_in_progress"]);
         assert!(store
             .list_open_background_responses(0)
             .await
@@ -1518,7 +1539,7 @@ mod tests {
             .await
             .unwrap();
         let open = store.list_open_background_responses(10).await.unwrap();
-        assert_eq!(ids(open), ["resp_in_progress"]);
+        assert_eq!(ids(open), ["resp_in_progress", "resp_lease_without_expiry"]);
     }
 
     #[tokio::test]
