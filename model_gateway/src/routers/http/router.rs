@@ -45,7 +45,7 @@ use tracing::{error, warn, Instrument};
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    middleware::{scheduler::PreemptionGuard, TenantRequestMeta},
+    middleware::{bulkhead::BulkheadPermits, scheduler::PreemptionGuard, TenantRequestMeta},
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -1986,11 +1986,18 @@ impl Router {
     /// forward the raw body verbatim (JSON validation and normalization
     /// defer to the worker). `Err` hands the request back untouched —
     /// body unconsumed — for the buffered typed path.
+    ///
+    /// `bulkheads` hands out the request's concurrency permits (the ones
+    /// dispatch takes on the buffered path) once the request is about to be
+    /// forwarded, or its refusal, which is then the response; the permits
+    /// ride on the streamed response's body. A request handed back for the
+    /// buffered path takes none here.
     pub(crate) async fn route_streaming_request(
         &self,
         req: Request<Body>,
         route: &'static str,
         wasm_request_hooks: bool,
+        bulkheads: impl FnOnce() -> Result<Option<BulkheadPermits>, Response>,
     ) -> Result<Response, Request<Body>> {
         let stream_reason = match self.request_body_path(req.headers(), wasm_request_hooks) {
             BodyPath::Buffer(reason) => {
@@ -2032,6 +2039,13 @@ impl Router {
             Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_AMBIGUOUS);
             return Err(req);
         }
+        // The request streams from here on: its bulkhead permits are taken
+        // now, as dispatch takes them before a buffered request's router
+        // runs, and a refusal is the answer.
+        let permits = match bulkheads() {
+            Ok(permits) => permits,
+            Err(refusal) => return Ok(refusal),
+        };
         Metrics::record_request_body_path(BODY_PATH_STREAMED, stream_reason);
 
         let start = Instant::now();
@@ -2109,7 +2123,10 @@ impl Router {
                 error_type_from_status(status),
             );
         }
-        Ok(response)
+        Ok(match permits {
+            Some(permits) => AttachedBody::wrap_response(response, permits),
+            None => response,
+        })
     }
 }
 
@@ -2186,10 +2203,20 @@ pub async fn stream_eligible_request_bodies(
         return next.run(req).await;
     };
     let wasm_request_hooks = state.wasm_request_hooks();
+    // The concurrency bulkheads dispatch takes on the buffered path: the
+    // gateway hands them out here too, for the caller tenant resolution left
+    // on the request, under the one served model's key (the streamed path is
+    // taken for one model only).
+    let gateway = state.router.as_any().downcast_ref::<Gateway>();
+    let tenant_meta = req.extensions().get::<TenantRequestMeta>().cloned();
+    let bulkheads = move || match gateway {
+        Some(gateway) => gateway.acquire_bulkheads(tenant_meta.as_ref(), None),
+        None => Ok(None),
+    };
     cancel
         .guard(async move {
             match http
-                .route_streaming_request(req, route, wasm_request_hooks)
+                .route_streaming_request(req, route, wasm_request_hooks, bulkheads)
                 .await
             {
                 Ok(response) => response,
@@ -3470,6 +3497,7 @@ mod tests {
                 streamed_request(&[b"{\"text\":\"", b"hello\"}"]),
                 "/generate",
                 false,
+                || Ok(None),
             )
             .await
             .unwrap();
@@ -3507,6 +3535,7 @@ mod tests {
                 streamed_request(&[b"{\"stream\":true}"]),
                 "/generate",
                 false,
+                || Ok(None),
             )
             .await
             .unwrap();
@@ -3529,7 +3558,12 @@ mod tests {
         let router = streaming_router(least_load_policy(), 8, vec![plain_worker(&url)]);
 
         let response = router
-            .route_streaming_request(streamed_request(&[b"12345678", b"9"]), "/generate", false)
+            .route_streaming_request(
+                streamed_request(&[b"12345678", b"9"]),
+                "/generate",
+                false,
+                || Ok(None),
+            )
             .await
             .unwrap();
 
@@ -3569,7 +3603,7 @@ mod tests {
             .unwrap();
 
         let response = router
-            .route_streaming_request(req, "/generate", false)
+            .route_streaming_request(req, "/generate", false, || Ok(None))
             .await
             .unwrap();
 
@@ -3616,7 +3650,7 @@ mod tests {
             .unwrap();
 
         let response = router
-            .route_streaming_request(req, "/generate", false)
+            .route_streaming_request(req, "/generate", false, || Ok(None))
             .await
             .unwrap();
 
@@ -3638,6 +3672,7 @@ mod tests {
                 streamed_request(&[b"{\"text\":\"hello\"}"]),
                 "/generate",
                 false,
+                || Ok(None),
             )
             .await
             .unwrap_err();
@@ -3663,7 +3698,7 @@ mod tests {
 
     async fn routed_worker_id(router: &Router, req: Request<Body>) -> String {
         let response = router
-            .route_streaming_request(req, "/generate", false)
+            .route_streaming_request(req, "/generate", false, || Ok(None))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -3735,7 +3770,7 @@ mod tests {
                 hint,
             );
             let req = router
-                .route_streaming_request(req, "/generate", false)
+                .route_streaming_request(req, "/generate", false, || Ok(None))
                 .await
                 .unwrap_err();
             let body = to_bytes(req.into_body(), usize::MAX).await.unwrap();
@@ -3913,7 +3948,7 @@ mod tests {
         let mut request = streamed_request(&[b"{\"text\":\"hello\"}"]);
         request.headers_mut().extend(headers);
         let streamed = router
-            .route_streaming_request(request, "/generate", false)
+            .route_streaming_request(request, "/generate", false, || Ok(None))
             .await
             .unwrap();
         assert_eq!(streamed.status(), StatusCode::OK);
@@ -4707,6 +4742,7 @@ mod tests {
                     streamed_request(&[b"{\"text\":\"hi\"}"]),
                     "/generate",
                     false,
+                    || Ok(None),
                 )
                 .await
                 .unwrap();
@@ -4770,6 +4806,7 @@ mod tests {
                 streamed_request(&[b"{\"text\":\"hi\"}"]),
                 "/generate",
                 false,
+                || Ok(None),
             )
             .await
             .unwrap();

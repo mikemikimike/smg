@@ -10,13 +10,20 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{
+        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        StatusCode,
+    },
 };
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use portpicker::pick_unused_port;
 use serde_json::json;
 use smg::config::RouterConfig;
@@ -79,7 +86,8 @@ fn held_worker(gate: &Arc<HoldGate>) -> MockWorkerConfig {
 }
 
 /// A non-streaming `/generate` by `tenant`. It names no model, so every
-/// request counts under the same model key.
+/// request counts under the same model key. Without a declared length it
+/// takes the buffered body path.
 #[expect(
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
@@ -93,6 +101,40 @@ fn generate_request(tenant: &str) -> Request<Body> {
         .header(TENANT_HEADER, tenant)
         .body(Body::from(payload.to_string()))
         .expect("build request")
+}
+
+/// The same request with its length declared, as clients send it: with
+/// router retries off it takes the streamed body path, which forwards the
+/// body before any handler runs.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn streamed_generate_request(tenant: &str) -> Request<Body> {
+    let payload = json!({ "text": "hello", "stream": false }).to_string();
+    Request::builder()
+        .method("POST")
+        .uri("/generate")
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, payload.len())
+        .header(TENANT_HEADER, tenant)
+        .body(Body::from(payload))
+        .expect("build request")
+}
+
+/// The process-wide metrics recorder, installed once, so a test can read
+/// which body path its requests took.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn metrics() -> &'static PrometheusHandle {
+    static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
+    HANDLE.get_or_init(|| {
+        PrometheusBuilder::new()
+            .install_recorder()
+            .expect("one recorder per process")
+    })
 }
 
 fn error_code(response: &axum::response::Response) -> Option<String> {
@@ -230,6 +272,58 @@ async fn a_model_at_its_cap_refuses_every_tenant_until_a_response_ends() {
 
     let served = send(&app, generate_request("team-b")).await;
     assert_eq!(served.status(), StatusCode::OK);
+
+    ctx.shutdown().await;
+}
+
+/// With router retries off and the length declared, a request takes the
+/// streamed body path, which forwards the body without a handler: the cap
+/// holds there too, and the slot returns with the streamed response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_at_its_cap_is_held_on_the_streamed_body_path() {
+    let metrics = metrics();
+    let gate = HoldGate::new();
+    let mut config = config(1, 0);
+    config.disable_retries = true;
+    let ctx = AppTestContext::new_with_config(config, vec![held_worker(&gate)]).await;
+    let app = ctx.create_app();
+
+    let held = send_in_background(&app, streamed_generate_request("team-a"));
+    wait_arrivals(&gate, 1).await;
+    assert!(
+        metrics.render().lines().any(|line| {
+            line.starts_with("smg_router_request_body_path_total")
+                && line.contains("path=\"streamed\"")
+                && !line.ends_with(" 0")
+        }),
+        "the held request took the streamed body path"
+    );
+
+    let refused = send(&app, streamed_generate_request("team-a")).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "the tenant's second in-flight request is refused on the streamed path"
+    );
+    assert_eq!(
+        error_code(&refused).as_deref(),
+        Some("tenant_concurrency_exceeded")
+    );
+    assert_eq!(retry_after(&refused).as_deref(), Some("2"));
+
+    let other = send_in_background(&app, streamed_generate_request("team-b"));
+    wait_arrivals(&gate, 1).await;
+
+    gate.release();
+    assert_eq!(join(held).await.status(), StatusCode::OK);
+    assert_eq!(join(other).await.status(), StatusCode::OK);
+
+    let again = send(&app, streamed_generate_request("team-a")).await;
+    assert_eq!(
+        again.status(),
+        StatusCode::OK,
+        "the slot came back with the streamed response"
+    );
 
     ctx.shutdown().await;
 }

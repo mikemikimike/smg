@@ -8,7 +8,7 @@
 //! size of the pools they would select from, so traffic can migrate between
 //! HTTP and gRPC and between regular and disaggregated fleets gradually.
 
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, future::Future, sync::Arc};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
@@ -38,7 +38,10 @@ use tracing::{debug, info, warn};
 use crate::{
     app_context::AppContext,
     config::RoutingMode,
-    middleware::{bulkhead::Bulkheads, TenantRequestMeta},
+    middleware::{
+        bulkhead::{BulkheadPermits, Bulkheads},
+        TenantRequestMeta,
+    },
     routers::{
         common::body_policy::REASON_MODEL_SELECTION,
         error as route_error,
@@ -491,16 +494,12 @@ impl Gateway {
         }
     }
 
-    /// Run `run` on `router` within the concurrency bulkheads
-    /// (`middleware::bulkhead`) when the request has a caller: a tenant at
-    /// its in-flight cap is answered 429 and a model at its cap 503, with
-    /// `Retry-After`, before the router runs. The permits ride on the
-    /// response body, so a streaming response holds its slots to its last
-    /// frame or the disconnect; the body of a response that is dropped unread
-    /// gives them back as well. An alias counts against the model it names; a
-    /// request that names no model counts under the unknown model's key. A
-    /// request without a caller (a probe, a realtime session, a cancel) takes
-    /// no permit.
+    /// Run `run` on `router` within the concurrency bulkheads (see
+    /// [`Self::acquire_bulkheads`]): a request beyond a cap is answered
+    /// before the router runs, and the permits ride on the response body, so
+    /// a streaming response holds its slots to its last frame or the
+    /// disconnect; the body of a response that is dropped unread gives them
+    /// back as well.
     async fn run_within_bulkheads<F, Fut>(
         &self,
         tenant_meta: Option<&TenantRequestMeta>,
@@ -512,28 +511,70 @@ impl Gateway {
         F: FnOnce(Arc<dyn RouterTrait>) -> Fut,
         Fut: Future<Output = Response>,
     {
+        match self.acquire_bulkheads(tenant_meta, model) {
+            Ok(Some(permits)) => AttachedBody::wrap_response(run(router).await, permits),
+            Ok(None) => run(router).await,
+            Err(refusal) => refusal,
+        }
+    }
+
+    /// The permits of a request by `tenant_meta` for `model` under the
+    /// concurrency bulkheads (`middleware::bulkhead`), or its refusal: a
+    /// tenant at its in-flight cap is answered 429 and a model at its cap
+    /// 503, with `Retry-After`. `None` with the caps off, or for a request
+    /// without a caller (a probe, a realtime session, a cancel). An alias
+    /// counts against the model it names; a request that names no model, or
+    /// the unknown one, counts against the one served model when there is
+    /// exactly one (that is where it is routed), else under the unknown
+    /// model's key. Dispatch takes the permits here, and so does the streamed
+    /// request-body path, before it forwards the body.
+    pub(crate) fn acquire_bulkheads(
+        &self,
+        tenant_meta: Option<&TenantRequestMeta>,
+        model: Option<&str>,
+    ) -> Result<Option<BulkheadPermits>, Response> {
         let Some(tenant_meta) = tenant_meta.filter(|_| !self.bulkheads.is_off()) else {
-            return run(router).await;
+            return Ok(None);
         };
-        let canonical = match (self.bulkheads.model(), model) {
-            (Some(_), Some(model)) => self.worker_registry.resolve_model_alias(model),
-            _ => None,
-        };
-        let model = canonical.as_deref().or(model);
+        let model = self
+            .bulkheads
+            .model()
+            .map(|_| self.model_bulkhead_key(model));
         let tenant = Some(tenant_meta.tenant_key().as_str());
-        let permits = match self.bulkheads.try_acquire(tenant, model) {
-            Ok(permits) => permits,
+        match self.bulkheads.try_acquire(tenant, model.as_deref()) {
+            Ok(permits) => Ok(Some(permits)),
             Err(scope) => {
                 debug!(
                     scope = ?scope,
                     tenant,
-                    model,
+                    model = model.as_deref(),
                     "request beyond a concurrency bulkhead"
                 );
-                return scope.reject();
+                Err(scope.reject())
             }
-        };
-        AttachedBody::wrap_response(run(router).await, permits)
+        }
+    }
+
+    /// The key a request for `model` counts against under the per-model
+    /// cap: the canonical model behind an alias, the one served model for a
+    /// request that names none (or the unknown one) when there is exactly
+    /// one, else the name as given.
+    fn model_bulkhead_key<'a>(&self, model: Option<&'a str>) -> Cow<'a, str> {
+        match model {
+            Some(model) if model != UNKNOWN_MODEL_ID => self
+                .worker_registry
+                .resolve_model_alias(model)
+                .map_or(Cow::Borrowed(model), |canonical| {
+                    Cow::Owned(canonical.to_string())
+                }),
+            _ => {
+                let mut served = self.worker_registry.get_models();
+                match served.pop() {
+                    Some(only) if served.is_empty() => Cow::Owned(only),
+                    _ => Cow::Borrowed(UNKNOWN_MODEL_ID),
+                }
+            }
+        }
     }
 }
 
@@ -2383,6 +2424,52 @@ mod tests {
 
         drop((other, again));
         assert_eq!(tenants.active_keys(), 0, "idle tenants hold no entry");
+    }
+
+    /// A request that names no model, or the unknown one, counts against the
+    /// one served model when there is exactly one (that is where it is
+    /// routed), so the model's bound stays tight; with more than one model
+    /// served it has a key of its own.
+    #[tokio::test]
+    async fn an_unnamed_request_counts_against_the_one_served_model() {
+        let gateway = bulkheaded_gateway(0, 1);
+        let models = gateway.bulkheads.model().expect("the per-model cap");
+        gateway
+            .worker_registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://worker-1:8080")
+                    .model(ModelCard::new("m"))
+                    .build(),
+            ))
+            .unwrap();
+
+        let held = generate_as(&gateway, "auth:a", UNKNOWN_MODEL_ID).await;
+        assert_eq!(held.status(), StatusCode::OK);
+        assert_eq!(models.inflight("m"), 1, "the one served model's slot");
+        assert_eq!(models.inflight(UNKNOWN_MODEL_ID), 0);
+        let refused = generate_as(&gateway, "auth:b", "m").await;
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code(&refused), Some("model_concurrency_exceeded"));
+        drop((held, refused));
+        assert_eq!(models.active_keys(), 0);
+
+        gateway
+            .worker_registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://worker-2:8080")
+                    .model(ModelCard::new("m2"))
+                    .build(),
+            ))
+            .unwrap();
+        let unnamed = generate_as(&gateway, "auth:a", UNKNOWN_MODEL_ID).await;
+        assert_eq!(unnamed.status(), StatusCode::OK);
+        assert_eq!(models.inflight(UNKNOWN_MODEL_ID), 1, "a key of its own");
+        assert_eq!(models.inflight("m"), 0);
+        let named = generate_as(&gateway, "auth:a", "m").await;
+        assert_eq!(named.status(), StatusCode::OK);
+        assert_eq!(models.inflight("m"), 1);
+        drop((unnamed, named));
+        assert_eq!(models.active_keys(), 0);
     }
 
     /// With a per-model cap of one, a second request for the model by any

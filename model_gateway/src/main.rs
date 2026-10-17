@@ -1254,16 +1254,20 @@ struct ServingArgs {
     /// models (a concurrency bulkhead): taken when the request is dispatched
     /// to its router, after admission, and held for the full response,
     /// streaming bodies included; one beyond answers 429
-    /// tenant_concurrency_exceeded with Retry-After. 0 (default) sets no
-    /// per-tenant cap. Must not exceed an explicit --max-concurrent-requests
+    /// tenant_concurrency_exceeded with Retry-After. The tenant is the
+    /// resolved tenant key: without tenant API keys or a trusted tenant
+    /// header it is the client address, one key for every caller behind a
+    /// proxy. 0 (default) sets no per-tenant cap. Must not exceed an explicit
+    /// --max-concurrent-requests
     #[arg(long, default_value_t = 0, help_heading = "Rate Limiting")]
     max_concurrent_requests_per_tenant: usize,
 
     /// Most in-flight requests one model may hold at once, across all
-    /// tenants (a concurrency bulkhead; an alias counts against its model);
-    /// one beyond answers 503 model_concurrency_exceeded with Retry-After.
-    /// 0 (default) sets no per-model cap. Must not exceed an explicit
-    /// --max-concurrent-requests
+    /// tenants (a concurrency bulkhead; an alias counts against its model, a
+    /// request that names no model against the one served model when there
+    /// is exactly one, else under a key of its own); one beyond answers 503
+    /// model_concurrency_exceeded with Retry-After. 0 (default) sets no
+    /// per-model cap. Must not exceed an explicit --max-concurrent-requests
     #[arg(long, default_value_t = 0, help_heading = "Rate Limiting")]
     max_concurrent_requests_per_model: usize,
 
@@ -3195,15 +3199,6 @@ impl CliArgs {
             .cors_allowed_origins(self.serving.cors_allowed_origins.clone())
             .max_concurrent_requests_per_tenant(self.serving.max_concurrent_requests_per_tenant)
             .max_concurrent_requests_per_model(self.serving.max_concurrent_requests_per_model)
-            .prefill_max_inflight_requests_per_worker(
-                self.workers.prefill_max_inflight_requests_per_worker,
-            )
-            .priority_scheduler_default_max_class(
-                self.serving.priority_scheduler_default_max_class.clone(),
-            )
-            .priority_scheduler_tenant_metric_top_n(
-                self.serving.priority_scheduler_tenant_metric_top_n,
-            )
             .retry_config(RetryConfig {
                 max_retries: self.serving.retry_max_retries,
                 initial_backoff_ms: self.serving.retry_initial_backoff_ms,

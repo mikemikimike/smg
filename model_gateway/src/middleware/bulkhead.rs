@@ -24,7 +24,7 @@ use std::sync::{
 
 use axum::{http::StatusCode, response::Response};
 use dashmap::DashMap;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::concurrency::shed_response;
 use crate::{
@@ -215,6 +215,11 @@ impl Bulkheads {
                 "Concurrency bulkhead: at most {} in-flight requests per tenant (max_concurrent_requests_per_tenant); one beyond answers 429",
                 tenant.cap()
             );
+            if tenant_cap_has_one_key_for_every_caller(config) {
+                warn!(
+                    "Concurrency bulkhead: without tenant API keys or a trusted tenant header every caller resolves to one tenant key (its client address, or the shared API key), so behind a proxy the per-tenant cap is a gateway-wide cap"
+                );
+            }
         }
         if let Some(model) = &bulkheads.model {
             info!(
@@ -267,6 +272,17 @@ impl Bulkheads {
     }
 }
 
+/// Whether the per-tenant cap would have one key for every caller: with no
+/// tenant API keys and the tenant header untrusted, a caller's tenant key is
+/// its client address (one address for everyone behind a proxy) or the shared
+/// API key's identity.
+#[must_use]
+pub fn tenant_cap_has_one_key_for_every_caller(config: &RouterConfig) -> bool {
+    config.max_concurrent_requests_per_tenant > 0
+        && config.tenant_api_keys.is_empty()
+        && !config.tenant_resolution.trust_tenant_header
+}
+
 /// A request's permits, returned together when dropped: the gateway attaches
 /// them to the response body.
 pub struct BulkheadPermits {
@@ -296,7 +312,10 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     use super::*;
-    use crate::{middleware::SHED_RETRY_AFTER_SECS, routers::error::HEADER_X_SMG_ERROR_CODE};
+    use crate::{
+        config::TenantApiKeyEntry, middleware::SHED_RETRY_AFTER_SECS,
+        routers::error::HEADER_X_SMG_ERROR_CODE,
+    };
 
     #[test]
     fn a_key_is_capped_and_keys_are_independent() {
@@ -394,6 +413,29 @@ mod tests {
         assert_eq!(bulkheads.tenant().map(|b| b.cap()), Some(8));
         assert!(bulkheads.model().is_none());
         assert!(Bulkheads::from_config(&RouterConfig::default()).is_off());
+    }
+
+    /// The per-tenant cap is flagged at start-up when nothing tells the
+    /// callers apart: no tenant API keys and the tenant header untrusted.
+    #[test]
+    fn a_per_tenant_cap_without_tenant_identities_is_flagged() {
+        let capped = RouterConfig {
+            max_concurrent_requests_per_tenant: 8,
+            ..Default::default()
+        };
+        assert!(tenant_cap_has_one_key_for_every_caller(&capped));
+        assert!(!tenant_cap_has_one_key_for_every_caller(
+            &RouterConfig::default()
+        ));
+        let mut trusted = capped.clone();
+        trusted.tenant_resolution.trust_tenant_header = true;
+        assert!(!tenant_cap_has_one_key_for_every_caller(&trusted));
+        let mut keyed = capped.clone();
+        keyed.tenant_api_keys.push(TenantApiKeyEntry {
+            tenant_id: "team-red".to_string(),
+            key: "team-red-secret".to_string(),
+        });
+        assert!(!tenant_cap_has_one_key_for_every_caller(&keyed));
     }
 
     /// Many threads taking and returning one key's slots: the count in

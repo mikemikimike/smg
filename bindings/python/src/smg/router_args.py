@@ -2037,8 +2037,11 @@ class RouterArgs:
                 " models (a concurrency bulkhead): taken when the request is"
                 " dispatched to its router, after admission, and held for the full"
                 " response; one beyond answers 429 tenant_concurrency_exceeded with"
-                " Retry-After. 0 (default) sets no per-tenant cap. Must not exceed"
-                " an explicit --max-concurrent-requests."
+                " Retry-After. The tenant is the resolved tenant key: without"
+                " tenant API keys or a trusted tenant header it is the client"
+                " address, one key for every caller behind a proxy. 0 (default)"
+                " sets no per-tenant cap. Must not exceed an explicit"
+                " --max-concurrent-requests."
             ),
         )
         rate_limit_group.add_argument(
@@ -2048,7 +2051,9 @@ class RouterArgs:
             help=(
                 "Most in-flight requests one model may hold at once, across all"
                 " tenants (a concurrency bulkhead; an alias counts against its"
-                " model); one beyond answers 503 model_concurrency_exceeded with"
+                " model, a request that names no model against the one served"
+                " model when there is exactly one, else under a key of its own);"
+                " one beyond answers 503 model_concurrency_exceeded with"
                 " Retry-After. 0 (default) sets no per-model cap. Must not exceed"
                 " an explicit --max-concurrent-requests."
             ),
