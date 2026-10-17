@@ -1882,6 +1882,11 @@ mod tests {
         );
         assert_eq!(named_table(&pair(Some("llama"), None)), None);
         assert_eq!(named_table(&pair(Some("llama"), Some("qwen3"))), None);
+        // The older `pythonic` parser's family reads with the Llama 4 table.
+        assert_eq!(
+            named_table(&pair(Some("pythonic"), None)),
+            Some(Table::Llama4)
+        );
         // `passthrough` leaves a channel as written, which no table reads for: the legacy
         // parsers keep it, alone or beside another name.
         assert_eq!(
@@ -1970,6 +1975,7 @@ mod tests {
             ("minimax", "minimax_m2"),
             ("minimax_m2", "minimax_m2"),
             ("minimax_m3", "minimax_m3"),
+            ("pythonic", "llama4"),
         ];
         let mut legacy: Vec<(String, &str)> = tools
             .list_parsers()
