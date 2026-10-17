@@ -28,8 +28,8 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        policy_filters_unavailable_workers, CacheNamespace, LoadBalancingPolicy, PolicyRegistry,
-        SelectWorkerInfo, WorkerLeg,
+        policy_filters_unavailable_workers, traffic_split, CacheNamespace, LoadBalancingPolicy,
+        PolicyRegistry, SelectWorkerInfo, WorkerLeg,
     },
     routers::{
         common::{header_utils, overload, retry::mark_non_retryable},
@@ -1050,9 +1050,15 @@ pub(crate) fn select_pair(
         return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
     }
     info.leg = WorkerLeg::Decode;
-    let Some(decode_idx) =
-        policies.select_worker_for_model(&decode_policy, model_id, &decode, &info)
-    else {
+    // The decode follows the prefill's traffic group, so a pair never spans
+    // two groups (see `PolicyRegistry::select_worker_for_model_following`).
+    let Some(decode_idx) = policies.select_worker_for_model_following(
+        &decode_policy,
+        model_id,
+        &decode,
+        &info,
+        Some(traffic_split::group_of(selected_prefill.as_ref())),
+    ) else {
         return Err(declined(WorkerLeg::Decode, decode_policy.name()));
     };
     let selected_decode = decode[decode_idx].clone();
