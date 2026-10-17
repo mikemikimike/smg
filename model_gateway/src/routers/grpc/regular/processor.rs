@@ -94,60 +94,24 @@ impl ResponseProcessor {
                 stop_decoder,
             );
         }
-        // Decode tokens
-        let outputs = stop_decoder
-            .process_tokens(complete.output_ids())
-            .map_err(|e| format!("Failed to process tokens: {e}"))?;
-
-        // Accumulate text with early breaks, noting where each token's text
-        // ends to place the reasoning span in tokens.
-        let mut final_text = String::new();
-        let mut stopped = false;
-        let mut held = false;
-        let mut token_ends = Vec::with_capacity(outputs.len());
-        for output in outputs {
-            match output {
-                SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
-                SequenceDecoderOutput::StoppedWithText(t) => {
-                    final_text.push_str(&t);
-                    stopped = true;
-                }
-                SequenceDecoderOutput::Stopped => stopped = true,
-                SequenceDecoderOutput::Held => held = true,
-            }
-            token_ends.push(final_text.len());
-            if stopped {
-                break;
-            }
-        }
-
-        // Complete token decoding, including bytes and a partial stop match.
-        // The last token takes the tail so the token spans reach the text end.
-        let tail = stop_decoder
-            .finish()
-            .map_err(|e| format!("Failed to finish token decoding: {e}"))?;
-        utils::warn_detokenize_recoveries(request_id, index as u32, stop_decoder);
-        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
-            final_text.push_str(&t);
-            if let Some(last) = token_ends.last_mut() {
-                *last = final_text.len();
-            }
-        }
-        if held
-            && tokenizer.uses_byte_fallback()
-            && original_request.separate_reasoning
-            && reasoning_parser_available
-        {
-            if let Some(ends) = eager_token_ends(
-                tokenizer,
-                &complete.output_ids()[..token_ends.len()],
-                stop_decoder.skip_special_tokens(),
-                &final_text,
-            ) {
-                token_ends = ends;
-            }
-        }
-        stopped |= stop_decoder.is_stopped();
+        let Decoded {
+            text: final_text,
+            token_ends,
+            stopped,
+            held: _,
+        } = decode_complete(
+            stop_decoder,
+            complete.output_ids(),
+            request_id,
+            index as u32,
+        )
+        .map_err(|e| e.to_string())?
+        .with_eager_token_ends(
+            original_request.separate_reasoning && reasoning_parser_available,
+            tokenizer,
+            complete.output_ids(),
+            stop_decoder.skip_special_tokens(),
+        );
 
         // The decoded output, kept to place the content's tokens for its
         // logprobs; the content starts after the reasoning span.
@@ -247,14 +211,8 @@ impl ResponseProcessor {
             utils::keep_first_tool_call(&mut tool_calls);
         }
 
-        // Step 3: Determine finish reason. A local stop-decoder match takes
-        // precedence over the engine's reason (which is "length" when stop
-        // strings are enforced gateway-side rather than by the backend).
-        let finish_reason_str = if stopped {
-            "stop"
-        } else {
-            complete.finish_reason()
-        };
+        // Step 3: Determine finish reason (a local stop beats the engine's).
+        let finish_reason_str = finish_after_local_stop(stopped, complete);
 
         // Parsed calls do not override an engine truncation or failure.
         let final_finish_reason_str = if tool_calls.is_some()
@@ -265,12 +223,7 @@ impl ResponseProcessor {
             finish_reason_str
         };
 
-        // When the local decoder matched a stop string, surface it (the engine
-        // reports no stop_reason over the ZMQ path); otherwise use the engine's.
-        let matched_stop = stop_decoder
-            .matched_stop()
-            .map(|s| serde_json::Value::String(s.to_string()))
-            .or_else(|| complete.matched_stop_json());
+        let matched_stop = matched_stop_value(stop_decoder, complete);
 
         // Step 4: Build ChatCompletionMessage (proper response message type)
         let chat_message = ChatCompletionMessage {
@@ -361,13 +314,7 @@ impl ResponseProcessor {
         {
             events.extend(reader.tail(&text)?);
         }
-        // A local stop-decoder match takes precedence over the engine's reason,
-        // as on the older path.
-        let reason = if stopped || stop_decoder.is_stopped() {
-            "stop"
-        } else {
-            complete.finish_reason()
-        };
+        let reason = finish_after_local_stop(stopped || stop_decoder.is_stopped(), complete);
         let who = Who {
             request_id,
             model,
@@ -376,10 +323,7 @@ impl ResponseProcessor {
         events.extend(reader.end(engine_finish(reason), who)?);
         let reasoning_tokens = finished(&events).map_or(0, |finished| finished.reasoning_tokens);
         let mut choice = adapt::chat::message(index as u32, &events);
-        choice.matched_stop = stop_decoder
-            .matched_stop()
-            .map(|s| serde_json::Value::String(s.to_string()))
-            .or_else(|| complete.matched_stop_json());
+        choice.matched_stop = matched_stop_value(stop_decoder, complete);
         // The content's tokens alone keep their logprobs, as on the older path: none when
         // the message has no content (whitespace alone, which `adapt::chat::message` leaves
         // out of the message).
@@ -437,11 +381,7 @@ impl ResponseProcessor {
         {
             events.extend(reader.tail(&text)?);
         }
-        let reason = if stopped || stop_decoder.is_stopped() {
-            "stop"
-        } else {
-            complete.finish_reason()
-        };
+        let reason = finish_after_local_stop(stopped || stop_decoder.is_stopped(), complete);
         let who = Who {
             request_id: &dispatch.request_id,
             model: &dispatch.model,
@@ -452,11 +392,7 @@ impl ResponseProcessor {
         if !request.thinking_text_returned {
             utils::message_utils::omit_thinking_text(&mut output.content);
         }
-        let stop_sequence = stop_decoder.matched_stop().map(String::from).or_else(|| {
-            complete
-                .matched_stop_json()
-                .and_then(|v| v.as_str().map(String::from))
-        });
+        let stop_sequence = matched_stop_string(stop_decoder, complete);
         let stop_reason = match output.stop_reason {
             Some(messages::StopReason::EndTurn) if stop_sequence.is_some() => {
                 Some(messages::StopReason::StopSequence)
@@ -675,70 +611,17 @@ impl ResponseProcessor {
         // Process each completion
         let mut result_array = Vec::new();
         for complete in all_responses {
-            stop_decoder.reset();
-
-            // Process tokens through stop decoder
-            let outputs = match stop_decoder.process_tokens(complete.output_ids()) {
-                Ok(outputs) => outputs,
-                Err(e) => {
-                    return Err(error::internal_error(
-                        "process_tokens_failed",
-                        format!("Failed to process tokens: {e}"),
-                    ))
-                }
-            };
-
-            // Accumulate text with early breaks
-            let mut decoded_text = String::new();
-            for output in outputs {
-                match output {
-                    SequenceDecoderOutput::Text(t) => decoded_text.push_str(&t),
-                    SequenceDecoderOutput::StoppedWithText(t) => {
-                        decoded_text.push_str(&t);
-                        break;
-                    }
-                    SequenceDecoderOutput::Stopped => break,
-                    SequenceDecoderOutput::Held => {}
-                }
-            }
-
-            // Flush remaining text
-            let tail = stop_decoder.finish().map_err(|e| {
-                error::internal_error(
-                    "process_tokens_failed",
-                    format!("Failed to finish token decoding: {e}"),
-                )
-            })?;
-            utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
-            // A stop the decoder found at any token (text streams as soon as its
-            // characters are complete, so a string stop can close mid-run) or
-            // in the tail is the response's finish reason, as on the other paths.
-            let stopped_at_finish = stop_decoder.is_stopped();
-            if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail
-            {
-                decoded_text.push_str(&t);
-            }
+            let decoded =
+                decode_complete(stop_decoder, complete.output_ids(), &dispatch.request_id, 0)
+                    .map_err(|e| error::internal_error("process_tokens_failed", e.to_string()))?;
+            let decoded_text = decoded.text;
 
             let output_ids = complete.output_ids().to_vec();
-            let finish_reason_str = complete.finish_reason();
-
-            // Parse finish_reason from string to proper type
             let finish_reason = utils::parse_finish_reason(
-                if stopped_at_finish {
-                    "stop"
-                } else {
-                    finish_reason_str
-                },
+                finish_after_local_stop(decoded.stopped, &complete),
                 complete.completion_tokens(),
             );
-
-            // The decoder's string stop when it matched one (the engine does not
-            // see string stops it did not apply), else the engine's value: a
-            // stop token's id stays reported, as on the other paths.
-            let matched_stop = stop_decoder
-                .matched_stop()
-                .map(|stop| serde_json::Value::String(stop.to_string()))
-                .or_else(|| complete.matched_stop_json());
+            let matched_stop = matched_stop_value(stop_decoder, &complete);
 
             // Extract logprobs if requested (convert proto types to Generate format)
             let input_token_logprobs = if request_logprobs {
@@ -893,63 +776,24 @@ impl ResponseProcessor {
             tracing::debug!("No tool parser found for model '{model}', skipping tool call parsing");
         }
 
-        // Decode tokens through stop decoder
-        stop_decoder.reset();
-        let outputs = stop_decoder
-            .process_tokens(complete.output_ids())
+        let Decoded {
+            text: final_text,
+            token_ends,
+            stopped,
+            held: _,
+        } = decode_complete(stop_decoder, complete.output_ids(), &dispatch.request_id, 0)
             .map_err(|e| {
-                error!(function = "process_non_streaming_messages_response", error = %e, "Failed to process tokens");
-                error::internal_error(
-                    "process_tokens_failed",
-                    format!("Failed to process tokens: {e}"),
-                )
-            })?;
-
-        // Accumulate text with early breaks, noting where each token's text
-        // ends to place the thinking span in tokens (as the chat path does).
-        let mut final_text = String::new();
-        let mut stopped = false;
-        let mut held = false;
-        let mut token_ends = Vec::with_capacity(outputs.len());
-        for output in outputs {
-            match output {
-                SequenceDecoderOutput::Text(t) => final_text.push_str(&t),
-                SequenceDecoderOutput::StoppedWithText(t) => {
-                    final_text.push_str(&t);
-                    stopped = true;
+                if let DecodeFailure::Process(_) = e {
+                    error!(function = "process_non_streaming_messages_response", error = %e.detail(), "Failed to process tokens");
                 }
-                SequenceDecoderOutput::Stopped => stopped = true,
-                SequenceDecoderOutput::Held => held = true,
-            }
-            token_ends.push(final_text.len());
-            if stopped {
-                break;
-            }
-        }
-        let tail = stop_decoder.finish().map_err(|e| {
-            error::internal_error(
-                "process_tokens_failed",
-                format!("Failed to finish token decoding: {e}"),
-            )
-        })?;
-        utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
-        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
-            final_text.push_str(&t);
-            if let Some(last) = token_ends.last_mut() {
-                *last = final_text.len();
-            }
-        }
-        if held && tokenizer.uses_byte_fallback() && reasoning_parser_available {
-            if let Some(ends) = eager_token_ends(
+                error::internal_error("process_tokens_failed", e.to_string())
+            })?
+            .with_eager_token_ends(
+                reasoning_parser_available,
                 &tokenizer,
-                &complete.output_ids()[..token_ends.len()],
+                complete.output_ids(),
                 stop_decoder.skip_special_tokens(),
-                &final_text,
-            ) {
-                token_ends = ends;
-            }
-        }
-        stopped |= stop_decoder.is_stopped();
+            );
 
         // Step 1: Parse reasoning content
         let mut reasoning_text: Option<String> = None;
@@ -1078,20 +922,11 @@ impl ResponseProcessor {
             utils::message_utils::omit_thinking_text(&mut content_blocks);
         }
 
-        // Step 4: Determine stop_reason and stop_sequence (derived from same conditions).
-        // A local stop-decoder match takes precedence over the engine's reason
-        // (the backend has no stop-string detection over ZMQ), surfacing the
-        // matched sequence for a StopSequence result.
-        let finish_reason_str = if stopped {
-            "stop"
-        } else {
-            complete.finish_reason()
-        };
-        let stop_sequence = stop_decoder.matched_stop().map(String::from).or_else(|| {
-            complete
-                .matched_stop_json()
-                .and_then(|v| v.as_str().map(String::from))
-        });
+        // Step 4: Determine stop_reason and stop_sequence (derived from same
+        // conditions): a local stop beats the engine's reason, and the matched
+        // sequence is surfaced for a StopSequence result.
+        let finish_reason_str = finish_after_local_stop(stopped, &complete);
+        let stop_sequence = matched_stop_string(stop_decoder, &complete);
 
         // Parsed calls do not override a truncation, as in Chat.
         let stop_reason = if finish_reason_str == "length" {
@@ -1148,7 +983,6 @@ impl ResponseProcessor {
         execution_result: ExecutionResult,
         completion_req: CompletionResponseSpec,
         dispatch: DispatchMetadata,
-        _tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<CompletionResponse, axum::response::Response> {
         let request_logprobs = completion_req.logprobs;
@@ -1189,53 +1023,15 @@ impl ResponseProcessor {
             // Arrival order, not `complete.index()`: SGLang non-streaming
             // Complete frames carry index 0 for every choice.
             for (i, complete) in all_responses.into_iter().enumerate() {
-                stop_decoder.reset();
-
-                let outputs = match stop_decoder.process_tokens(complete.output_ids()) {
-                    Ok(outputs) => outputs,
-                    Err(e) => {
-                        return Err(error::internal_error(
-                            "process_tokens_failed",
-                            format!("Failed to process tokens: {e}"),
-                        ))
-                    }
-                };
-
-                let mut decoded_text = String::new();
-                let mut stopped = false;
-                for output in outputs {
-                    match output {
-                        SequenceDecoderOutput::Text(t) => decoded_text.push_str(&t),
-                        SequenceDecoderOutput::StoppedWithText(t) => {
-                            decoded_text.push_str(&t);
-                            stopped = true;
-                            break;
-                        }
-                        SequenceDecoderOutput::Stopped => {
-                            stopped = true;
-                            break;
-                        }
-                        SequenceDecoderOutput::Held => {}
-                    }
-                }
-
-                let tail = stop_decoder.finish().map_err(|e| {
-                    error::internal_error(
-                        "process_tokens_failed",
-                        format!("Failed to finish token decoding: {e}"),
-                    )
-                })?;
-                utils::warn_detokenize_recoveries(
+                let decoded = decode_complete(
+                    stop_decoder,
+                    complete.output_ids(),
                     &dispatch.request_id,
                     index_offset + i as u32,
-                    stop_decoder,
-                );
-                if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
-                    tail
-                {
-                    decoded_text.push_str(&t);
-                }
-                stopped |= stop_decoder.is_stopped();
+                )
+                .map_err(|e| error::internal_error("process_tokens_failed", e.to_string()))?;
+                let decoded_text = decoded.text;
+                let stopped = decoded.stopped;
 
                 prompt_tokens = prompt_tokens.max(complete.prompt_tokens());
                 cached_tokens = cached_tokens.max(complete.cached_tokens());
@@ -1266,13 +1062,7 @@ impl ResponseProcessor {
                     }
                 };
 
-                // When the local decoder matched a stop string, surface it (the
-                // engine reports no stop_reason over the ZMQ path); otherwise use
-                // the engine's.
-                let matched_stop = stop_decoder
-                    .matched_stop()
-                    .map(|s| serde_json::Value::String(s.to_string()))
-                    .or_else(|| complete.matched_stop_json());
+                let matched_stop = matched_stop_value(stop_decoder, &complete);
 
                 let suffix_len = completion_req.suffix.as_ref().map_or(0, |s| s.len());
                 let echo_len = if completion_req.echo {
@@ -1323,6 +1113,160 @@ impl ResponseProcessor {
             system_fingerprint: dispatch.weight_version.clone(),
         })
     }
+}
+
+/// A choice's output decoded through the stop decoder, as every non-streaming
+/// reader decodes it: the text up to a stop, where each token's text ends in
+/// it (the last token taking the decoder's tail), whether a stop fired at any
+/// token or in the tail, and whether the decoder held text back for bytes
+/// still to come.
+#[derive(Debug)]
+struct Decoded {
+    text: String,
+    token_ends: Vec<usize>,
+    stopped: bool,
+    held: bool,
+}
+
+impl Decoded {
+    /// The token ends as the tokenizer's eager boundaries when byte buffering
+    /// released several tokens at once (see `eager_token_ends`); `wanted` is
+    /// the caller's rule for when the spans matter at all.
+    fn with_eager_token_ends(
+        mut self,
+        wanted: bool,
+        tokenizer: &Arc<dyn Tokenizer>,
+        output_ids: &[u32],
+        skip_special_tokens: bool,
+    ) -> Self {
+        if wanted && self.held && tokenizer.uses_byte_fallback() {
+            if let Some(ends) = eager_token_ends(
+                tokenizer,
+                &output_ids[..self.token_ends.len()],
+                skip_special_tokens,
+                &self.text,
+            ) {
+                self.token_ends = ends;
+            }
+        }
+        self
+    }
+}
+
+/// Why a choice could not be decoded, in the words the readers report.
+#[derive(Debug)]
+enum DecodeFailure {
+    Process(String),
+    Finish(String),
+}
+
+impl DecodeFailure {
+    /// The decoder's own words, without the reader's prefix.
+    fn detail(&self) -> &str {
+        match self {
+            Self::Process(detail) | Self::Finish(detail) => detail,
+        }
+    }
+}
+
+impl std::fmt::Display for DecodeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Process(e) => write!(f, "Failed to process tokens: {e}"),
+            Self::Finish(e) => write!(f, "Failed to finish token decoding: {e}"),
+        }
+    }
+}
+
+/// Decode a complete choice's `output_ids` through `stop_decoder`: reset it,
+/// run the tokens with an early break on a stop, finish the decoding (bytes
+/// and a partial stop match; the tail is the last token's), warn about
+/// detokenize recoveries, and note a stop the decoder found at any token or
+/// in the tail.
+fn decode_complete(
+    stop_decoder: &mut StopSequenceDecoder,
+    output_ids: &[u32],
+    request_id: &str,
+    index: u32,
+) -> Result<Decoded, DecodeFailure> {
+    stop_decoder.reset();
+    let outputs = stop_decoder
+        .process_tokens(output_ids)
+        .map_err(|e| DecodeFailure::Process(e.to_string()))?;
+
+    let mut text = String::new();
+    let mut stopped = false;
+    let mut held = false;
+    let mut token_ends = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        match output {
+            SequenceDecoderOutput::Text(t) => text.push_str(&t),
+            SequenceDecoderOutput::StoppedWithText(t) => {
+                text.push_str(&t);
+                stopped = true;
+            }
+            SequenceDecoderOutput::Stopped => stopped = true,
+            SequenceDecoderOutput::Held => held = true,
+        }
+        token_ends.push(text.len());
+        if stopped {
+            break;
+        }
+    }
+
+    let tail = stop_decoder
+        .finish()
+        .map_err(|e| DecodeFailure::Finish(e.to_string()))?;
+    utils::warn_detokenize_recoveries(request_id, index, stop_decoder);
+    if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
+        text.push_str(&t);
+        if let Some(last) = token_ends.last_mut() {
+            *last = text.len();
+        }
+    }
+    stopped |= stop_decoder.is_stopped();
+    Ok(Decoded {
+        text,
+        token_ends,
+        stopped,
+        held,
+    })
+}
+
+/// The finish reason with a local stop-decoder match taking precedence over
+/// the engine's (which is "length" when stop strings are enforced
+/// gateway-side rather than by the backend).
+fn finish_after_local_stop(stopped: bool, complete: &ProtoGenerateComplete) -> &str {
+    if stopped {
+        "stop"
+    } else {
+        complete.finish_reason()
+    }
+}
+
+/// The string stop the local decoder matched (the engine reports no stop over
+/// the ZMQ path), else the engine's value: a stop token's id stays reported.
+fn matched_stop_value(
+    stop_decoder: &StopSequenceDecoder,
+    complete: &ProtoGenerateComplete,
+) -> Option<serde_json::Value> {
+    stop_decoder
+        .matched_stop()
+        .map(|s| serde_json::Value::String(s.to_string()))
+        .or_else(|| complete.matched_stop_json())
+}
+
+/// [`matched_stop_value`] as a Messages stop sequence: the string, or the
+/// engine's value when it is one.
+fn matched_stop_string(
+    stop_decoder: &StopSequenceDecoder,
+    complete: &ProtoGenerateComplete,
+) -> Option<String> {
+    stop_decoder.matched_stop().map(String::from).or_else(|| {
+        complete
+            .matched_stop_json()
+            .and_then(|v| v.as_str().map(String::from))
+    })
 }
 
 // Byte buffering can release several tokens at once. Observe their original
@@ -1638,6 +1582,63 @@ mod responses_finish_reason_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/common/scripted_tokenizer.rs"
         ));
+    }
+
+    /// One decode for every reader: the text, where each token's text ends,
+    /// whether a stop fired; the finish and the matched stop read from it.
+    #[test]
+    fn decoding_a_choice_reports_its_text_token_ends_and_stop() {
+        let tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(scripted_tokenizer::ScriptedTokenizer::from_chunks(vec![
+                "Hel".into(),
+                "lo ".into(),
+                "world".into(),
+                "!".into(),
+            ]));
+        let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+            finish_reason: "length".into(),
+            ..Default::default()
+        });
+
+        // Without a stop: every token's text end, the last at the text's end.
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer.clone(),
+            llm_tokenizer::StopSequenceConfig::default(),
+            false,
+        );
+        let decoded = decode_complete(&mut decoder, &[100, 101, 102, 103], "req", 0).unwrap();
+        assert_eq!(decoded.text, "Hello world!");
+        assert_eq!(decoded.token_ends, vec![3, 6, 11, 12]);
+        assert!(!decoded.stopped);
+        assert_eq!(
+            finish_after_local_stop(decoded.stopped, &complete),
+            "length"
+        );
+        assert_eq!(matched_stop_value(&decoder, &complete), None);
+
+        // A string stop: the text ends before it, the stop fired and is the
+        // finish and the matched stop, whatever the engine said.
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer.clone(),
+            llm_tokenizer::StopSequenceConfig {
+                stop_sequences: vec!["world".to_string()],
+                ..Default::default()
+            },
+            false,
+        );
+        let decoded = decode_complete(&mut decoder, &[100, 101, 102, 103], "req", 0).unwrap();
+        assert_eq!(decoded.text, "Hello ");
+        assert!(decoded.stopped);
+        assert_eq!(decoded.token_ends.last(), Some(&decoded.text.len()));
+        assert_eq!(finish_after_local_stop(decoded.stopped, &complete), "stop");
+        assert_eq!(
+            matched_stop_value(&decoder, &complete),
+            Some(serde_json::Value::String("world".into()))
+        );
+        assert_eq!(
+            matched_stop_string(&decoder, &complete).as_deref(),
+            Some("world")
+        );
     }
 
     #[tokio::test]

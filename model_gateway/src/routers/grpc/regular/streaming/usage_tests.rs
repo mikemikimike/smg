@@ -295,7 +295,6 @@ async fn non_streamed_completion(
             context::ExecutionResult::Single { stream },
             CompletionResponseSpec::from(request),
             dispatch(),
-            tokenizer,
             &mut decoder,
         )
         .await
