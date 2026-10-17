@@ -43,7 +43,7 @@ use super::{
 use crate::{
     config::ParserChoice,
     middleware::TenantRequestMeta,
-    observability::{cache_trace, metrics::Metrics, token_dump::TokenDump},
+    observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
@@ -217,8 +217,6 @@ pub(crate) struct SharedComponents {
     /// The tables the registered tokenizers' response templates compile into, which the parser
     /// name `hf` selects (see `regular::symphony::template`).
     pub templates: Arc<Templates>,
-    /// The token dump, when `--token-dump-dir` enables it.
-    pub token_dump: Option<Arc<TokenDump>>,
 }
 
 /// Ingress-phase state (evolves through preparation, worker selection,
@@ -388,8 +386,6 @@ pub(crate) struct DispatchContext {
     /// reselection refills it.
     pub pd_prefill_guard: Option<PrefillLoadGuard>,
     pub response: ResponseState,
-    /// The token dump, when `--token-dump-dir` enables it.
-    pub token_dump: Option<Arc<TokenDump>>,
 }
 
 impl DispatchContext {
@@ -975,7 +971,6 @@ impl RequestContext {
         };
         drop(request_type);
         let parser = state.parser;
-        let token_dump = components.token_dump.clone();
         drop(components);
         let routing = state.routing_snapshot.ok_or_else(|| {
             error!(
@@ -1034,7 +1029,6 @@ impl RequestContext {
             load_guards: None,
             pd_prefill_guard: state.pd_prefill_guard,
             response: state.response,
-            token_dump,
         })
     }
 

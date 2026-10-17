@@ -615,7 +615,6 @@ mod tests {
             runtime: "sglang",
             transport: Transport::Grpc,
             leg: Leg::Single,
-            root_request_id: None,
         }
     }
 

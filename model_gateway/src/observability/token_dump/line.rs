@@ -27,9 +27,6 @@ pub enum Leg {
 #[serde(rename_all = "snake_case")]
 pub enum Transport {
     Grpc,
-    /// Direct ZMQ: messages are recorded at the gateway's proto boundary,
-    /// before the translation to the engine's own wire format.
-    Zmq,
 }
 
 /// Which message of the engine's response oneof a `response` line holds.
@@ -97,11 +94,9 @@ pub struct CallMeta {
     pub runtime: &'static str,
     pub transport: Transport,
     pub leg: Leg,
-    /// The client request's id, as the request-id middleware assigned it.
-    pub root_request_id: Option<String>,
 }
 
-/// An engine request, as the gRPC router's proto wrapper exposes it.
+/// An engine request, as it went out on the wire.
 #[derive(Debug)]
 pub struct RequestEvent<'a> {
     /// Full protobuf name of the message in `msg`.
@@ -179,7 +174,6 @@ struct RequestLine<'a> {
     transport: Transport,
     leg: Leg,
     request_id: &'a str,
-    root_request_id: Option<&'a str>,
     #[serde(rename = "type")]
     type_name: &'a str,
     input_ids: &'a [u32],
@@ -264,7 +258,6 @@ pub fn request_line(call: u64, t: &str, meta: &CallMeta, event: &RequestEvent<'_
         transport: meta.transport,
         leg: meta.leg,
         request_id: event.request_id,
-        root_request_id: meta.root_request_id.as_deref(),
         type_name: event.type_name,
         input_ids: event.input_ids,
         msg: BASE64.encode(&event.msg),
@@ -382,7 +375,6 @@ mod tests {
             runtime: "sglang",
             transport: Transport::Grpc,
             leg: Leg::Prefill,
-            root_request_id: Some("root".to_string()),
         };
         let event = RequestEvent {
             type_name: "sglang.grpc.scheduler.GenerateRequest",
@@ -397,7 +389,6 @@ mod tests {
             json!({"v":1,"kind":"request","call":7,"t":"2026-10-09T21:00:01.456Z",
                    "model":"m","worker":"grpc://w:1","runtime":"sglang",
                    "transport":"grpc","leg":"prefill","request_id":"r1",
-                   "root_request_id":"root",
                    "type":"sglang.grpc.scheduler.GenerateRequest",
                    "input_ids":[1,2,3],"msg":"CgE="})
         );

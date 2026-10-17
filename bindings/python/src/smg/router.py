@@ -270,8 +270,8 @@ class Router:
             with _RJEM_MALLOC_CONF=prof:true,prof_active:true). Default: None
         token_dump_dir: Directory where token dumps are written (POST /start_token_dump,
             token_dump_on_start); unset, the token dump routes answer 404. Default: None
-        token_dump_on_start: Record every engine call of the gRPC router from startup
-            until shutdown (needs token_dump_dir). Default: False
+        token_dump_on_start: Record every gRPC engine call from startup until
+            shutdown (needs token_dump_dir). Default: False
         token_dump_max_mb: Size cap of one token dump file, in MiB. Default: 1024
         pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default:
             False

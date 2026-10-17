@@ -20,7 +20,10 @@ use tracing::{debug, info, warn};
 use crate::{
     config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
-    observability::{inflight_tracker::InFlightRequestTracker, token_dump::TokenDump},
+    observability::{
+        inflight_tracker::InFlightRequestTracker,
+        token_dump::{DumpTap, TokenDump},
+    },
     policies::PolicyRegistry,
     rate_limit::RateLimitManager,
     routers::{
@@ -522,6 +525,14 @@ impl AppContextBuilder {
 
         let token_dump =
             TokenDump::from_config(&router_config).map_err(AppContextBuildError::InvalidConfig)?;
+        if let Some(dump) = &token_dump {
+            // The dump records the engine clients' calls; the tap is
+            // process-wide, like the gateway's one dump.
+            smg_grpc_client::set_call_tap(Some(Arc::new(DumpTap::new(
+                Arc::clone(dump),
+                Arc::clone(&worker_registry),
+            ))));
+        }
 
         Ok(AppContext {
             gateway_auth,

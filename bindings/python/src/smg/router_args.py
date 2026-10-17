@@ -566,7 +566,7 @@ class RouterArgs:
     # Per-tenant token/request rate limiting
     tenant_rate_limit_config: str | None = None
     tenant_rate_limit_enabled: bool = False
-    # Token dump: every engine call of the gRPC router as JSON lines
+    # Token dump: every gRPC engine call as JSON lines
     token_dump_dir: str | None = None
     token_dump_max_mb: int = 1024
     token_dump_on_start: bool = False
@@ -1822,7 +1822,7 @@ class RouterArgs:
             ),
         )
         token_dump_group = parser.add_argument_group(
-            "Token dump", "Every engine call of the gRPC router, recorded as JSON lines"
+            "Token dump", "Every gRPC engine call, recorded as JSON lines"
         )
         token_dump_group.add_argument(
             f"--{prefix}token-dump-dir",

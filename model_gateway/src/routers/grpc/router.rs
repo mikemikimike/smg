@@ -141,7 +141,6 @@ impl GrpcRouter {
             tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
             parser: ctx.router_config.parser,
             templates: Arc::new(Templates::new(tokenizer_registry.clone())),
-            token_dump: ctx.token_dump.clone(),
         });
 
         // The admission queue's timeout also bounds how long an accepted

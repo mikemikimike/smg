@@ -2799,7 +2799,6 @@ mod tests {
             multimodal_inflight: None,
             pd_prefill_guard: None,
             response: Default::default(),
-            token_dump: None,
         }
     }
 
@@ -4816,7 +4815,6 @@ mod tests {
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
             parser: crate::config::ParserChoice::Legacy,
-            token_dump: None,
         });
         let mut ctx = RequestContext::for_generate(
             Arc::new(request),

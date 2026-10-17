@@ -1,10 +1,15 @@
-//! Token dump: an operator-controlled record of every engine call the gRPC
-//! router makes, for debugging, RL data collection and CI replay.
+//! Token dump: an operator-controlled record of the `Generate` calls the
+//! gateway makes to its engines over gRPC, for debugging, RL data collection
+//! and CI replay.
 //!
 //! `--token-dump-dir` enables it. A session records into one new file,
 //! `<dir>/token-dump-<session>.jsonl`: from boot to shutdown under
 //! `--token-dump-on-start`, or from `POST /start_token_dump` until
 //! `POST /stop_token_dump` or its expiry. One session runs at a time.
+//!
+//! The calls are recorded where the engine clients send them (the
+//! [`DumpTap`] on `smg_grpc_client`'s call tap), from the messages on the
+//! wire, so no router code takes part.
 //!
 //! # Format (v1)
 //!
@@ -14,24 +19,23 @@
 //!
 //! - `session`: first line: the session id, start time, model filter, expiry
 //!   and size cap.
-//! - `request`: an engine call about to be dispatched: model, worker,
-//!   runtime, transport (`grpc`/`zmq`), leg (`single`/`prefill`/`decode`),
-//!   the engine request id, the client's request id, the full protobuf name
-//!   of the message (`type`), its `input_ids` and its base64 protobuf
-//!   encoding (`msg`). On `zmq`, `msg` is the request the gateway built
-//!   before translating it for the engine.
-//! - `response`: each message the engine stream yielded, as the engine sent
-//!   it (an error `Complete` included): `seq` from 0, `t_ms` since the call's
-//!   request line, `part` (`chunk`/`complete`/`empty`), and the `index`,
-//!   `token_ids` and `finish_reason` that message carries, with no
-//!   accumulation across messages.
+//! - `request`: an engine call as it goes out: model, worker, runtime,
+//!   transport (`grpc`), leg (`single`/`prefill`/`decode`), the engine
+//!   request id, the full protobuf name of the message (`type`), its
+//!   `input_ids` and its exact base64 protobuf encoding (`msg`).
+//! - `response`: each message the engine sent (an error `Complete`
+//!   included): `seq` from 0, `t_ms` since the call's request line, `part`
+//!   (`chunk`/`complete`/`empty`), and the `index`, `token_ids` and
+//!   `finish_reason` that message carries, with no accumulation across
+//!   messages.
 //! - `end`: `status` is `ok` (the engine sent every `Complete` the request
 //!   asked for, one per sample, and `t_ms` is when the last one arrived; or
-//!   the stream ended, or the gateway marked it completed), `error`,
-//!   `cancelled` (the gateway dropped the call before the engine finished it)
-//!   or `start_failed`, with the `error` code and message for the failures;
-//!   `responses` counts the call's response lines, so a reader can tell when
-//!   some were dropped.
+//!   it ended the call with status OK), `error` (it failed the call after a
+//!   response), `start_failed` (before one) or `cancelled` (the gateway let
+//!   go of the call before the engine ended it), with the `error` code and
+//!   message for the failures; a failure below gRPC reads `Unavailable`.
+//!   `responses` counts the call's response lines, so a reader can tell
+//!   when some were dropped.
 //! - `session_end`: last line: the reason (`stopped`/`expired`/`shutdown`)
 //!   and the session's counters. A file without it was cut short and its
 //!   last line may be partial.
@@ -43,6 +47,7 @@
 
 pub mod line;
 mod session;
+mod tap;
 
 use std::{
     io,
@@ -71,6 +76,7 @@ pub use self::{
         Transport,
     },
     session::{CallRecorder, Session},
+    tap::DumpTap,
 };
 use crate::config::RouterConfig;
 
@@ -174,13 +180,18 @@ impl TokenDump {
         Ok(Some(dump))
     }
 
-    /// The session to record a call to `model` into, if one is running for
-    /// it and has not expired.
-    pub fn session_for(&self, model: &str) -> Option<Arc<Session>> {
+    /// The running session, while it takes calls: not full, not expired.
+    pub fn session(&self) -> Option<Arc<Session>> {
         let current = self.current.load();
         let session = Option::as_ref(&*current)?;
-        (session.records_model(model) && !session.is_full() && !session.expired(Instant::now()))
-            .then(|| Arc::clone(session))
+        (!session.is_full() && !session.expired(Instant::now())).then(|| Arc::clone(session))
+    }
+
+    /// The session to record a call to `model` into, if one is running for
+    /// it and takes calls.
+    pub fn session_for(&self, model: &str) -> Option<Arc<Session>> {
+        self.session()
+            .filter(|session| session.records_model(model))
     }
 
     /// Start a session with a time limit. Blocking: it creates the file.
@@ -611,7 +622,6 @@ mod tests {
                 runtime: "sglang",
                 transport: Transport::Grpc,
                 leg: Leg::Single,
-                root_request_id: None,
             };
             for _ in 0..100 {
                 if session.is_full() {
@@ -645,7 +655,6 @@ mod tests {
             runtime: "sglang",
             transport: Transport::Grpc,
             leg: Leg::Single,
-            root_request_id: None,
         };
         let request = || RequestEvent {
             type_name: "t.Request",

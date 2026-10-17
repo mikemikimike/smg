@@ -1112,8 +1112,8 @@ struct ServingArgs {
 
     // ==================== Token dump ====================
     /// Directory where token dumps are written: `POST /start_token_dump` (an
-    /// admin route) and `--token-dump-on-start` record every engine call of the
-    /// gRPC router there, one JSON line per event; unset, the routes answer 404
+    /// admin route) and `--token-dump-on-start` record every gRPC engine call
+    /// there, one JSON line per event; unset, the routes answer 404
     #[arg(long, help_heading = "Token Dump")]
     token_dump_dir: Option<String>,
 

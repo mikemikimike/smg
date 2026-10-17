@@ -33,6 +33,10 @@ use smg::{
 };
 use tokio::net::TcpListener;
 
+/// The dump records through the engine clients' call tap, which is
+/// process-wide: one test at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const MODEL: &str = "token-dump-test-model";
 /// Tokens the canned mock emits per request.
 const OUTPUT_TOKENS: u32 = 3;
@@ -292,6 +296,7 @@ fn kinds(call: &[Value]) -> Vec<&str> {
 
 #[tokio::test]
 async fn single_worker_calls_record_what_the_engine_saw_and_sent() {
+    let _serial = SERIAL.lock().await;
     let dump_dir = tempfile::tempdir().unwrap();
     let capture_dir = tempfile::tempdir().unwrap();
     let capture = capture_dir.path().join("capture.jsonl");
@@ -360,6 +365,7 @@ async fn single_worker_calls_record_what_the_engine_saw_and_sent() {
 
 #[tokio::test]
 async fn a_pd_request_records_both_legs() {
+    let _serial = SERIAL.lock().await;
     let dump_dir = tempfile::tempdir().unwrap();
     let prefill = start_mock_worker(None, Duration::ZERO).await;
     let decode = start_mock_worker(None, Duration::ZERO).await;
@@ -406,6 +412,7 @@ async fn a_pd_request_records_both_legs() {
 
 #[tokio::test]
 async fn a_call_dropped_before_the_engine_answers_is_recorded_cancelled() {
+    let _serial = SERIAL.lock().await;
     let dump_dir = tempfile::tempdir().unwrap();
     // The mock holds its answer far longer than the client waits.
     let port = start_mock_worker(None, Duration::from_secs(30)).await;
@@ -440,6 +447,7 @@ async fn a_call_dropped_before_the_engine_answers_is_recorded_cancelled() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_call_the_engine_refuses_is_recorded_start_failed() {
+    let _serial = SERIAL.lock().await;
     let dump_dir = tempfile::tempdir().unwrap();
     let port = start_mock_worker(Some(PathBuf::from("/dev/full")), Duration::ZERO).await;
     let (router, app) = build_router(
@@ -467,6 +475,7 @@ async fn a_call_the_engine_refuses_is_recorded_start_failed() {
 
 #[tokio::test]
 async fn a_runtime_session_records_only_while_it_runs() {
+    let _serial = SERIAL.lock().await;
     let dump_dir = tempfile::tempdir().unwrap();
     let port = start_mock_worker(None, Duration::ZERO).await;
     let (router, app) = build_router(

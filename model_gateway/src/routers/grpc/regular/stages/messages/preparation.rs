@@ -439,7 +439,6 @@ mod tests {
             tokenizer_autoload: true,
             tokenizer_load_failures: Arc::default(),
             parser: crate::config::ParserChoice::Legacy,
-            token_dump: None,
         });
         for (output_config, rendered) in [
             (json!({"effort": "high"}), Ok("effort=high")),
