@@ -532,6 +532,8 @@ impl StreamingProcessor {
         // and borrow the delta's text, and the buffer is recycled once the step's chunks are out.
         let mut decoded = Decoded::default();
         let mut spare = Events::new();
+        // A rechunked stream keeps one chunk per event: the rechunker reads each delta's shape.
+        let per_event = original_request.provider == ProviderProfile::Minimax;
 
         // Phase 2: Main streaming loop
         let mut final_indices: Option<Vec<(u32, bool)>> = None;
@@ -707,6 +709,7 @@ impl StreamingProcessor {
                             choice_logprobs,
                             usage.as_ref(),
                             emit_usage_null,
+                            per_event,
                         )
                         .await?;
                         spare = events.recycle();
@@ -837,6 +840,7 @@ impl StreamingProcessor {
                             None,
                             usage.as_ref(),
                             emit_usage_null,
+                            per_event,
                         )
                         .await?;
                         spare = events.recycle();
@@ -902,6 +906,7 @@ impl StreamingProcessor {
                             None,
                             usage.as_ref(),
                             emit_usage_null,
+                            per_event,
                         )
                         .await?;
                         spare = events.recycle();
@@ -2195,13 +2200,15 @@ impl StreamingProcessor {
         Ok(())
     }
 
-    /// Write the chunks Symphony's events make for the choice at `index`: the
-    /// delta each event has, the chunk's logprobs on its first text delta. The
-    /// `Finish` event writes nothing here: the finish chunk is the loop's, with
-    /// the matched stop. The opening chunk carried the role, so the deltas do
-    /// not repeat it, as the older path's do not. The step's events are consumed
-    /// out of the buffer, which keeps its room for the next step: what an event
-    /// owns moves into its chunk, a borrowed text is copied into it once.
+    /// Write the one chunk Symphony's events of a step make for the choice at
+    /// `index` (`adapt::chat::step`): the step's text, reasoning and calls in
+    /// one delta, the chunk's logprobs on it when it carries text. The `Finish`
+    /// event writes nothing here: the finish chunk is the loop's, with the
+    /// matched stop. The opening chunk carried the role, so the delta does not
+    /// repeat it, as the older path's do not. A stream the response rechunks
+    /// (`per_event`) keeps one chunk per event, since the rechunker reads each
+    /// delta's shape and order. The step's events are consumed out of the
+    /// buffer, which keeps its room for the next step.
     #[expect(clippy::too_many_arguments)]
     async fn push_events(
         tx: &SseSender,
@@ -2212,23 +2219,35 @@ impl StreamingProcessor {
         mut logprobs: Option<ChatLogProbs>,
         usage: Option<&Usage>,
         emit_usage_null: bool,
+        per_event: bool,
     ) -> Result<(), String> {
-        for event in events.consume() {
-            let Some(mut choice) = adapt::chat::into_delta(index, event) else {
-                continue;
-            };
-            if choice.finish_reason.is_some() {
-                continue;
+        if per_event {
+            for event in events.consume() {
+                let Some(mut choice) = adapt::chat::into_delta(index, event) else {
+                    continue;
+                };
+                if choice.finish_reason.is_some() {
+                    continue;
+                }
+                choice.delta.role = None;
+                if choice.delta.content.is_some() || choice.delta.reasoning_content.is_some() {
+                    choice.logprobs = logprobs.take();
+                }
+                Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null)
+                    .await
+                    .map_err(|()| "Failed to send chunk".to_string())?;
             }
-            choice.delta.role = None;
-            if choice.delta.content.is_some() || choice.delta.reasoning_content.is_some() {
-                choice.logprobs = logprobs.take();
-            }
-            Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null)
-                .await
-                .map_err(|()| "Failed to send chunk".to_string())?;
+            return Ok(());
         }
-        Ok(())
+        let Some(mut choice) = adapt::chat::step(index, events.consume()) else {
+            return Ok(());
+        };
+        if choice.delta.content.is_some() || choice.delta.reasoning_content.is_some() {
+            choice.logprobs = logprobs;
+        }
+        Self::push_chunk(tx, buffer, frame, &choice, usage, emit_usage_null)
+            .await
+            .map_err(|()| "Failed to send chunk".to_string())
     }
 
     /// Hand the buffered chunks, if any, to the channel as one frame.
@@ -2325,10 +2344,11 @@ impl StreamingProcessor {
         stop
     }
 
-    /// Feeds Symphony's `events` to the content-block `machine` and sends the stream events it
-    /// gives, in order, the `thinking_delta`s only when `thinking_text` (a `thinking.display` of
-    /// `omitted` keeps the thinking block, its start and its stop, and no text); the stop reason
-    /// when a `Finish` was among the events.
+    /// Feeds Symphony's `events`, one step's, to the content-block `machine` and sends the stream
+    /// events it gives, in order, the deltas of one block in a step joined into one
+    /// (`adapt::messages::Stream::feed_step`), the `thinking_delta`s only when `thinking_text` (a
+    /// `thinking.display` of `omitted` keeps the thinking block, its start and its stop, and no
+    /// text); the stop reason when a `Finish` was among the events.
     async fn send_symphony_blocks(
         tx: &SseSender,
         buffer: &mut Vec<u8>,
@@ -2336,11 +2356,8 @@ impl StreamingProcessor {
         events: &[Event<'_>],
         thinking_text: bool,
     ) -> Result<Option<messages::StopReason>, utils::StreamFailure> {
-        let mut stop = None;
         let mut blocks = Vec::new();
-        for event in events {
-            stop = machine.feed(event, &mut blocks).or(stop);
-        }
+        let stop = machine.feed_step(events, &mut blocks);
         for block in &blocks {
             let thinking_delta = matches!(
                 block,

@@ -156,6 +156,25 @@ impl Stream {
         None
     }
 
+    /// Feeds a step's events in order, as [`Stream::feed`] does one, and coalesces the deltas
+    /// they make for one block: the stream events for `events` are appended to `out` with at
+    /// most one `content_block_delta` per block and kind in a row, so a step that completes
+    /// several runs of one block sends one delta. Returns the stop reason when `Finish` was among
+    /// the events.
+    pub fn feed_step(
+        &mut self,
+        events: &[Event<'_>],
+        out: &mut Vec<MessageStreamEvent>,
+    ) -> Option<StopReason> {
+        let from = out.len();
+        let mut stop = None;
+        for event in events {
+            stop = self.feed(event, out).or(stop);
+        }
+        coalesce(out, from);
+        stop
+    }
+
     /// Ends the stream's blocks: stops the open block, if any, and lets held whitespace go. For a
     /// stream that ends without `Finish`; `feed` does this itself at `Finish`.
     pub fn close(&mut self, out: &mut Vec<MessageStreamEvent>) {
@@ -263,6 +282,55 @@ impl Stream {
             content_block,
         });
         self.open = Some(block);
+    }
+}
+
+/// Joins the deltas from `from` on that continue the one before them, in place: the same block
+/// and the same kind of delta, text to text, thinking to thinking, JSON to JSON. A step of one
+/// event, the usual one, is left as it is.
+fn coalesce(out: &mut Vec<MessageStreamEvent>, from: usize) {
+    if out.len() < from + 2 {
+        return;
+    }
+    let mut kept = from;
+    for next in from + 1..out.len() {
+        let (before, after) = out.split_at_mut(next);
+        if !joined(&mut before[kept], &mut after[0]) {
+            kept += 1;
+            out.swap(kept, next);
+        }
+    }
+    out.truncate(kept + 1);
+}
+
+/// Whether `next` continues `last`, and if so its text appended to `last`'s.
+fn joined(last: &mut MessageStreamEvent, next: &mut MessageStreamEvent) -> bool {
+    match (last, next) {
+        (
+            MessageStreamEvent::ContentBlockDelta { index, delta },
+            MessageStreamEvent::ContentBlockDelta {
+                index: of_next,
+                delta: more,
+            },
+        ) if index == of_next => match (delta, more) {
+            (
+                ContentBlockDelta::TextDelta { text },
+                ContentBlockDelta::TextDelta { text: more },
+            )
+            | (
+                ContentBlockDelta::ThinkingDelta { thinking: text },
+                ContentBlockDelta::ThinkingDelta { thinking: more },
+            )
+            | (
+                ContentBlockDelta::InputJsonDelta { partial_json: text },
+                ContentBlockDelta::InputJsonDelta { partial_json: more },
+            ) => {
+                text.push_str(more);
+                true
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -653,6 +721,64 @@ mod tests {
         let (out, stop) = stream(&[finish(FinishReason::Length, 1)]);
         assert!(out.is_empty(), "no block was open: {out:?}");
         assert_eq!(stop, Some(StopReason::MaxTokens));
+    }
+
+    #[test]
+    fn a_step_sends_one_delta_per_block_where_its_events_made_several() {
+        let step = [
+            Event::Content(Text::uncounted("Sure")),
+            Event::Malformed {
+                text: Text::uncounted("."),
+                why: MalformedReason::UnknownTool,
+            },
+            call(0, "f"),
+            arguments(0, r#"{"a":"#),
+            arguments(0, "1}"),
+            end(0),
+            finish(FinishReason::Stop, 1),
+        ];
+        let deltas = |events: &[MessageStreamEvent]| -> Vec<Value> {
+            events
+                .iter()
+                .filter(|event| matches!(event, MessageStreamEvent::ContentBlockDelta { .. }))
+                .map(event_wire)
+                .collect()
+        };
+        let rest = |events: &[MessageStreamEvent]| -> Vec<Value> {
+            events
+                .iter()
+                .filter(|event| !matches!(event, MessageStreamEvent::ContentBlockDelta { .. }))
+                .map(event_wire)
+                .collect()
+        };
+        let (one_by_one, _) = stream(&step);
+        assert_eq!(deltas(&one_by_one).len(), 4, "two text runs, two fragments");
+        let mut machine = Stream::new();
+        let mut out = Vec::new();
+        assert_eq!(
+            machine.feed_step(&step, &mut out),
+            Some(StopReason::ToolUse)
+        );
+        assert_eq!(
+            deltas(&out),
+            [
+                json!({"type": "content_block_delta", "index": 0,
+                       "delta": {"type": "text_delta", "text": "Sure."}}),
+                json!({"type": "content_block_delta", "index": 1,
+                       "delta": {"type": "input_json_delta", "partial_json": "{\"a\":1}"}}),
+            ]
+        );
+        assert_eq!(
+            rest(&out),
+            rest(&one_by_one),
+            "the joining changes nothing else"
+        );
+        // The next step's text is its own delta: joining stays inside a step.
+        let mut next = Vec::new();
+        let mut machine = Stream::new();
+        machine.feed_step(&[Event::Content(Text::uncounted("one"))], &mut next);
+        machine.feed_step(&[Event::Content(Text::uncounted("two"))], &mut next);
+        assert_eq!(deltas(&next).len(), 2);
     }
 
     #[test]

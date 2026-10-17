@@ -287,6 +287,25 @@ impl Stream {
         None
     }
 
+    /// Feeds a step's events in order, as [`Stream::feed`] does one, and coalesces the deltas
+    /// they make for one part: the stream events for `events` are appended to `out` with at most
+    /// one text, reasoning or arguments delta per item in a row, so a step that completes several
+    /// runs of one part sends one delta. Returns the response's [`Output`] when `Finish` was among
+    /// the events.
+    pub fn feed_step(
+        &mut self,
+        events: &[Event<'_>],
+        out: &mut Vec<StreamEvent>,
+    ) -> Option<Output> {
+        let from = out.len();
+        let mut output = None;
+        for event in events {
+            output = self.feed(event, out).or(output);
+        }
+        coalesce(out, from);
+        output
+    }
+
     /// Completes every open item and returns the [`Output`] for a stream that ends without
     /// `Finish`: the response and its items still in progress.
     pub fn close(&mut self, out: &mut Vec<StreamEvent>) -> Output {
@@ -674,6 +693,76 @@ fn response_status(finish: Option<&FinishReason>) -> (ResponseStatus, Option<Inc
 /// model closed without any, so they are whole too.
 fn whole_arguments(arguments: &str) -> bool {
     arguments.is_empty() || serde_json::from_str::<IgnoredAny>(arguments).is_ok()
+}
+
+/// Joins the deltas from `from` on that continue the one before them, in place: the same item
+/// and part, the same kind of delta. A step of one event, the usual one, is left as it is.
+fn coalesce(out: &mut Vec<StreamEvent>, from: usize) {
+    if out.len() < from + 2 {
+        return;
+    }
+    let mut kept = from;
+    for next in from + 1..out.len() {
+        let (before, after) = out.split_at_mut(next);
+        if !joined(&mut before[kept], &mut after[0]) {
+            kept += 1;
+            out.swap(kept, next);
+        }
+    }
+    out.truncate(kept + 1);
+}
+
+/// Whether `next` continues `last`, and if so its text appended to `last`'s.
+fn joined(last: &mut StreamEvent, next: &mut StreamEvent) -> bool {
+    match (last, next) {
+        (
+            StreamEvent::OutputTextDelta {
+                output_index,
+                content_index,
+                delta,
+                ..
+            },
+            StreamEvent::OutputTextDelta {
+                output_index: of_next,
+                content_index: part,
+                delta: more,
+                ..
+            },
+        )
+        | (
+            StreamEvent::ReasoningTextDelta {
+                output_index,
+                content_index,
+                delta,
+                ..
+            },
+            StreamEvent::ReasoningTextDelta {
+                output_index: of_next,
+                content_index: part,
+                delta: more,
+                ..
+            },
+        ) if output_index == of_next && content_index == part => {
+            delta.push_str(more);
+            true
+        }
+        (
+            StreamEvent::FunctionCallArgumentsDelta {
+                output_index,
+                delta,
+                ..
+            },
+            StreamEvent::FunctionCallArgumentsDelta {
+                output_index: of_next,
+                delta: more,
+                ..
+            },
+        ) if output_index == of_next => {
+            delta.push_str(more);
+            true
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1409,6 +1498,78 @@ mod tests {
                 "{expected} in {seen:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_step_sends_one_delta_per_part_where_its_events_made_several() {
+        let step = [
+            Event::Reasoning(Text::uncounted("pl")),
+            Event::Dropped {
+                text: Text::uncounted("|"),
+                why: DropReason::Wrapper,
+            },
+            Event::Reasoning(Text::uncounted("an")),
+            Event::ReasoningEnd,
+            Event::Content(Text::uncounted("Sure")),
+            Event::Malformed {
+                text: Text::uncounted("."),
+                why: MalformedReason::UnknownTool,
+            },
+            call(0, "f"),
+            arguments(0, r#"{"a":"#),
+            arguments(0, "1}"),
+            end(0),
+        ];
+        let is_delta = |event: &StreamEvent| {
+            matches!(
+                event,
+                StreamEvent::OutputTextDelta { .. }
+                    | StreamEvent::ReasoningTextDelta { .. }
+                    | StreamEvent::FunctionCallArgumentsDelta { .. }
+            )
+        };
+        let (one_by_one, _) = stream("resp_s", &step);
+        assert_eq!(one_by_one.iter().filter(|event| is_delta(event)).count(), 6);
+        let mut machine = Stream::new("resp_s");
+        let mut out = Vec::new();
+        assert!(machine.feed_step(&step, &mut out).is_none());
+        let deltas: Vec<(String, String)> = out
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ReasoningTextDelta { delta, .. } => {
+                    Some(("reasoning".to_string(), delta.clone()))
+                }
+                StreamEvent::OutputTextDelta { delta, .. } => {
+                    Some(("text".to_string(), delta.clone()))
+                }
+                StreamEvent::FunctionCallArgumentsDelta { delta, .. } => {
+                    Some(("arguments".to_string(), delta.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            deltas,
+            [
+                ("reasoning".to_string(), "plan".to_string()),
+                ("text".to_string(), "Sure.".to_string()),
+                ("arguments".to_string(), "{\"a\":1}".to_string()),
+            ]
+        );
+        let rest = |events: &[StreamEvent]| -> Vec<String> {
+            types(
+                &events
+                    .iter()
+                    .filter(|event| !is_delta(event))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            rest(&out),
+            rest(&one_by_one),
+            "the joining changes nothing else"
+        );
     }
 
     #[test]
