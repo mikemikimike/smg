@@ -93,10 +93,10 @@ and a client that wants the raw text back can have it.
   and its trailer before the closing marker, with the assembler that reads it: a marker whose
   header does not match opens no call and is given back to the state it came in.
 - `grammar`: the structural-tag derivation and its per-syntax spellings (`keyed`, `xtml`,
-  `tagged`, `pythonic`, `attributed` for MiniMax M2's, dots3's, MiniCPM5's and DSML's, and `xml`
-  for MiniMax M3's; the JSON, compact keyed, list, Inkling and Mistral spellings in the module
-  itself), with
-  the argument shapes a JSON schema pins (`schema`).
+  `tagged`, `pythonic`, `attributed` for MiniMax M2's, dots3's, MiniCPM5's and DSML's, `xml`
+  for MiniMax M3's, `json` for the JSON family's: a call's object, xLAM's and Llama Nemotron's
+  lists, Inkling's named JSON and Mistral's named arguments; the compact keyed spelling sits beside
+  `keyed`'s), with the argument shapes a JSON schema pins (`schema`).
 - `adapt`: the three API adapters, every response policy in one place.
 - `event`, `input`, `parser`: the contract above.
 
