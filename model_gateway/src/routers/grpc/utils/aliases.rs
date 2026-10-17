@@ -31,7 +31,7 @@ pub fn answering_to(name: &str) -> Option<Table> {
 /// among them, which leaves its channel as written, which no table reads for. A row may also be
 /// the name a downstream launcher passes for a model family whose table has no older parser
 /// (`muse` for `muse_spark`), so that the launcher's flags read with the table.
-pub const ALIASES: [(&str, Table); 15] = [
+pub const ALIASES: [(&str, Table); 16] = [
     ("qwen", Table::Qwen3),
     ("qwen_xml", Table::Qwen3Tagged),
     ("qwen_coder", Table::Qwen3Tagged),
@@ -42,6 +42,7 @@ pub const ALIASES: [(&str, Table); 15] = [
     ("deepseek32", Table::DeepSeekV3_2),
     ("deepseek_v41", Table::DeepSeekV4_1),
     ("pythonic", Table::Llama4),
+    ("llama4_pythonic", Table::Llama4),
     ("minimax", Table::MinimaxM2),
     ("muse", Table::MuseSpark),
     ("kimik2", Table::KimiK2),
