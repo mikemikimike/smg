@@ -1043,6 +1043,20 @@ const GROUPS: &[Group] = &[
         status: Status::Replaying,
     },
     Group {
+        slug: "gpt-oss-20b",
+        model: "openai/gpt-oss-20b",
+        also: &[
+            "gpt-oss-120b",
+            "gpt-oss-safeguard-20b",
+            "gpt-oss-safeguard-120b",
+        ],
+        released: "2025-08-04",
+        smg: (None, None),
+        table: Some(Table::GptOss),
+        set: None,
+        status: Status::AwaitingFixtures,
+    },
+    Group {
         slug: "granite-4.1-3b",
         model: "ibm-granite/granite-4.1-3b",
         also: &["granite-4.1-30b"],

@@ -305,6 +305,10 @@ fn muse_spark() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::MuseSpark.format(), Declared::default()))
 }
 
+fn gpt_oss() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::GptOss.format(), Declared::default()))
+}
+
 fn mistral_v13() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::MistralV13.format(), Declared::default()))
 }
@@ -872,6 +876,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::MuseSpark),
     },
     Subject {
+        name: "gpt-oss",
+        new: gpt_oss,
+        outputs: GPT_OSS_TABLE_OUTPUTS,
+        table: Some(Table::GptOss),
+    },
+    Subject {
         name: "plain",
         new: plain,
         outputs: PLAIN_OUTPUTS,
@@ -1166,6 +1176,33 @@ const MUSE_SPARK_OUTPUTS: &[&str] = &[
     "<atem:invoke id=\"1\">text</atem:invoke> to=user<|message|>Hi",
     " to=self<|message|>A thought cut<|eom|><|start|>assistant to=us",
     "unframed text",
+];
+
+/// The gpt-oss table: the template's spelling (a thought, then the recipient in the role
+/// section with the bare content type), the documented one (the recipient after the channel,
+/// the content type constrained), two calls with the first's `<|call|>` as text, a preamble on
+/// the commentary channel before a call with no space before the constraint, a thought and an
+/// answer, an answer alone, an answer under a content type, a call on the analysis channel, a
+/// call cut short, a recipient with no name, a header the end leaves unfinished, arguments that
+/// are not JSON, text after the arguments, a message to a built-in tool on each channel, and
+/// nothing.
+const GPT_OSS_TABLE_OUTPUTS: &[&str] = &[
+    "<|channel|>analysis<|message|>Need the weather.<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Paris\"}",
+    "<|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>{\"city\": \"Paris\", \"days\": 3}",
+    " to=functions.get_stock_price<|channel|>commentary json<|message|>{}<|call|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Rome\"}",
+    "<|channel|>commentary<|message|>Checking.<|end|><|start|>assistant<|channel|>commentary to=functions.lookup<|constrain|>json<|message|>{\"q\": [1, 2.5, null]}",
+    "<|channel|>analysis<|message|>Plan.<|end|><|start|>assistant<|channel|>final<|message|>It is sunny.",
+    "<|channel|>final<|message|>Hello!",
+    "<|channel|>final <|constrain|>json<|message|>{\"answer\": 42}",
+    "<|channel|>analysis to=functions.get_weather <|constrain|>json<|message|>{\"city\": \"Paris\"}",
+    "<|channel|>commentary to=functions.get_weather<|message|>{\"city\": \"Par",
+    "<|channel|>commentary to=functions.<|channel|>final<|message|>Hi",
+    "<|channel|>analysis<|message|>Plan.<|end|><|start|>assistant<|chan",
+    "<|channel|>commentary to=functions.f<|message|>not json",
+    "<|channel|>commentary to=functions.f<|message|>{} trailing<|end|>",
+    "<|channel|>analysis to=python<|message|>print(1)<|call|>",
+    "<|channel|>commentary to=browser.search <|constrain|>json<|message|>{\"query\": \"x\"}<|call|>",
+    "",
 ];
 
 /// Kimi K3's syntax: the recorded shape, a thought with text, every value type, calls ended every

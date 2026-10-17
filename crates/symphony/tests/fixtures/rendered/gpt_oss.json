@@ -1,0 +1,453 @@
+{
+ "table": "gpt_oss",
+ "source": {
+  "repository": "openai/gpt-oss-20b",
+  "revision": "6cee5e81ee83917806bbde320786a8fb61efebee",
+  "file": "chat_template.jinja",
+  "sha256": "a4c9919cbbd4acdd51ccffe22da049264b1b73e59055fa58811a99efbd7c8146",
+  "also": [
+   "openai/gpt-oss-120b",
+   "openai/gpt-oss-safeguard-20b",
+   "openai/gpt-oss-safeguard-120b"
+  ],
+  "rendered_as": "transformers renders a chat template: trim_blocks, lstrip_blocks, loopcontrols, tojson = json.dumps(ensure_ascii=False), strftime_now pinned to 2026-01-01",
+  "script": "scripts/render_gpt_oss_turns.py"
+ },
+ "notes": [
+  "A turn is the history rendered with the turn's messages minus the generation prompt, minus the stop token that ends it (<|return|> after an answer, <|call|> after a call), which the stop decoder hides from the parser.",
+  "The template writes a call's recipient in the header's role section (`<|start|>assistant to=functions.NAME<|channel|>commentary json<|message|>`) and each call as a message of its own, so a turn of two calls holds the first's <|call|> as text; a live stream stops at the first.",
+  "The template renders the thought of a message with calls only while no later message answers; an answer's thought is dropped from the history, so a thought stands in a fixture only where the turn is the last one rendered.",
+  "The tail is the prompt from its last user message; the replay starts after the prompt's last <|start|>assistant."
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "get_weather",
+    "description": "The weather in a city.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "unit": {
+       "type": "string"
+      },
+      "days": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "get_stock_price",
+    "description": "A stock's price.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "ticker": {
+       "type": "string"
+      }
+     }
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "save_note",
+    "description": "Save a note.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "title": {
+       "type": "string"
+      },
+      "body": {
+       "type": "string"
+      },
+      "tags": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      },
+      "meta": {
+       "type": "object"
+      }
+     }
+    }
+   }
+  }
+ ],
+ "turns": [
+  {
+   "name": "answer",
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "It is sunny in Paris."
+    }
+   ],
+   "tail": "<|start|>user<|message|>Weather in Paris?<|end|><|start|>assistant",
+   "output": "<|channel|>final<|message|>It is sunny in Paris.",
+   "reasoning": "",
+   "content": "It is sunny in Paris.",
+   "calls": []
+  },
+  {
+   "name": "thought-answer",
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "It is sunny in Paris.",
+     "thinking": "The user asks about Paris; no tool is needed."
+    }
+   ],
+   "tail": "<|start|>user<|message|>Weather in Paris?<|end|><|start|>assistant",
+   "output": "<|channel|>analysis<|message|>The user asks about Paris; no tool is needed.<|end|><|start|>assistant<|channel|>final<|message|>It is sunny in Paris.",
+   "reasoning": "The user asks about Paris; no tool is needed.",
+   "content": "It is sunny in Paris.",
+   "calls": []
+  },
+  {
+   "name": "call",
+   "messages": [
+    {
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tail": "<|start|>user<|message|>Weather in Paris?<|end|><|start|>assistant",
+   "output": " to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Paris\"}",
+   "reasoning": "",
+   "content": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Paris"
+     }
+    }
+   ]
+  },
+  {
+   "name": "thought-call",
+   "messages": [
+    {
+     "role": "assistant",
+     "thinking": "Need the weather.",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tail": "<|start|>user<|message|>Weather in Paris?<|end|><|start|>assistant",
+   "output": "<|channel|>analysis<|message|>Need the weather.<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Paris\"}",
+   "reasoning": "Need the weather.",
+   "content": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Paris"
+     }
+    }
+   ]
+  },
+  {
+   "name": "calls-two",
+   "messages": [
+    {
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome",
+         "days": 3
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tail": "<|start|>user<|message|>Weather in Paris?<|end|><|start|>assistant",
+   "output": " to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Paris\"}<|call|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Rome\", \"days\": 3}",
+   "reasoning": "",
+   "content": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Paris"
+     }
+    },
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Rome",
+      "days": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "thought-calls-three",
+   "messages": [
+    {
+     "role": "assistant",
+     "thinking": "Paris, Rome and a note.",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome",
+         "unit": "celsius"
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "save_note",
+        "arguments": {
+         "title": "Trip",
+         "tags": [
+          "a",
+          "b"
+         ]
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tail": "<|start|>user<|message|>Weather in Paris?<|end|><|start|>assistant",
+   "output": "<|channel|>analysis<|message|>Paris, Rome and a note.<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Paris\"}<|call|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Rome\", \"unit\": \"celsius\"}<|call|><|start|>assistant to=functions.save_note<|channel|>commentary json<|message|>{\"title\": \"Trip\", \"tags\": [\"a\", \"b\"]}",
+   "reasoning": "Paris, Rome and a note.",
+   "content": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Paris"
+     }
+    },
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Rome",
+      "unit": "celsius"
+     }
+    },
+    {
+     "name": "save_note",
+     "arguments": {
+      "title": "Trip",
+      "tags": [
+       "a",
+       "b"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "name": "call-empty-arguments",
+   "messages": [
+    {
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_stock_price",
+        "arguments": {}
+       }
+      }
+     ]
+    }
+   ],
+   "tail": "<|start|>user<|message|>Weather in Paris?<|end|><|start|>assistant",
+   "output": " to=functions.get_stock_price<|channel|>commentary json<|message|>{}",
+   "reasoning": "",
+   "content": "",
+   "calls": [
+    {
+     "name": "get_stock_price",
+     "arguments": {}
+    }
+   ]
+  },
+  {
+   "name": "call-nested-unicode",
+   "messages": [
+    {
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "save_note",
+        "arguments": {
+         "title": "計画 🌍",
+         "body": "a \"q\" \\ b\nc",
+         "tags": [
+          "a",
+          "b"
+         ],
+         "meta": {
+          "nested": {
+           "deep": [
+            1,
+            2.5,
+            true,
+            null
+           ]
+          }
+         }
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tail": "<|start|>user<|message|>Weather in Paris?<|end|><|start|>assistant",
+   "output": " to=functions.save_note<|channel|>commentary json<|message|>{\"title\": \"計画 🌍\", \"body\": \"a \\\"q\\\" \\\\ b\\nc\", \"tags\": [\"a\", \"b\"], \"meta\": {\"nested\": {\"deep\": [1, 2.5, true, null]}}}",
+   "reasoning": "",
+   "content": "",
+   "calls": [
+    {
+     "name": "save_note",
+     "arguments": {
+      "title": "計画 🌍",
+      "body": "a \"q\" \\ b\nc",
+      "tags": [
+       "a",
+       "b"
+      ],
+      "meta": {
+       "nested": {
+        "deep": [
+         1,
+         2.5,
+         true,
+         null
+        ]
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "name": "answer-after-tool-result",
+   "messages": [
+    {
+     "role": "assistant",
+     "content": "It is 18 degrees in Paris."
+    }
+   ],
+   "tail": "<|start|>user<|message|>Weather in Paris?<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Paris\"}<|call|><|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>\"{\\\"temperature\\\": 18}\"<|end|><|start|>assistant",
+   "output": "<|channel|>final<|message|>It is 18 degrees in Paris.",
+   "reasoning": "",
+   "content": "It is 18 degrees in Paris.",
+   "calls": []
+  },
+  {
+   "name": "thought-call-after-tool-result",
+   "messages": [
+    {
+     "role": "assistant",
+     "thinking": "Rome too.",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Rome"
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "tail": "<|start|>user<|message|>Weather in Paris?<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Paris\"}<|call|><|start|>functions.get_weather to=assistant<|channel|>commentary<|message|>\"{\\\"temperature\\\": 18}\"<|end|><|start|>assistant",
+   "output": "<|channel|>analysis<|message|>Rome too.<|end|><|start|>assistant to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Rome\"}",
+   "reasoning": "Rome too.",
+   "content": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Rome"
+     }
+    }
+   ]
+  }
+ ]
+}

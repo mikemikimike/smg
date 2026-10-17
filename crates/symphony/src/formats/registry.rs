@@ -21,9 +21,9 @@
 use std::sync::LazyLock;
 
 use super::{
-    deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, hy4, inkling, iquest,
-    json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2, minimax_m3,
-    mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
+    deepseek_v4, deepseek_v4_1, dots3, function_gemma, gemma4, glm, glm4, gpt_oss, hy4, inkling,
+    iquest, json, k2_horizon, kimi_k3, lfm2_5, ling, llama_nemotron, minicpm5, minimax_m2,
+    minimax_m3, mistral_v13, muse_spark, olmo3, plain, qwen2_5, qwen3, seed_oss, xlam,
 };
 use crate::{
     format::{CallSyntax, Format},
@@ -92,13 +92,15 @@ pub enum Table {
     K2Horizon,
     /// [`muse_spark()`].
     MuseSpark,
+    /// [`gpt_oss()`].
+    GptOss,
     /// [`plain()`].
     Plain,
 }
 
 impl Table {
     /// Every table, in this order.
-    pub const ALL: [Table; 29] = [
+    pub const ALL: [Table; 30] = [
         Self::Qwen3,
         Self::Qwen3Tagged,
         Self::Qwen3TaggedDirect,
@@ -127,6 +129,7 @@ impl Table {
         Self::Glm4,
         Self::K2Horizon,
         Self::MuseSpark,
+        Self::GptOss,
         Self::Plain,
     ];
 
@@ -162,6 +165,7 @@ impl Table {
             Self::Glm4 => "glm4",
             Self::K2Horizon => "k2_horizon",
             Self::MuseSpark => "muse_spark",
+            Self::GptOss => "gpt_oss",
             Self::Plain => "plain",
         }
     }
@@ -235,6 +239,7 @@ impl Table {
             Self::Glm4 => glm4(),
             Self::K2Horizon => k2_horizon(),
             Self::MuseSpark => muse_spark(),
+            Self::GptOss => gpt_oss(),
             Self::Plain => plain(),
         }
     }
@@ -828,6 +833,16 @@ const GROUPS: &[Group] = &[
         model: "meta-models/Muse-Spark-Open-816B-A42B",
         also: &["Muse-Spark-Open-816B-A42B-NVFP4"],
         table: Table::MuseSpark,
+        opener: None,
+    },
+    Group {
+        model: "openai/gpt-oss-20b",
+        also: &[
+            "gpt-oss-120b",
+            "gpt-oss-safeguard-20b",
+            "gpt-oss-safeguard-120b",
+        ],
+        table: Table::GptOss,
         opener: None,
     },
     Group {

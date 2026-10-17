@@ -384,3 +384,82 @@ What the table leaves open, for want of fixtures: the recorded sets, once bellwe
 whether the model ever writes a message to a recipient the table has no row for (its text is
 framing today); and whether `commentary` should reach the client as content or as a channel of its
 own, which the API has no place for.
+
+## gpt-oss (`gpt_oss`)
+
+The template opens the turn with `<|start|>assistant` and writes every message as a header,
+`<|message|>`, its body, and `<|end|>` or the stop that ends the turn: the thought on the
+`analysis` channel, the answer on the `final` channel (`<|return|>` ends it), an update the user
+sees on the `commentary` channel, and a call as a message on the `commentary` channel addressed to
+the tool, `to=functions.NAME`, with a content type after the recipient (`<|constrain|>json`, or
+`json` alone), one JSON value as its body and `<|call|>` as its end. The template renders the
+recipient in the header's role section (`<|start|>assistant to=functions.NAME<|channel|>commentary
+json<|message|>`); the format's documentation and its own reader write and read it after the
+channel too (`<|channel|>commentary to=functions.NAME <|constrain|>json<|message|>`). What the
+table says:
+
+- **A header is the channel's name and whatever follows it.** The format's reader splits a
+  header on whitespace and takes the channel, a recipient and a content type from it in any
+  order; the table reads it the same way: `<|channel|>analysis`, `<|channel|>commentary` and
+  `<|channel|>final` are the terminals, what follows up to `<|message|>` is the header's rest
+  (a content type such as ` <|constrain|>json` or ` json`, which the model writes on any channel
+  when a response format is in play; a recipient) in a header state the table frames, and
+  `<|message|>` opens the body. So `final <|constrain|>json`, `final json` and the bare header
+  all open the answer.
+- **A recipient decides what a message is, whatever its channel.** `to=functions.` opens a call
+  from the turn's own state or from either channel's header, since the model writes a function
+  call on the analysis channel too (the gateway's own non-streaming Harmony reader checks the
+  recipient before the channel for that reason; its streaming reader sorts by channel, tracked
+  apart). A recipient among the format's built-in tools (`to=python`,
+  `to=browser.…`, `to=container.…`), on either channel or before it, enters a header state the
+  table frames and a body state that is reasoning, closed by `<|call|>` or `<|end|>`: the
+  message is out of the answer and in the thought, as the gateway's own non-streaming Harmony
+  reader keeps it (its streaming reader drops the commentary case; the table reads both alike),
+  so a turn that ends at a built-in call is never empty; the chat template
+  renders no built-in tool, so the request made no such call. Any other recipient is the header's
+  rest, and the body reads as its channel says.
+- **The text between the messages is framing.** The turn's own state (`message`) holds
+  `<|start|>assistant` between messages, the space before a recipient, and whatever the model
+  writes outside a message; it and the header states are dropped as wrapping, never malformed,
+  never content, as the Muse Spark table drops its own.
+- **One terminal reads every spelling of a call.** `to=functions.` opens a call given as data
+  ([`CallSyntax::Shaped`]) from the turn's own state or from either channel's header, wherever
+  the header puts the recipient: the name runs to the first space or `<`, as the format's reader cuts
+  the `<|channel|>` and `<|constrain|>` sections out, and the call's header skips what stands
+  between the name and `<|message|>` (the content type, with or without a space before it; the
+  channel, when the recipient came first); the engine reads that header before any row, so no
+  channel terminal inside it fires. A recipient with no name opens no call, and the next header
+  reads. Inside a thought or an answer the same text is text.
+- **`<|end|>` ends a call as `<|call|>` does**, since the format's reader ends every message at
+  either; the stop closes the last call (the stop row), and any other finish cuts it.
+- **The `commentary` channel without a recipient is content.** The format calls it a preamble the
+  user sees; the table gives it as content in the order the model wrote it, before or between the
+  calls, as the Muse Spark table gives its `commentary` messages.
+- **Nothing is trimmed.** The template writes nothing around a body, and the format's reader
+  keeps a body as written; the Hugging Face test template of the same format strips its fields,
+  which `tests/templates.rs` keeps as that template's reading, not this table's.
+- **A `<|call|>` inside a string argument ends the call there** (the engine's rule, bellwether
+  #16). The live stream agrees: the model's `<|call|>` is a stop token, so the stream ends there
+  whatever the model meant.
+- **A turn of several calls holds `<|call|>` as text.** The template writes each call as a message
+  of its own, so a rendered history of two calls carries the first's `<|call|>` between them, and
+  the table reads it as the call's close; a live stream stops at the first, since `<|call|>` is a
+  stop token, and the next call comes in the next turn.
+- **The replay starts after the prompt's last `<|start|>assistant`** (`Format::turn_anchor`), so
+  a call or a tool result quoted in an earlier turn moves nothing, and a prompt that opens a
+  message (`<|channel|>final<|message|>` after the opener) leaves the output inside it.
+
+Where the table is reached: the gateway hands a gpt-oss model (by its architecture, its model
+type or `gpt-oss` in its id) to its dedicated Harmony pipeline for Chat Completions and Responses
+in the modes that have one, before the Symphony resolver runs, so there the output is read by
+that pipeline whatever `--parser` says; the table reads the model on the Messages route, which
+has no such check, and in the mode without a Harmony pipeline. Whether the pipeline should yield
+to the table under `--parser symphony` is a gateway decision, tracked apart.
+
+The table is pinned against the turns the checkpoint's template renders for a tool-calling
+conversation (`tests/fixtures/rendered/gpt_oss.json`, written by `scripts/render_gpt_oss_turns.py`
+and replayed at every cut by `tests/rendered_turns.rs`), and against the format's documented
+spellings in the module's tests; bellwether has not recorded the group's set. What the table
+leaves open: the structural tag for a forced or required call (`Format::grammar` writes none for
+a shaped call without a layout; the forced table covers `tool_choice` as for the other tables
+without one), the recorded set, and the live reading against the engine's own server.
