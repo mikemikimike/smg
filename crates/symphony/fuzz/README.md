@@ -66,10 +66,12 @@ The whole-JSON promise breaks under three names, so that an allowance is exact: 
 (a call ended with no arguments fragment at all), `tolerated-json` (arguments whose shape closed,
 or one scalar token, but which JSON refuses: a value left out, a trailing comma, an escape JSON
 lacks, a short `\u`, whitespace outside JSON's, a number or a word cut short) and `whole-json` (the
-committed prefix of a value that never closed). A name is a shape, from any reader on every
-target, not a reader's own. The nightly workflow allows the shapes of the classes reported and
-not yet fixed, named in `symphony-fuzz.yml`; a name leaves the list with its fix, and a new
-reader's breach of an allowed shape surfaces then.
+committed prefix of a value that never closed); `pythonic-cut-call-closed` is a pythonic call that
+ended without its own `)` and had its object closed for it (one that said nothing and left it open
+is a breach of the whole-JSON names, so no event carries two names). A name is a shape, from any
+reader on every target, not a reader's own. The nightly workflow allows the shapes of the classes
+reported and not yet fixed, named in `symphony-fuzz.yml`; a name leaves the list with its fix, and
+a new reader's breach of an allowed shape surfaces then.
 
 One target by hand, with libFuzzer's own options after `--`:
 
