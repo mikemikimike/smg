@@ -581,6 +581,17 @@ fn made_up_empty_string(json: &str, source: &str) -> bool {
     }
 }
 
+/// Whether `text` is one whole JSON value: the syntax, as a client's reader takes it, not a
+/// reader's number range. `serde_json`'s `Value` refuses `9.99e999999` for its range alone, a
+/// number JSON writes and a client reads as it can; `IgnoredAny` walks the same grammar (the
+/// brackets and commas, a word spelled whole, a number's digits, decimals and exponent, the
+/// escapes, a raw control character refused inside a string) without converting the number.
+/// It takes a `\u` escape of any code point, a lone surrogate included, as the grammar does;
+/// a reader that drops a byte of the output fails conservation before it reaches this judge.
+fn whole_json(text: &str) -> bool {
+    serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
+}
+
 /// Whether `text` is a JSON prefix the prefix parser takes whole.
 fn valid_json_prefix(text: &str) -> bool {
     matches!(PartialJson::default().parse(text, true), Ok((_, consumed)) if consumed == text.len())
@@ -691,16 +702,12 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                         .find(|(i, _)| i == index)
                         .map(|(_, so_far)| so_far.as_str())
                         .unwrap_or_default();
-                    breach(
-                        "whole-json",
-                        serde_json::from_str::<Value>(so_far).is_ok(),
-                        || {
-                            format!(
-                                "{}: the call closed with arguments that are no whole JSON: {so_far:?}",
-                                place()
-                            )
-                        },
-                    );
+                    breach("whole-json", whole_json(so_far), || {
+                        format!(
+                            "{}: the call closed with arguments that are no whole JSON: {so_far:?}",
+                            place()
+                        )
+                    });
                 }
             }
             Event::Malformed { .. } => {
@@ -1363,6 +1370,49 @@ mod tests {
         let case = decode(&data, Some(Table::Qwen3));
         assert!(!case.cuts.is_empty());
         check(&case);
+        Ok(())
+    }
+
+    #[test]
+    fn the_whole_json_judge_is_the_syntax_not_a_readers_number_range() -> Result<(), String> {
+        for whole in [
+            "9.99e999999",
+            "8888E8888",
+            "{\"days\": -1e999}",
+            "{}",
+            "[1, 2]",
+            "\"x\"",
+            "null",
+            // The grammar's escape, whatever the code point: a lone surrogate is syntax.
+            "{\"a\": \"\\ud800\"}",
+        ] {
+            assert!(whole_json(whole), "{whole}");
+        }
+        for refused in [
+            "84.",
+            "0e",
+            "1e+",
+            "-",
+            "nu",
+            "{\"a\": ,}",
+            "{\"a\": 1,}",
+            "[,,]",
+            "\"\\h\"",
+            "\"\\u0l\"",
+            "{\"a\": \"b",
+            "",
+            "{\"a\":\u{b}1}",
+            // A raw control character inside a string, which the escapes exist for.
+            "\"a\nb\"",
+            "{\"a\": \"b\tc\"}",
+        ] {
+            assert!(!whole_json(refused), "{refused:?}");
+        }
+        // The case the range judge flagged: the arguments pass through as the model wrote them,
+        // whole JSON text a client reads.
+        let output = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"days\": 9.99e999999}}\n</tool_call>";
+        let data = encode(Table::Qwen3, "", output)?;
+        check(&decode(&data, Some(Table::Qwen3)));
         Ok(())
     }
 
