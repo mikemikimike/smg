@@ -1400,6 +1400,12 @@ fn default_least_load_throughput() -> f64 {
 /// sets this key is refused with that knob named, never silently ignored.
 pub const RETIRED_POLICY_INTERVAL_KEY: &str = "load_check_interval_secs";
 
+/// The checked reader. `remote = "Self"` leaves the derived reader on the
+/// type as an inherent `PolicyConfig::deserialize`, which a path call would
+/// pick over this trait method and so skip the check: read a policy through
+/// the trait (`serde_json::from_*`, `serde_yaml::from_*`, a field of a
+/// deriving struct, `<PolicyConfig as Deserialize>::deserialize`), never by
+/// that path.
 impl<'de> Deserialize<'de> for PolicyConfig {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
