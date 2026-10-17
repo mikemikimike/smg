@@ -52,6 +52,13 @@ the instrumented build goes to `$CARGO_TARGET_DIR/symphony-fuzz`.
 A target stops at its first crash. `--keep-going` runs libFuzzer's fork mode instead, which keeps
 every crash's artifact and continues, so that one campaign collects every class; a class that
 recurs on every mutation of a seed still restarts the job each time and holds that target back.
+A fork child that stops working (asleep after its crash handler, no CPU time accruing while the
+parent waits for it) is stopped by `stall-watchdog.sh`, which `run.sh` runs beside its fork-mode
+runs: a child older than two minutes whose CPU ticks did not grow over two samples is killed
+(SIGKILL, which the parent counts as a crash it ignores; a TERM would reach libFuzzer's own
+handler, whose exit code makes the parent stop the whole target), the stop is logged under
+`logs/<label>/watchdog.log`, and the parent spawns the next job; parents are never touched, and
+the watchdog ends with the run.
 Once a class is reported, `--allow <names>` (the environment variable `SYMPHONY_FUZZ_ALLOW`, comma
 separated) makes the harness look past it, so that the next class surfaces. Every check honors it.
 An allowance is for a run, never for the default; the names are the ones the breach messages carry.

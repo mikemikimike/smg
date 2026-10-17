@@ -14,7 +14,8 @@
 # A target stops at its first crash; with --keep-going it runs libFuzzer's fork mode, which keeps
 # every crash's artifact and goes on, so that one campaign collects every class of breach. The
 # summary counts a target's artifacts by the `breach <name>` the harness names when it replays
-# them. --allow NAMES (comma separated) makes the harness look past breaches already reported
+# them; a fork child that stops working (stall-watchdog.sh) is stopped so the parent spawns the
+# next job. --allow NAMES (comma separated) makes the harness look past breaches already reported
 # (SYMPHONY_FUZZ_ALLOW); --label NAME keeps a run's logs and artifacts under logs/NAME and
 # artifacts/NAME, apart from other runs'; --summary-only prints the table of a run already made.
 set -euo pipefail
@@ -101,16 +102,35 @@ classes_of() {
 }
 
 if [ -z "$summary_only" ]; then
+  # In fork mode the watchdog stops a child that wedged (no CPU time over two minutes), so a
+  # wedge costs one job, not the target's budget; it watches this run's own processes alone.
+  watchdog=
+  if [ ${#keep_going[@]} -gt 0 ]; then
+    "$here/stall-watchdog.sh" $$ "$build_dir/$triple/release" "$logs/watchdog.log" &
+    watchdog=$!
+  fi
+  # The runs are waited for by pid, never with a bare `wait`, which would wait on the watchdog too;
+  # a run that ended leaves the list, so a later `wait -n` never names a job already reaped.
+  runs=()
   running=0
   for target in "${targets[@]}"; do
     run_one "$target" &
+    runs+=($!)
     running=$((running + 1))
     if [ "$running" -ge "$jobs" ]; then
-      wait -n
+      wait -n -p finished "${runs[@]}" || true
+      left=()
+      for pid in "${runs[@]}"; do [ "$pid" = "${finished:-}" ] || left+=("$pid"); done
+      runs=("${left[@]}")
       running=$((running - 1))
     fi
   done
-  wait
+  [ ${#runs[@]} -eq 0 ] || wait "${runs[@]}"
+  if [ -n "$watchdog" ]; then
+    pkill -P "$watchdog" 2>/dev/null || true
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+  fi
 fi
 
 failed=0
