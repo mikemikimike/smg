@@ -258,8 +258,10 @@ impl HarmonyStreamingProcessor {
         )
         .await?;
 
-        // Mark prefill stream completed AFTER decode succeeds
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         prefill_stream.mark_completed();
         Ok(())
     }
@@ -311,6 +313,7 @@ impl HarmonyStreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         decode_stream.mark_completed();
 
+        decode.client_left = decode_stream.client_left();
         decode
             .finish(
                 prompt_tokens,
@@ -1063,6 +1066,10 @@ struct ChatDecode {
     // only ever set from this stream's own Complete messages, so it can't be fooled by prefill
     // data into thinking decode produced authoritative usage it didn't.
     decode_completed_indices: HashSet<u32>,
+    /// Whether the client left during the read: the stream's verdict, taken before
+
+    /// the finish so that no terminal router metric is recorded for a leaving client.
+    client_left: bool,
     // Reusable SSE encoder shared across every chunk emitted for this stream.
     encoder: SseEncoder,
 }
@@ -1084,6 +1091,7 @@ impl ChatDecode {
             spec_drafted: HashMap::new(),
             parsed_reasoning_tokens: 0,
             decode_completed_indices: HashSet::new(),
+            client_left: false,
             encoder: SseEncoder::new(),
         }
     }
@@ -1394,6 +1402,12 @@ impl ChatDecode {
             .await?;
         }
 
+        // The read ended with the client's leaving, not with the engine's end:
+        // no terminal router metric for it, as the HTTP router has none for a
+        // disconnect (neither a completed request nor a failure).
+        if self.client_left {
+            return Ok(());
+        }
         // Record streaming metrics
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,

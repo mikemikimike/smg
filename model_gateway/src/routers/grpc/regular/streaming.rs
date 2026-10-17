@@ -420,7 +420,9 @@ impl StreamingProcessor {
         // Mark stream as completed successfully to prevent abort on drop
         grpc_stream.mark_completed();
 
-        stream.settle_and_record(reservation).await;
+        stream
+            .settle_and_record(reservation, grpc_stream.client_left())
+            .await;
         Ok(())
     }
 
@@ -464,8 +466,10 @@ impl StreamingProcessor {
             )
             .await;
 
-        // Mark prefill stream as completed AFTER decode completes successfully
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         if result.is_ok() {
             prefill_stream.mark_completed();
         }
@@ -734,6 +738,12 @@ impl StreamingProcessor {
                 handle.close_reserved_only().await;
             }
         }
+        // The read ended with the client's leaving, not with the engine's end:
+        // no terminal router metric for it, as the HTTP router has none for a
+        // disconnect (neither a completed request nor a failure).
+        if stream.client_left() {
+            return Ok(());
+        }
         Self::record_generate_metrics(start_time, first_token_time, total_completion, None, &ctx);
 
         Ok(())
@@ -793,8 +803,10 @@ impl StreamingProcessor {
         )
         .await;
 
-        // Mark prefill stream as completed AFTER decode completes successfully
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         if result.is_ok() {
             prefill_stream.mark_completed();
         }
@@ -989,6 +1001,12 @@ impl StreamingProcessor {
             } else {
                 handle.close_reserved_only().await;
             }
+        }
+        // The read ended with the client's leaving, not with the engine's end:
+        // no terminal router metric for it, as the HTTP router has none for a
+        // disconnect (neither a completed request nor a failure).
+        if stream.client_left() {
+            return Ok(());
         }
         Self::record_generate_metrics(
             start_time,
@@ -2670,7 +2688,12 @@ impl StreamingProcessor {
             }
         }
 
-        // Record metrics
+        // The read ended with the client's leaving, not with the engine's end:
+        // no terminal router metric for it, as the HTTP router has none for a
+        // disconnect (neither a completed request nor a failure).
+        if grpc_stream.client_left() {
+            return Ok(());
+        }
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.backend_type,
@@ -2923,6 +2946,13 @@ impl StreamingProcessor {
                         let mut sse_buffer = Vec::with_capacity(256);
                         Self::format_completion_sse_into(&mut sse_buffer, &usage_chunk);
                         let _ = tx.send(Ok(Bytes::from(sse_buffer))).await;
+                    }
+                    // The units' streams are read for this client (the sender
+                    // the watch reads): a sender closed by now says the client
+                    // left and ended the read, which is no completed
+                    // generation and gets no terminal router metric.
+                    if tx.is_closed() {
+                        return;
                     }
                     Metrics::record_streaming_metrics(StreamingMetricsParams {
                         router_type: metrics_labels::ROUTER_GRPC,
@@ -3350,8 +3380,10 @@ impl StreamingProcessor {
             )
             .await;
 
-        // Mark prefill stream as completed AFTER decode completes successfully
-        // This ensures that if client disconnects during decode, BOTH streams send abort
+        // The prefill stream is marked completed after the decode's read ended
+        // well: a decode that failed leaves both streams to abort on drop; a
+        // client that left ends the read with `Ok` too, its decode stream
+        // aborting the request on drop, the prefill's own request complete.
         if result.is_ok() {
             prefill_stream.mark_completed();
         }
@@ -4502,7 +4534,14 @@ impl<'a> ChatStream<'a> {
     /// The end: the reservation settled with what the stream used
     /// ([`Self::counts`], the engine's counts as they are), and the
     /// streaming metrics recorded.
-    async fn settle_and_record(self, reservation: Option<Arc<SharedReservationHandle>>) {
+    /// `client_left` says the read ended with the client's leaving, not with the engine's end:
+    /// the reservation is still settled, but no terminal router metric is recorded for it, as
+    /// the HTTP router has none for a disconnect (neither a completed request nor a failure).
+    async fn settle_and_record(
+        self,
+        reservation: Option<Arc<SharedReservationHandle>>,
+        client_left: bool,
+    ) {
         let model = &self.dispatch.model;
         let counts = self.counts();
         let (total_prompt, total_completion) = (counts.prompt, counts.completion);
@@ -4518,6 +4557,9 @@ impl<'a> ChatStream<'a> {
             } else {
                 handle.settle_success(counts.settlement()).await;
             }
+        }
+        if client_left {
+            return;
         }
         // In PD mode this task only starts once the decode stream exists --
         // for sequential PD that is after prefill completes, with the first
