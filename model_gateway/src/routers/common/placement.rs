@@ -28,8 +28,8 @@ use crate::{
         metrics::{metrics_labels, Metrics},
     },
     policies::{
-        policy_filters_unavailable_workers, traffic_split, CacheNamespace, LoadBalancingPolicy,
-        PolicyRegistry, SelectWorkerInfo, WorkerLeg,
+        policy_filters_unavailable_workers, CacheNamespace, LoadBalancingPolicy, PolicyRegistry,
+        SelectWorkerInfo, WorkerLeg,
     },
     routers::{
         common::{header_utils, overload, retry::mark_non_retryable},
@@ -1023,8 +1023,8 @@ pub(crate) fn select_pair(
             verdict: PlacementFailure::PolicyDeclined(policy),
         })
     };
-    let Some(prefill_idx) =
-        policies.select_worker_for_model(&prefill_policy, model_id, &prefill, &info)
+    let Some((prefill_idx, prefill_group)) =
+        policies.select_worker_for_model_split(&prefill_policy, model_id, &prefill, &info, None)
     else {
         return Err(declined(WorkerLeg::Prefill, prefill_policy.name()));
     };
@@ -1050,14 +1050,15 @@ pub(crate) fn select_pair(
         return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
     }
     info.leg = WorkerLeg::Decode;
-    // The decode follows the prefill's traffic group, so a pair never spans
-    // two groups (see `PolicyRegistry::select_worker_for_model_following`).
-    let Some(decode_idx) = policies.select_worker_for_model_following(
+    // The decode follows the traffic group the prefill leg was split into, so
+    // a pair never spans two groups; an unsplit prefill leaves it to decide
+    // for itself (see `PolicyRegistry::select_worker_for_model_split`).
+    let Some((decode_idx, _)) = policies.select_worker_for_model_split(
         &decode_policy,
         model_id,
         &decode,
         &info,
-        Some(traffic_split::group_of(selected_prefill.as_ref())),
+        prefill_group,
     ) else {
         return Err(declined(WorkerLeg::Decode, decode_policy.name()));
     };
