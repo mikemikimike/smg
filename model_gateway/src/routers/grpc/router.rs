@@ -2602,16 +2602,11 @@ mod pd_tests {
                 "{mode:?}: {answer}"
             );
 
-            for (fleet_name, labels) in [
-                (None, (Some("qwen"), None)),
-                (Some("qwen"), UNLABELED),
-                (Some("passthrough"), (None, Some("qwen3"))),
+            for (fleet_name, labels, parser_header) in [
+                (None, (Some("qwen"), None), "legacy"),
+                (Some("qwen"), UNLABELED, "symphony"),
+                (Some("passthrough"), (None, Some("qwen3")), "symphony"),
             ] {
-                let parser_header = if labels.0.is_some() {
-                    "legacy"
-                } else {
-                    "symphony"
-                };
                 let answer = chat_answer(
                     mode,
                     fleet_name,
