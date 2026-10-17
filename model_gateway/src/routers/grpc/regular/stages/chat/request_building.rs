@@ -255,16 +255,17 @@ impl BuildStage for ChatRequestBuildingStage {
                 symphony::turn_constraint(
                     parser,
                     &names,
-                    &chat_request,
+                    symphony::Asks::Chat(&chat_request),
+                    &chat_request.effective_tool_list(),
                     &processed_messages.text,
                     &ctx.components.templates,
                 )
             },
-            || symphony::AutoTag::Chat {
+            || symphony::AutoTag {
                 parser,
                 labels: names.labels.clone(),
                 flags: names.flags.clone(),
-                request: Arc::clone(&chat_request),
+                request: symphony::AutoRequest::Chat(Arc::clone(&chat_request)),
                 reasoning_open: reasoning_decision(
                     ctx,
                     &chat_request,
@@ -283,7 +284,7 @@ impl BuildStage for ChatRequestBuildingStage {
         let assignment = symphony::assign(
             parser,
             &names,
-            chat_request.as_ref(),
+            symphony::Asks::Chat(chat_request.as_ref()),
             tool_constraints.as_ref(),
             &processed_messages.text,
             &ctx.components.templates,

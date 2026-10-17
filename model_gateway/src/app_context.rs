@@ -470,7 +470,7 @@ impl AppContextBuilder {
                 symphony_aliases = %symphony_aliases.join(", "),
                 "Unknown parser name"
             );
-            return Err(AppContextBuildError::InvalidConfig(why));
+            return Err(AppContextBuildError::InvalidConfig(why.into()));
         }
         if router_config.parser == ParserChoice::Symphony
             && names.tool.is_some()

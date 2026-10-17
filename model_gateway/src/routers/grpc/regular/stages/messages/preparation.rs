@@ -265,14 +265,16 @@ impl MessagePreparationStage {
             .components
             .worker_registry
             .get_by_model(&ctx.input.model_id);
-        let symphony_constraint = symphony::constraint_messages(
+        let symphony_constraint = symphony::constraint(
             parser,
             &names,
-            request,
+            symphony::Asks::Messages {
+                request,
+                continues: request.continues_final_assistant(),
+            },
             &filtered_tools,
             reasoning,
             symphony::grammar_start_of(&workers),
-            request.continues_final_assistant(),
             &ctx.components.templates,
         );
         let tool_call_constraint = match (symphony_constraint, chat_tool_choice.as_ref()) {

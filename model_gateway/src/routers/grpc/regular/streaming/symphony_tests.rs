@@ -32,7 +32,7 @@ use crate::{
         proto_wrapper::ProtoGenerateComplete,
         regular::{
             processor::ResponseProcessor,
-            symphony::{assign, template::Templates, Assignment},
+            symphony::{assign, template::Templates, Asks, Assignment},
         },
         utils::ModelNames,
     },
@@ -189,7 +189,7 @@ async fn a_call_the_conversation_established_is_a_call_without_a_tool_inventory(
     let assignment = assign(
         ParserChoice::Symphony,
         &ModelNames::default(),
-        &request,
+        Asks::Chat(&request),
         None,
         RETRY_PROMPT,
         &Templates::new(Arc::new(TokenizerRegistry::new())),
