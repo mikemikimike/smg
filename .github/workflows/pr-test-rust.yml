@@ -809,7 +809,9 @@ jobs:
               # test trees and client libraries the CPU jobs run or no lane
               # imports (crates/wasm/tests holds the storage-hook fixtures of
               # the Responses suite and is also in `agentic` below; the
-              # servicer tests run in python-unit-tests)
+              # servicer tests run in python-unit-tests, and the ones that
+              # import a real engine are also in that engine's bucket below,
+              # so a change to one of them runs the lane that executes it)
               - 'model_gateway/tests/**'
               - 'model_gateway/benches/**'
               - 'crates/*/tests/**'
@@ -999,10 +1001,18 @@ jobs:
               - 'grpc_servicer/smg_grpc_servicer/sglang/**'
               - '.github/actions/setup-sglang/**'
               - 'scripts/ci_install_sglang.sh'
+              # the servicer tests that import the engine itself (skipped by
+              # python-unit-tests, run by the engine's row that passes
+              # servicer_unit_tests)
+              - 'grpc_servicer/tests/test_sglang_zmq_msgpack.py'
+              - 'grpc_servicer/tests/test_sglang_zmq_plugin.py'
+              - 'grpc_servicer/tests/test_sglang_rust_servicer.py'
             vllm: &vllm
               - 'grpc_servicer/smg_grpc_servicer/vllm/**'
               - '.github/actions/setup-vllm/**'
               - 'scripts/ci_install_vllm.sh'
+              # the servicer tests that import the engine itself (see sglang)
+              - 'grpc_servicer/tests/test_vllm_*.py'
             trtllm: &trtllm
               - '.github/actions/setup-trtllm/**'
               - 'scripts/ci_install_trtllm.sh'
@@ -1650,11 +1660,13 @@ jobs:
 
   e2e-2gpu-pd:
     name: e2e-2gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
-    needs: [e2e-1gpu-gateway, detect-changes]
+    needs: [build-wheel, e2e-1gpu-gateway, detect-changes]
     if: >-
       always()
       && !cancelled()
       && needs.detect-changes.outputs.symphony-only != 'true'
+      && needs.detect-changes.outputs.docs-only != 'true'
+      && needs.build-wheel.result == 'success'
       && !contains(fromJSON('["failure", "cancelled"]'), needs.e2e-1gpu-gateway.result)
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1718,11 +1730,12 @@ jobs:
   # PD legs both advertise worker-side processing; the M-RoPE class takes the
   # worker path and the Phi-3.5 class must stay on the router path.
   e2e-2gpu-pd-mm-worker:
-    needs: [e2e-1gpu-chat-mm-worker, detect-changes]
+    needs: [build-wheel, e2e-1gpu-chat-mm-worker, detect-changes]
     if: >-
       always()
       && !cancelled()
       && needs.detect-changes.outputs.symphony-only != 'true'
+      && needs.build-wheel.result == 'success'
       && needs.e2e-1gpu-chat-mm-worker.result == 'success'
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1746,7 +1759,7 @@ jobs:
 
   e2e-4gpu-chat:
     name: e2e-4gpu-chat (${{ matrix.engine }})
-    needs: [e2e-1gpu-chat, detect-changes]
+    needs: [build-wheel, e2e-1gpu-chat, detect-changes]
     # The full tier and the rows of the engines whose own files changed, after
     # the one-engine chat job (the gating this job inherited through needs,
     # now spelled out). In an engine tier that job runs some rows and skips
@@ -1756,6 +1769,8 @@ jobs:
       always()
       && !cancelled()
       && needs.detect-changes.outputs.symphony-only != 'true'
+      && needs.detect-changes.outputs.docs-only != 'true'
+      && needs.build-wheel.result == 'success'
       && !contains(fromJSON('["failure", "cancelled"]'), needs.e2e-1gpu-chat.result)
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1792,7 +1807,7 @@ jobs:
 
   e2e-4gpu-gateway:
     name: e2e-4gpu-gateway
-    needs: [e2e-1gpu-gateway, detect-changes]
+    needs: [build-wheel, e2e-1gpu-gateway, detect-changes]
     # The full tier and an sglang change, after the one-engine router job; in
     # an engine tier that job runs one row, so its result is accepted unless
     # a row failed or was cancelled.
@@ -1800,6 +1815,8 @@ jobs:
       always()
       && !cancelled()
       && needs.detect-changes.outputs.symphony-only != 'true'
+      && needs.detect-changes.outputs.docs-only != 'true'
+      && needs.build-wheel.result == 'success'
       && !contains(fromJSON('["failure", "cancelled"]'), needs.e2e-1gpu-gateway.result)
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -1852,11 +1869,13 @@ jobs:
   # every PR with the topology that exercises both legs' load balancing.
   e2e-4gpu-pd:
     name: e2e-4gpu-pd (${{ matrix.engine }}${{ matrix.kv_backend && format('-{0}', matrix.kv_backend) || '' }})
-    needs: [e2e-1gpu-gateway, detect-changes]
+    needs: [build-wheel, e2e-1gpu-gateway, detect-changes]
     if: >-
       always()
       && !cancelled()
       && needs.detect-changes.outputs.symphony-only != 'true'
+      && needs.detect-changes.outputs.docs-only != 'true'
+      && needs.build-wheel.result == 'success'
       && !contains(fromJSON('["failure", "cancelled"]'), needs.e2e-1gpu-gateway.result)
       && (github.event_name != 'pull_request'
           || (needs.detect-changes.result == 'success'
@@ -2302,15 +2321,29 @@ jobs:
                           or "needs.detect-changes.outputs.e2e-full == 'true'" not in text):
                       missing_tier.append(j)
                       break
-          if missing_needs or missing_check or missing_tier:
+          # Every e2e-* lane needs the wheel: a lane that reads its prerequisite's
+          # result as "not failed or cancelled" (an engine tier skips rows) no
+          # longer inherits the wheel check through it, and a compile-error pull
+          # request would run the lane to fail on the missing artifact.
+          missing_wheel = []
+          for j in jobs:
+              sec = re.search(rf"^  {re.escape(j)}:\n(.*?)(?=^  \S|\Z)", src, re.M | re.S).group(1)
+              cond = re.search(r"^    if: >-\n((?:      .*\n)+)", sec, re.M)
+              needs_j = re.search(r"^    needs:\s*\[([^\]]*)\]", sec, re.M)
+              if (not cond or "needs.build-wheel.result == 'success'" not in cond.group(1)
+                      or not needs_j or "build-wheel" not in {n.strip() for n in needs_j.group(1).split(",")}):
+                  missing_wheel.append(j)
+          if missing_needs or missing_check or missing_tier or missing_wheel:
               if missing_needs:
                   print(f"e2e jobs missing from finish.needs: {missing_needs}")
               if missing_check:
                   print(f"e2e jobs missing from the finish failure check: {missing_check}")
               if missing_tier:
                   print(f"e2e jobs whose condition or row enabling lacks the main-push rule or the full tier: {missing_tier}")
+              if missing_wheel:
+                  print(f"e2e jobs that do not need build-wheel and check its result: {missing_wheel}")
               sys.exit(1)
-          print(f"OK: all {len(jobs)} e2e-* jobs gate merge and run in the full tier: {sorted(jobs)}")
+          print(f"OK: all {len(jobs)} e2e-* jobs gate merge, need the wheel and run in the full tier: {sorted(jobs)}")
           EOF
 
       - name: Check CI result
