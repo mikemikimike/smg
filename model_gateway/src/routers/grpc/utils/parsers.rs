@@ -86,6 +86,17 @@ impl ParserResolver {
         }
     }
 
+    /// The names `model`'s own cards set (worker labels), without the process-wide fallback:
+    /// what the workers say of the model, each `None` when no card names one. The router reads
+    /// these to decide whether Symphony takes a model off a pipeline of its own
+    /// (`GrpcRouter::harmony_reads`): a gateway-wide name is the default for models without one.
+    pub(crate) fn card_names(&self, model: &str) -> Names {
+        Names {
+            tool: self.card_parser(model, |card| card.tool_parser.as_ref()),
+            reasoning: self.card_parser(model, |card| card.reasoning_parser.as_ref()),
+        }
+    }
+
     fn card_parser(
         &self,
         model: &str,

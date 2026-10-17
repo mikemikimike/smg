@@ -43,9 +43,9 @@ use super::{
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
     regular::{
         responses, stages::decisions::supports_worker as supports_decisions_worker,
-        streaming::StreamingProcessor,
+        streaming::StreamingProcessor, symphony,
     },
-    utils::{message_utils, missing_tokenizer_response, ParserResolver},
+    utils::{message_utils, missing_tokenizer_response, Names, ParserResolver},
 };
 use crate::{
     app_context::AppContext,
@@ -278,6 +278,46 @@ impl GrpcRouter {
             .to_string()
     }
 
+    /// Whether the Harmony pipeline reads a chat or Responses request for
+    /// `model` (the canonical id): the one rule for both routes and every
+    /// mode. Symphony decides first: a request it is selected for
+    /// (`regular::symphony::selected`: the `--parser` flag or the request's
+    /// `X-SMG-Parser` header says so, and a table reads the model, the
+    /// registry's, the one the model's own cards pin, or the response template
+    /// its cards name) runs the chat pipeline, whatever the model. The Harmony
+    /// pipeline is reached only when Symphony is not selected, for a model the
+    /// detector names (its cards' architecture or model type, else its id) in
+    /// a mode that has the pipeline (Regular and PD; EPD has none and runs
+    /// every chat request through the chat pipeline). So one model is read by
+    /// one parser per request, chosen by the parser switch and never by the
+    /// route or the mode. Symphony is selected twice over before it takes a
+    /// model off its own pipeline: by the model's own names, its cards'
+    /// (`ParserResolver::card_names`), so that a gateway-wide
+    /// `--tool-call-parser` / `--reasoning-parser`, the default for models
+    /// without a reader of their own, does not take it; and by the names the
+    /// chat pipeline reads with (`ParserResolver::names`, the cards' first,
+    /// then the gateway-wide), so that the request never lands on the legacy
+    /// chat parsers, which neither reader means it for (a card's reasoning
+    /// label that pins a table beside a fleet-wide tool-call name no table
+    /// answers to). The detector is asked first because it is the cheap test:
+    /// the selection is read only for the models it names.
+    fn harmony_reads(&self, headers: Option<&HeaderMap>, model: &str) -> bool {
+        let components = &self.shared_components;
+        let selected = |names: &Names| {
+            symphony::selected(
+                components.parser,
+                headers,
+                names,
+                model,
+                &components.templates,
+            )
+        };
+        self.harmony_pipeline.is_some()
+            && HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, model)
+            && !(selected(&components.parser_resolver.card_names(model))
+                && selected(&components.parser_resolver.names(model)))
+    }
+
     /// Close a reservation that a non-2xx final response never got the
     /// chance to settle (prep failure repeated across every attempt,
     /// retries exhausted, a non-retryable dispatch failure). No-op if
@@ -306,31 +346,28 @@ impl GrpcRouter {
             return *response;
         }
 
-        // EPD has no Harmony pipeline, so its chat requests all use the single
-        // chat/generate pipeline.
-        let is_harmony = self.harmony_pipeline.is_some()
-            && HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
-
-        debug!(
-            "Processing chat completion request for model: {}, using_harmony={}",
-            model_id, is_harmony
-        );
-
-        let pipeline = match self.harmony_pipeline.as_ref() {
-            Some(harmony_pipeline) if is_harmony => harmony_pipeline,
-            _ => &self.pipeline,
-        };
-
         // Canonicalize once, up front, so every dispatch attempt (and the
         // reservation) targets the same model -- see
         // `resolve_canonical_model_id`'s doc comment. The body's own `model`
         // field is rewritten to match: by this point `model_id_cloned` is
         // already canonical, so `RequestContext::new`'s own alias resolve
         // would no-op and otherwise leave the alias sitting in the body for
-        // response metadata and parser selection to read.
+        // response metadata and parser selection to read. The pipeline is
+        // chosen on the canonical id too (`harmony_reads`), as the parser
+        // selection inside it reads that id.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
+
+        let is_harmony = self.harmony_reads(headers, &model_id_cloned);
+        debug!(
+            "Processing chat completion request for model: {}, using_harmony={}",
+            model_id_cloned, is_harmony
+        );
+        let pipeline = match self.harmony_pipeline.as_ref() {
+            Some(harmony_pipeline) if is_harmony => harmony_pipeline,
+            _ => &self.pipeline,
+        };
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
@@ -418,9 +455,9 @@ impl GrpcRouter {
             canonicalize_responses_request(&self.worker_registry, &body, model_id);
         let model_id = canonical_model_id.as_ref();
 
-        // Choose implementation based on Harmony model detection (checks worker metadata)
-        let is_harmony =
-            HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
+        // The Harmony or the regular Responses implementation: the one rule
+        // the chat route applies (`harmony_reads`), on the canonical id.
+        let is_harmony = self.harmony_reads(headers, &body.model);
 
         // `background: true` answers the queued object at once and runs the
         // work behind the response id; with the mode switched off such a
@@ -1231,21 +1268,26 @@ mod pd_tests {
     use http::header::RETRY_AFTER;
     use llm_tokenizer::{factory, registry::TokenizerRegistry};
     use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+    use portpicker::pick_unused_port;
     use reasoning_parser::ParserFactory as ReasoningParserFactory;
     use serde_json::json;
     use smg_data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     };
+    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
     use smg_mcp::{McpConfig, McpOrchestrator};
+    use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
     use tool_parser::ParserFactory as ToolParserFactory;
+    use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
     use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
     use super::*;
     use crate::{
         config::{PolicyConfig, RouterConfig, RoutingMode},
         policies::PolicyRegistry,
+        routers::grpc::harmony::try_harmony_encoding,
         tenant::TenantKey,
-        worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, WorkerRegistry},
+        worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerRegistry},
         workflow::{
             create_worker_workflow_data, steps::local::SubmitTokenizerJobStep, JobQueue,
             JobQueueConfig, TokenizerLoadFailure, WorkerKind, WorkerRegistrationMode, WorkerSpec,
@@ -1282,7 +1324,18 @@ mod pd_tests {
     /// Minimal `AppContext` for constructing a disaggregated gRPC router. PD
     /// serves /v1/responses, so the MCP orchestrator must be initialized.
     async fn grpc_ctx(mode: RoutingMode) -> Arc<AppContext> {
-        let config = RouterConfig::builder()
+        grpc_ctx_with_tool_parser(mode, None).await
+    }
+
+    /// [`grpc_ctx`] with the gateway's `--tool-call-parser` name, which under
+    /// Symphony pins the table that answers to it for every model. The tests
+    /// pin with `qwen`, a legacy parser's name the `qwen3` table answers to, so
+    /// the startup check of the names accepts it under either `--parser`.
+    async fn grpc_ctx_with_tool_parser(
+        mode: RoutingMode,
+        tool_parser: Option<&str>,
+    ) -> Arc<AppContext> {
+        let mut builder = RouterConfig::builder()
             .mode(mode)
             .grpc_connection()
             .policy(PolicyConfig::Random)
@@ -1293,8 +1346,11 @@ mod pd_tests {
             .worker_startup_timeout_secs(10)
             .worker_startup_check_interval_secs(1)
             .max_concurrent_requests(64)
-            .queue_timeout_secs(60)
-            .build_unchecked();
+            .queue_timeout_secs(60);
+        if let Some(name) = tool_parser {
+            builder = builder.tool_call_parser(name);
+        }
+        let config = builder.build_unchecked();
 
         let mcp_orchestrator = Arc::new(OnceLock::new());
         mcp_orchestrator
@@ -2169,5 +2225,475 @@ mod pd_tests {
             retry_config_for("unrelated-model").max_retries,
             default_retries
         );
+    }
+
+    /// The served model of the pipeline-choice tests: a Harmony model by its
+    /// card's architecture, under an id no Symphony table claims, so the
+    /// registry's table never decides for it and the parser names do.
+    const HARMONY_MODEL: &str = "m";
+
+    /// A gRPC engine on loopback that answers every generate call with
+    /// `output_ids`: one chunk carrying them, then the complete frame.
+    #[derive(Clone)]
+    struct ScriptedEngine {
+        output_ids: Vec<u32>,
+    }
+
+    type ScriptedStream<T> =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send>>;
+
+    #[tonic::async_trait]
+    impl TokenSpeedScheduler for ScriptedEngine {
+        type GenerateStream = ScriptedStream<ts::GenerateResponse>;
+        type SubscribeKvEventsStream = ScriptedStream<common::KvEventBatch>;
+        type GetTokenizerStream = ScriptedStream<common::GetTokenizerChunk>;
+
+        async fn generate(
+            &self,
+            request: TonicRequest<ts::GenerateRequest>,
+        ) -> Result<TonicResponse<Self::GenerateStream>, Status> {
+            use ts::generate_response::Response as GenResp;
+            let request_id = request.into_inner().request_id;
+            let completion_tokens = self.output_ids.len() as u32;
+            let frames = vec![
+                Ok(ts::GenerateResponse {
+                    request_id: request_id.clone(),
+                    response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                        token_ids: self.output_ids.clone(),
+                        prompt_tokens: 3,
+                        completion_tokens,
+                        index: 0,
+                        ..Default::default()
+                    })),
+                }),
+                Ok(ts::GenerateResponse {
+                    request_id,
+                    response: Some(GenResp::Complete(ts::GenerateComplete {
+                        output_ids: self.output_ids.clone(),
+                        finish_reason: "stop".to_string(),
+                        prompt_tokens: 3,
+                        completion_tokens,
+                        index: 0,
+                        ..Default::default()
+                    })),
+                }),
+            ];
+            Ok(TonicResponse::new(Box::pin(futures::stream::iter(frames))))
+        }
+
+        async fn health_check(
+            &self,
+            _request: TonicRequest<ts::HealthCheckRequest>,
+        ) -> Result<TonicResponse<ts::HealthCheckResponse>, Status> {
+            Ok(TonicResponse::new(ts::HealthCheckResponse {
+                healthy: true,
+                message: "ok".to_string(),
+            }))
+        }
+
+        async fn abort(
+            &self,
+            _request: TonicRequest<ts::AbortRequest>,
+        ) -> Result<TonicResponse<ts::AbortResponse>, Status> {
+            Ok(TonicResponse::new(ts::AbortResponse {
+                success: true,
+                message: String::new(),
+            }))
+        }
+
+        async fn get_model_info(
+            &self,
+            _request: TonicRequest<ts::GetModelInfoRequest>,
+        ) -> Result<TonicResponse<ts::GetModelInfoResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn get_server_info(
+            &self,
+            _request: TonicRequest<ts::GetServerInfoRequest>,
+        ) -> Result<TonicResponse<ts::GetServerInfoResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn get_loads(
+            &self,
+            _request: TonicRequest<ts::GetLoadsRequest>,
+        ) -> Result<TonicResponse<ts::GetLoadsResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn subscribe_kv_events(
+            &self,
+            _request: TonicRequest<common::SubscribeKvEventsRequest>,
+        ) -> Result<TonicResponse<Self::SubscribeKvEventsStream>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn flush_cache(
+            &self,
+            _request: TonicRequest<common::FlushCacheRequest>,
+        ) -> Result<TonicResponse<common::FlushCacheResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn start_profile(
+            &self,
+            _request: TonicRequest<common::StartProfileRequest>,
+        ) -> Result<TonicResponse<common::ProfileResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn stop_profile(
+            &self,
+            _request: TonicRequest<common::StopProfileRequest>,
+        ) -> Result<TonicResponse<common::ProfileResponse>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+
+        async fn get_tokenizer(
+            &self,
+            _request: TonicRequest<common::GetTokenizerRequest>,
+        ) -> Result<TonicResponse<Self::GetTokenizerStream>, Status> {
+            Err(Status::unimplemented("scripted engine"))
+        }
+    }
+
+    /// Serves a [`ScriptedEngine`] on a free loopback port and returns the port
+    /// once it accepts connections.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test helper; the engine's server lives for the test process"
+    )]
+    async fn spawn_engine(output_ids: Vec<u32>) -> u16 {
+        let port = pick_unused_port().expect("a free port for the scripted engine");
+        let addr = format!("127.0.0.1:{port}").parse().expect("engine address");
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(TokenSpeedSchedulerServer::new(ScriptedEngine {
+                    output_ids,
+                }))
+                .serve(addr)
+                .await
+                .expect("scripted engine server");
+        });
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                return port;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the scripted engine on port {port} never came up");
+    }
+
+    /// The parser names a worker's card sets: `(tool_parser, reasoning_parser)`.
+    type Labels = (Option<&'static str>, Option<&'static str>);
+    const UNLABELED: Labels = (None, None);
+
+    /// A worker of `worker_type` serving [`HARMONY_MODEL`] at `url`, a Harmony
+    /// model by its card's architecture, its card naming `labels` as the
+    /// model's own parsers when given.
+    fn register_harmony_worker(
+        ctx: &AppContext,
+        url: &str,
+        worker_type: WorkerType,
+        labels: Labels,
+    ) {
+        let mut card =
+            ModelCard::new(HARMONY_MODEL).with_architectures(vec!["GptOssForCausalLM".to_string()]);
+        if let Some(name) = labels.0 {
+            card = card.with_tool_parser(name);
+        }
+        if let Some(name) = labels.1 {
+            card = card.with_reasoning_parser(name);
+        }
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::TokenSpeed)
+            .model(card)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        ctx.worker_registry
+            .register(Arc::new(worker))
+            .expect("register worker");
+    }
+
+    /// The worker types of a mode's legs.
+    fn legs(mode: Mode) -> &'static [WorkerType] {
+        match mode {
+            Mode::Regular => &[WorkerType::Regular],
+            Mode::PrefillDecode => &[WorkerType::Prefill, WorkerType::Decode],
+            Mode::EncodePrefillDecode => {
+                &[WorkerType::Encode, WorkerType::Prefill, WorkerType::Decode]
+            }
+        }
+    }
+
+    fn routing_mode(mode: Mode) -> RoutingMode {
+        match mode {
+            Mode::Regular => regular_routing_mode(),
+            Mode::PrefillDecode => pd_routing_mode(),
+            Mode::EncodePrefillDecode => epd_routing_mode(),
+        }
+    }
+
+    /// The output the table pinned by the tests reads: a thought, content and
+    /// one call of the declared `lookup` tool, which the engine answers as the
+    /// one token the tokenizer decodes into it.
+    const TABLE_OUTPUT: &str = "<think>plan</think>Hello <tool_call>\n\
+                                {\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>";
+    const TABLE_OUTPUT_ID: u32 = 100;
+    /// A chat template whose generation prompt ends at the turn opener the
+    /// pinned table replays from.
+    const CHAT_TEMPLATE: &str = "{% for message in messages %}<|im_start|>{{ message.role }}\n\
+                                 {{ message.content }}<|im_end|>\n{% endfor %}\
+                                 {% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+
+    /// The tokenizer of [`HARMONY_MODEL`]: renders the chat template, encodes
+    /// the prompt as three ids, and decodes [`TABLE_OUTPUT_ID`] into
+    /// [`TABLE_OUTPUT`].
+    async fn register_tokenizer(ctx: &AppContext) {
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new()
+                .with_chat_template(CHAT_TEMPLATE)
+                .expect("chat template")
+                .with_deferred_chat_ids(vec![11, 12, 13])
+                .with_tokens(&[(TABLE_OUTPUT, TABLE_OUTPUT_ID)]),
+        );
+        ctx.tokenizer_registry
+            .load(HARMONY_MODEL, HARMONY_MODEL, "mock", || async move {
+                Ok(tokenizer)
+            })
+            .await
+            .expect("register the tokenizer");
+    }
+
+    /// The engine's output for the Harmony reader: "Hi" on the final channel,
+    /// as the Harmony encoding tokenizes it.
+    fn harmony_output() -> Vec<u32> {
+        try_harmony_encoding()
+            .expect("the Harmony encoding")
+            .tokenizer()
+            .encode_with_special_tokens("<|channel|>final<|message|>Hi<|return|>")
+    }
+
+    /// One chat completion for [`HARMONY_MODEL`] through a router of `mode`,
+    /// every leg's engine answering `output_ids`; the gateway's tool-call
+    /// parser name `fleet_name`, the workers' card `labels`, and the request's
+    /// `X-SMG-Parser` header `parser_header`: the status, the `x-smg-parser`
+    /// response header, and the body.
+    async fn chat_answer(
+        mode: Mode,
+        fleet_name: Option<&str>,
+        labels: Labels,
+        parser_header: Option<&str>,
+        output_ids: Vec<u32>,
+    ) -> (StatusCode, Option<String>, serde_json::Value) {
+        let ctx = grpc_ctx_with_tool_parser(routing_mode(mode), fleet_name).await;
+        register_tokenizer(&ctx).await;
+        for worker_type in legs(mode) {
+            let port = spawn_engine(output_ids.clone()).await;
+            register_harmony_worker(
+                &ctx,
+                &format!("grpc://127.0.0.1:{port}"),
+                *worker_type,
+                labels,
+            );
+        }
+        let router = GrpcRouter::new(&ctx, mode).expect("router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let mut headers = HeaderMap::new();
+        if let Some(parser) = parser_header {
+            headers.insert(symphony::HEADER, parser.parse().expect("header value"));
+        }
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": HARMONY_MODEL, "separate_reasoning": true,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {"q": {"type": "integer"}}}
+            }}]
+        }))
+        .expect("chat request");
+        let response = router
+            .route_chat(Some(&headers), &tenant_meta, body, HARMONY_MODEL)
+            .await;
+        let status = response.status();
+        let parser = response
+            .headers()
+            .get("x-smg-parser")
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({"raw": String::from_utf8_lossy(&bytes)}));
+        (status, parser, body)
+    }
+
+    /// The Harmony pipeline's answer to the scripted "Hi": the final channel's
+    /// text as the content, no call, no thought, no parser header.
+    fn assert_harmony_answer(
+        mode: Mode,
+        (status, parser, answer): &(StatusCode, Option<String>, serde_json::Value),
+    ) {
+        assert_eq!(*status, StatusCode::OK, "{mode:?}: {answer}");
+        assert_eq!(
+            *parser, None,
+            "{mode:?}: the Harmony pipeline names no parser"
+        );
+        let message = &answer["choices"][0]["message"];
+        assert_eq!(message["content"], "Hi", "{mode:?}: {answer}");
+        assert!(
+            message["tool_calls"].as_array().is_none_or(Vec::is_empty),
+            "{mode:?}: {answer}"
+        );
+        assert!(message["reasoning_content"].is_null(), "{mode:?}: {answer}");
+        assert_eq!(
+            answer["choices"][0]["finish_reason"], "stop",
+            "{mode:?}: {answer}"
+        );
+    }
+
+    /// Symphony decides a Harmony model's chat request before the Harmony
+    /// pipeline, in both modes that have one. Selected for the request (the
+    /// header, with the table the workers' own label pins, as the registry's
+    /// table for the model would), the chat pipeline answers and Symphony
+    /// reads the engine's output, the thought and the call apart, and names
+    /// itself; not selected (the header names the legacy parsers), the Harmony
+    /// pipeline answers as before, reading the Harmony channels and naming no
+    /// parser. A gateway-wide parser name is not the model's own and does not
+    /// take the request off the Harmony pipeline; nor does a label of the
+    /// model's own when the pipeline would then read with the legacy parsers
+    /// (a reasoning label that pins a table, a fleet-wide tool-call name no
+    /// table answers to).
+    #[tokio::test]
+    async fn symphony_decides_a_harmony_models_chat_request_before_the_harmony_pipeline() {
+        for mode in [Mode::Regular, Mode::PrefillDecode] {
+            let (status, parser, answer) = chat_answer(
+                mode,
+                None,
+                (Some("qwen"), None),
+                Some("symphony"),
+                vec![TABLE_OUTPUT_ID],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{mode:?}: {answer}");
+            assert_eq!(parser.as_deref(), Some("symphony"), "{mode:?}: {answer}");
+            let message = &answer["choices"][0]["message"];
+            assert_eq!(message["reasoning_content"], "plan", "{mode:?}: {answer}");
+            assert_eq!(
+                message["content"].as_str().map(str::trim),
+                Some("Hello"),
+                "{mode:?}: {answer}"
+            );
+            assert_eq!(
+                message["tool_calls"][0]["function"]["name"], "lookup",
+                "{mode:?}: {answer}"
+            );
+            assert_eq!(
+                answer["choices"][0]["finish_reason"], "tool_calls",
+                "{mode:?}: {answer}"
+            );
+
+            for (fleet_name, labels) in [
+                (None, (Some("qwen"), None)),
+                (Some("qwen"), UNLABELED),
+                (Some("passthrough"), (None, Some("qwen3"))),
+            ] {
+                let parser_header = if labels.0.is_some() {
+                    "legacy"
+                } else {
+                    "symphony"
+                };
+                let answer = chat_answer(
+                    mode,
+                    fleet_name,
+                    labels,
+                    Some(parser_header),
+                    harmony_output(),
+                )
+                .await;
+                assert_harmony_answer(mode, &answer);
+            }
+        }
+    }
+
+    /// Symphony on, but no table reads the model (no label, an id the
+    /// registry does not know): the request is not Symphony's, and the Harmony
+    /// pipeline keeps it, in both modes.
+    #[tokio::test]
+    async fn a_harmony_model_no_table_reads_stays_with_the_harmony_pipeline_under_symphony() {
+        for mode in [Mode::Regular, Mode::PrefillDecode] {
+            let answer =
+                chat_answer(mode, None, UNLABELED, Some("symphony"), harmony_output()).await;
+            assert_harmony_answer(mode, &answer);
+        }
+    }
+
+    /// The rule as a table, per mode and per request: the Harmony pipeline
+    /// reads a Harmony model's request under the legacy parsers, under
+    /// Symphony when no table reads the model, whatever gateway-wide parser
+    /// name is set, and when the model's own label selects a table but the
+    /// pipeline's names would hand the request to the legacy parsers; never
+    /// one Symphony is selected for (the workers' own label pins a table or
+    /// names the response template, or a header the chat pipeline refuses);
+    /// and never in EPD, which has no Harmony pipeline. The same answer serves
+    /// the chat and the Responses routes.
+    #[tokio::test]
+    async fn the_harmony_pipeline_is_reached_only_when_symphony_is_not_selected() {
+        let header = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(symphony::HEADER, value.parse().expect("header value"));
+            headers
+        };
+        for mode in [
+            Mode::Regular,
+            Mode::PrefillDecode,
+            Mode::EncodePrefillDecode,
+        ] {
+            let has_harmony_pipeline = mode != Mode::EncodePrefillDecode;
+            for (fleet_name, labels, parser_header, harmony) in [
+                (None, UNLABELED, None, true),
+                (None, UNLABELED, Some("legacy"), true),
+                (None, UNLABELED, Some("symphony"), true),
+                (Some("qwen"), UNLABELED, Some("symphony"), true),
+                (None, (Some("qwen"), None), Some("legacy"), true),
+                (None, (Some("qwen"), None), Some("symphony"), false),
+                (None, (None, Some("qwen3")), Some("symphony"), false),
+                (
+                    Some("passthrough"),
+                    (None, Some("qwen3")),
+                    Some("symphony"),
+                    true,
+                ),
+                (None, (Some("passthrough"), None), Some("symphony"), true),
+                (None, (Some("hf"), None), Some("symphony"), false),
+                (None, UNLABELED, Some("fast"), false),
+            ] {
+                let ctx = grpc_ctx_with_tool_parser(routing_mode(mode), fleet_name).await;
+                for (index, worker_type) in legs(mode).iter().enumerate() {
+                    register_harmony_worker(
+                        &ctx,
+                        &format!("grpc://worker-{index}:30000"),
+                        *worker_type,
+                        labels,
+                    );
+                }
+                let router = GrpcRouter::new(&ctx, mode).expect("router");
+                let headers = parser_header.map(header);
+                assert_eq!(
+                    router.harmony_reads(headers.as_ref(), HARMONY_MODEL),
+                    harmony && has_harmony_pipeline,
+                    "{mode:?}, fleet name {fleet_name:?}, labels {labels:?}, header {parser_header:?}"
+                );
+            }
+        }
     }
 }

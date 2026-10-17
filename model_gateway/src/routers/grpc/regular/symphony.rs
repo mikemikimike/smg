@@ -161,6 +161,30 @@ pub(crate) fn reads(
     })
 }
 
+/// Whether Symphony is selected for a request of `model`: the parser the request runs under
+/// ([`choice`]: `default`, the gateway's `--parser` flag, unless the request's header names the
+/// other) is Symphony, and a table reads the model ([`reads`]): the registry's, the one `names`
+/// pin, or the response template's. A refusal is a selection too, since it is Symphony's answer:
+/// the names ask the template for what the model cannot give, or the header names neither parser,
+/// and the chat pipeline's preparation refuses the request as it refuses every model's. Only a
+/// request the legacy parsers read, under `legacy` or for a model no table reads, is not selected.
+/// The caller resolves `names` for the model: the router asks this before it picks a pipeline for a
+/// model that has one of its own (`GrpcRouter::harmony_reads`), with the names the model's own
+/// cards set, so the route and the mode never decide the parser, and a gateway-wide name does not
+/// take a model off its own pipeline.
+pub(crate) fn selected(
+    default: ParserChoice,
+    headers: Option<&HeaderMap>,
+    names: &Names,
+    model: &str,
+    templates: &Templates,
+) -> bool {
+    match choice(default, headers) {
+        Ok(parser) => !matches!(reads(parser, names, model, templates), Ok(None)),
+        Err(_) => true,
+    }
+}
+
 /// Whether the parser names set for a model (the flags, or one worker's labels) are names the
 /// gateway reads with under `parser`: a legacy parser's, or, with Symphony on, a table's or
 /// [`TEMPLATE_PARSER`]. `tools` and `reasoning` are the legacy registries; a name whose registry
@@ -3201,5 +3225,99 @@ mod tests {
         )
         .expect_err("refused");
         assert_eq!(why, "no tokenizer is registered for model 'Qwen/Qwen3-8B'");
+    }
+
+    /// Symphony is selected for a request a table reads (the registry's for a model it knows, a
+    /// pinned one for any model, the header over the flag) or refuses (the template named for a
+    /// model without one, a header naming neither parser), and for no other: the legacy parsers
+    /// by the flag or the header, a model no table reads, a legacy tool-call name.
+    #[test]
+    fn symphony_is_selected_for_a_request_a_table_reads_or_refuses_and_for_no_other() {
+        let templates = Templates::new(Arc::new(TokenizerRegistry::new()));
+        let header = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(HEADER, value.parse().expect("header value"));
+            headers
+        };
+        let known = "Qwen/Qwen3-8B";
+        let unknown = "m";
+        let none = Names::default();
+
+        // The registry's table, for a model it knows; none for one it does not.
+        assert!(selected(
+            ParserChoice::Symphony,
+            None,
+            &none,
+            known,
+            &templates
+        ));
+        assert!(!selected(
+            ParserChoice::Symphony,
+            None,
+            &none,
+            unknown,
+            &templates
+        ));
+        // The legacy parsers, by the flag or by the header, read nothing of Symphony's.
+        assert!(!selected(
+            ParserChoice::Legacy,
+            None,
+            &none,
+            known,
+            &templates
+        ));
+        assert!(!selected(
+            ParserChoice::Symphony,
+            Some(&header("legacy")),
+            &none,
+            known,
+            &templates
+        ));
+        // The header selects over the flag; a pinned table reads any model; a legacy
+        // tool-call name no table answers to keeps the legacy parsers.
+        assert!(selected(
+            ParserChoice::Legacy,
+            Some(&header("symphony")),
+            &none,
+            known,
+            &templates
+        ));
+        assert!(selected(
+            ParserChoice::Symphony,
+            None,
+            &names(Some("qwen3"), None),
+            unknown,
+            &templates
+        ));
+        assert!(!selected(
+            ParserChoice::Symphony,
+            None,
+            &names(Some("passthrough"), None),
+            known,
+            &templates
+        ));
+        // A refusal is Symphony's: the template named for a model without one; a header that
+        // names neither parser, whatever the flag.
+        assert!(selected(
+            ParserChoice::Symphony,
+            None,
+            &names(Some(TEMPLATE_PARSER), None),
+            unknown,
+            &templates
+        ));
+        assert!(selected(
+            ParserChoice::Symphony,
+            Some(&header("fast")),
+            &none,
+            unknown,
+            &templates
+        ));
+        assert!(selected(
+            ParserChoice::Legacy,
+            Some(&header("fast")),
+            &none,
+            unknown,
+            &templates
+        ));
     }
 }
