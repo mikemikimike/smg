@@ -1050,9 +1050,10 @@ pub(crate) fn select_pair(
         return Err(fail(WorkerLeg::Decode, PlacementFailure::Unavailable));
     }
     info.leg = WorkerLeg::Decode;
-    // The decode follows the traffic group the prefill leg was split into, so
-    // a pair never spans two groups; an unsplit prefill leaves it to decide
-    // for itself (see `PolicyRegistry::select_worker_for_model_split`).
+    // The decode follows the traffic group the prefill leg was split into,
+    // or the named group an unsplit prefill was picked from, so a pair never
+    // spans two groups; an unsplit prefill from the default group leaves it
+    // to decide for itself (see `PolicyRegistry::select_worker_for_model_split`).
     let Some((decode_idx, _)) = policies.select_worker_for_model_split(
         &decode_policy,
         model_id,
