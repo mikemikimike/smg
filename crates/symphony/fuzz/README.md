@@ -118,7 +118,8 @@ check saw. In fork mode the message is in the job's own log; replaying the artif
 2. Minimize: `cargo +nightly fuzz tmin --sanitizer none <target> artifacts/<label>/<target>/crash-<hash>`
    writes the smallest input that still crashes next to it as `minimized-from-<hash>`.
 3. Explain: `cargo +nightly run --release --example explain -- <target> <file>` prints the decoded
-   case and runs the checks on it outside the fuzzer.
+   case and runs the checks on it outside the fuzzer; with `--events` it prints the events of the
+   whole replay and of the replay in pieces first, one per line, the streams a reader sees.
 4. File it: an issue with the target, the crate's commit, the decoded case from step 3 (the output
    as a Rust string literal and the cuts are enough to replay it; attach the minimized bytes when
    the literal is unwieldy), the invariant that failed and the check's message. Nothing else from

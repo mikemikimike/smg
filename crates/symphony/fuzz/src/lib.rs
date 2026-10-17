@@ -216,6 +216,18 @@ pub fn run(data: &[u8], table: Option<Table>) {
     check(&decode(data, table));
 }
 
+/// The events of `case` replayed with its output cut at `cuts` (none for the whole replay,
+/// `case.cuts` for the pieces): what a reader of the stream sees, for reading an artifact
+/// outside the shape checks (`explain --events`).
+///
+/// # Panics
+///
+/// As a replay does: a `feed` that fails is the `feed-failed` breach, and an engine that panics
+/// panics here.
+pub fn events(case: &Case, cuts: &[usize]) -> Vec<Event> {
+    replay(case, cuts).events
+}
+
 /// Replays `case` whole and in its pieces and asserts the contract on both.
 pub fn check(case: &Case) {
     let whole = replay(case, &[]);
@@ -1535,6 +1547,26 @@ mod tests {
         }
         assert!(closed_structure("{\"a\": \"}\"}") && !closed_structure("{\"a\": \"}\""));
         assert!(!closed_structure("}") && !closed_structure("{]") && !closed_structure("  "));
+    }
+
+    #[test]
+    fn the_events_of_both_replays_are_the_streams_a_reader_sees() -> Result<(), String> {
+        let output = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>";
+        let case = decode(&encode(Table::Qwen3, "", output)?, Some(Table::Qwen3));
+        let (whole, pieces) = (events(&case, &[]), events(&case, &case.cuts));
+        assert!(
+            pieces.len() > whole.len(),
+            "the pieces come as the deltas arrive"
+        );
+        for replay in [&whole, &pieces] {
+            let conserved: String = replay.iter().map(bytes_of).collect();
+            assert_eq!(conserved, output);
+            assert!(matches!(
+                replay.last(),
+                Some(Event::Finish { tool_calls: 1, .. })
+            ));
+        }
+        Ok(())
     }
 
     #[test]
