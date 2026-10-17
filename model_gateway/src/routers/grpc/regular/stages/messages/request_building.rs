@@ -109,8 +109,11 @@ impl BuildStage for MessageRequestBuildingStage {
                 )
             })
         };
+        // Where a Symphony table reads the message, its replay of the
+        // prompt: a turn the prompt leaves unopened starts inside the
+        // thought whatever the switch says (`regular::symphony::reasoning_open`).
         let require_reasoning = match symphony::reasoning_open(
-            ctx.state.parser.unwrap_or_default(),
+            ctx.state.parser.unwrap_or(ParserChoice::Legacy),
             &ctx.components
                 .parser_resolver
                 .names(&messages_request.model),
