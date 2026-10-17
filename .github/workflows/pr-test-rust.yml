@@ -1001,9 +1001,10 @@ jobs:
               - 'grpc_servicer/smg_grpc_servicer/sglang/**'
               - '.github/actions/setup-sglang/**'
               - 'scripts/ci_install_sglang.sh'
-              # the servicer tests that import the engine itself (skipped by
-              # python-unit-tests, run by the engine's row that passes
-              # servicer_unit_tests)
+              # the servicer tests that need the engine's own dependencies
+              # (SGLang itself, or torch, which python-unit-tests does not
+              # install), run by the SGLang row that passes servicer_unit_tests
+              - 'grpc_servicer/tests/test_sglang_mm_tensors.py'
               - 'grpc_servicer/tests/test_sglang_zmq_msgpack.py'
               - 'grpc_servicer/tests/test_sglang_zmq_plugin.py'
               - 'grpc_servicer/tests/test_sglang_rust_servicer.py'
@@ -1015,6 +1016,7 @@ jobs:
               # (vLLM itself, or torch, which python-unit-tests does not
               # install), run by the vLLM row that passes servicer_unit_tests;
               # the other test_vllm_* files run on CPU in python-unit-tests
+              # (as do the other test_sglang_* files, see sglang)
               - 'grpc_servicer/tests/test_vllm_error_codes.py'
               - 'grpc_servicer/tests/test_vllm_kv_events.py'
               - 'grpc_servicer/tests/test_vllm_media_identity.py'
