@@ -176,7 +176,7 @@ impl WorkerSelectionStage {
     /// shed, with the same back-off hint as the admission queue's refusals.
     fn refuse_if_expired(&self, ctx: &RequestContext, accepted: Instant) -> Option<Response> {
         let timeout = self.queue_timeout?;
-        let waited = waited_past_timeout(accepted, Instant::now(), timeout)?;
+        let waited = waited_past_timeout(accepted, AcceptedAt::clock_now(), timeout)?;
         Some(Self::queue_timeout_refusal(ctx, waited, timeout))
     }
 
@@ -225,12 +225,13 @@ impl WorkerSelectionStage {
         let (Some(timeout), Some(accepted)) = (self.queue_timeout, accepted) else {
             return admission.await;
         };
-        let budget = timeout.saturating_sub(accepted.elapsed());
+        let budget =
+            timeout.saturating_sub(AcceptedAt::clock_now().saturating_duration_since(accepted));
         match tokio::time::timeout(budget, admission).await {
             Ok(result) => result,
             Err(_) => Err(Self::queue_timeout_refusal(
                 ctx,
-                accepted.elapsed(),
+                AcceptedAt::clock_now().saturating_duration_since(accepted),
                 timeout,
             )),
         }
@@ -5899,8 +5900,10 @@ mod tests {
     /// A request's first selection takes the stamp; a later pipeline run of
     /// the same request (a Responses tool loop iteration carries the same
     /// meta) is not refused for the time the request spent generating and
-    /// running tools, however long, while a new request that waited is.
-    #[tokio::test]
+    /// running tools, however long, while a new request that waited is. On
+    /// the paused clock no time passes between a stamp and the selection
+    /// that reads it, however loaded the host; only the sleeps advance it.
+    #[tokio::test(start_paused = true)]
     async fn a_later_run_of_the_same_request_is_not_bounded() {
         let registry = Arc::new(WorkerRegistry::new());
         registry
@@ -5908,14 +5911,14 @@ mod tests {
             .unwrap();
         let stage =
             regular_stage(Arc::clone(&registry)).with_queue_timeout(Duration::from_millis(1));
-        let mut first = prepared_ctx(Arc::clone(&registry), Some(Instant::now()));
+        let mut first = prepared_ctx(Arc::clone(&registry), Some(AcceptedAt::clock_now()));
         stage
             .execute(&mut first)
             .await
             .expect("the first selection");
         let meta = first.input.tenant_request_meta.clone();
 
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
         let mut later = prepared_ctx(Arc::clone(&registry), None);
         later.input.tenant_request_meta = meta;
         stage
@@ -5924,8 +5927,8 @@ mod tests {
             .expect("a later run of the same request is not held to the bound");
         assert!(later.state.workers.is_some());
 
-        let mut fresh = prepared_ctx(registry, Some(Instant::now()));
-        std::thread::sleep(Duration::from_millis(5));
+        let mut fresh = prepared_ctx(registry, Some(AcceptedAt::clock_now()));
+        tokio::time::sleep(Duration::from_millis(5)).await;
         let refused = stage
             .execute(&mut fresh)
             .await

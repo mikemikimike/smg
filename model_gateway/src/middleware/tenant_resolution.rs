@@ -42,9 +42,18 @@ pub struct AcceptedAt {
 }
 
 impl AcceptedAt {
-    /// A stamp taken now.
+    /// A stamp taken now, on the clock the bound is read on
+    /// ([`Self::clock_now`]).
     pub fn now() -> Self {
-        Self::at(Instant::now())
+        Self::at(Self::clock_now())
+    }
+
+    /// The clock an acceptance is stamped on and the bound ahead of worker
+    /// selection is read on, both ends the same: the runtime's, which is the
+    /// wall clock in production and the paused clock of a test that advances
+    /// time itself.
+    pub fn clock_now() -> Instant {
+        tokio::time::Instant::now().into_std()
     }
 
     /// A stamp taken at `at`.
