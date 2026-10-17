@@ -1803,11 +1803,15 @@ impl CacheAwarePolicy {
     /// The cost form of the spill decision (`balance_cost_gate`): every row
     /// the decision read is a candidate at its expected wait plus the
     /// prefill the request still needs there, its uncached share of the
-    /// prompt (see [`LeastLoadPolicy::select_min_total_wait`]). The holders
-    /// of the prefix are left for a colder worker exactly when their wait
+    /// prompt (see [`LeastLoadPolicy::select_min_total_wait`]), read as the
+    /// tokens of the blocks it holds over the prompt's tokens, so a prompt
+    /// that ends inside a block is not read as cached whole. The holders of
+    /// the prefix are left for a colder worker exactly when their wait
     /// exceeds its by more than the time the prefix saves; a shallower
     /// holder keeps the credit of its own overlap; the in-flight count
-    /// margins do not apply. Selection and credit stay one atomic step.
+    /// margins do not apply, nor do the group a selection policy formed or
+    /// `overlap_decay`: the cost ranks every row on its blocks. Selection
+    /// and credit stay one atomic step.
     fn select_final_by_cost(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1815,11 +1819,14 @@ impl CacheAwarePolicy {
         request: &RequestInputs<'_>,
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
-        let request_blocks = request.request_blocks.max(1) as f64;
+        let prompt_tokens = request.prompt_tokens.max(1) as f64;
+        let block_size = request.block_size as f64;
         let rows: Vec<usize> = inputs.iter().map(|candidate| candidate.idx).collect();
         let shares: Vec<f64> = inputs
             .iter()
-            .map(|candidate| (candidate.device_blocks / request_blocks).clamp(0.0, 1.0))
+            .map(|candidate| {
+                (candidate.device_blocks.max(0.0) * block_size / prompt_tokens).clamp(0.0, 1.0)
+            })
             .collect();
         let selected =
             self.load_scorer
@@ -3378,6 +3385,16 @@ impl Default for CacheAwarePolicy {
 }
 
 #[cfg(test)]
+impl CacheAwarePolicy {
+    /// The policy with `load_scorer` in place of the default one, so a test
+    /// can size the mean prefill the credit floors at.
+    fn with_load_scorer(mut self, load_scorer: LeastLoadPolicy) -> Self {
+        self.load_scorer = load_scorer;
+        self
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
     use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
@@ -3388,7 +3405,10 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::load_state::TestFeed;
+    use crate::worker::{
+        expected_wait::{DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_THROUGHPUT},
+        load_state::TestFeed,
+    };
 
     #[test]
     fn text_is_wanted_only_without_token_ids() {
@@ -4820,13 +4840,17 @@ mod tests {
     /// One selection of a 32-token request on a two-worker pool where `w1`
     /// holds the request's first `held` tokens, with `queued` uncached
     /// tokens reported per worker at 100 tokens/s and no request in flight
-    /// on either worker. Returns the policy and workers for credit checks.
+    /// on either worker. The scorer's mean prefill is 4 tokens, so the
+    /// credit floor stays under the work the table reads. Returns the
+    /// policy and workers for credit checks.
     fn cost_pick(
         config: CacheAwareConfig,
         held: usize,
         queued: [i32; 2],
     ) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>, usize) {
-        let policy = CacheAwarePolicy::with_config(config);
+        let policy = CacheAwarePolicy::with_config(config).with_load_scorer(
+            LeastLoadPolicy::with_params(DEFAULT_KV_PRESSURE_WEIGHT, 4, DEFAULT_THROUGHPUT, 0),
+        );
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
         let tokens: Vec<u32> = (0..32).collect();
         seed_token_tenants(&policy, &workers, &tokens[..held], &["http://w1:8000"]);
@@ -4868,8 +4892,9 @@ mod tests {
     fn the_cost_gate_prices_a_partial_prefix_at_its_uncached_share() {
         // 24 of the 32 tokens are held: 8 remain to prefill on the home
         // against 32 on a cold worker, so the gap that opens the gate is 24
-        // tokens, and the home is credited the 8 it must compute where the
-        // count gate credits the whole prompt.
+        // tokens, and the home is credited the 8 it must compute (over the
+        // scorer's 4-token floor) where the count gate credits the whole
+        // prompt.
         let (policy, workers, idx) = cost_pick(cost_gate(), 24, [24, 0]);
         assert_eq!(idx, 0);
         assert_only_final_worker_credited(&policy, &workers, 0, 8);
