@@ -8,7 +8,9 @@
 //! bytes are fragments for as long as they keep it a JSON prefix (judged by [`Prefix`], so the
 //! fragments keep the promise `ToolCallArguments` makes, exactly as strong as for the
 //! [`Assembler`](super::Assembler)), and from the first byte that does not, the bytes come back as
-//! `Malformed` with `InvalidArguments`. The fragments are the model's own bytes, spacing included.
+//! `Malformed` with `InvalidArguments`. The fragments are the model's own bytes, spacing included,
+//! but for a raw control character inside a string, which JSON forbids and the fragment writes as
+//! its escape ([`Prefix::escaped`]); only `source` keeps the model's byte there.
 //! A word being spelled (`nu`) is held until it is a literal or is refused, which the judge does
 //! from its first letter, so that where the chunks were cut does not decide which of its bytes
 //! were sent.
