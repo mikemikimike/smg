@@ -1,0 +1,121 @@
+//! What a request declares about its calls costs nothing to hold: [`Declared::shared`] over the
+//! request's tools allocates nothing, however many tools the request declares and however large
+//! their schemas, and a parameter's schema is read in place. A separate executable, so it can
+//! declare the counting allocator the pin needs.
+
+#![expect(unsafe_code, reason = "a global allocator that counts allocations")]
+
+use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    hint::black_box,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
+
+use openai_protocol::common::{Function, Tool};
+use serde_json::json;
+use symphony::Declared;
+
+struct Counting;
+
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the layout is the caller's, handed to the system allocator unchanged.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: `ptr` came from `alloc` or `realloc` above with this layout.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: `ptr` came from `alloc` or `realloc` above with this layout.
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: Counting = Counting;
+
+fn allocations_during(work: impl FnOnce()) -> usize {
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    work();
+    ALLOCATIONS.load(Ordering::Relaxed) - before
+}
+
+/// Ten function tools whose schemas run to about two kilobytes each.
+fn tools() -> Arc<[Tool]> {
+    let filler =
+        "a description long enough to make the schema weigh what a real one does ".repeat(24);
+    (0..10)
+        .map(|k| Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: format!("lookup_{k}"),
+                description: Some(filler.clone()),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "description": "the record key"},
+                        "fields": {"type": "array", "items": {"type": "string"}},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                        "filter": {
+                            "type": "object",
+                            "properties": {
+                                "since": {"type": "string", "format": "date-time"},
+                                "status": {"type": "string", "enum": ["open", "closed", "any"]}
+                            }
+                        }
+                    },
+                    "required": ["key"]
+                }),
+                strict: None,
+                extra: Default::default(),
+            },
+        })
+        .collect()
+}
+
+#[test]
+fn holding_what_a_request_declares_allocates_nothing() {
+    let tools = tools();
+    assert!(
+        tools
+            .iter()
+            .all(|tool| serde_json::to_string(tool).map_or(0, |json| json.len()) > 2_000),
+        "the schemas are meant to be large"
+    );
+
+    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let declared = black_box(Declared::shared(Arc::clone(&tools)));
+    let building = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    assert_eq!(building, 0, "building Declared allocated {building} times");
+
+    let names: Vec<String> = (0..10).map(|k| format!("lookup_{k}")).collect();
+    let mut found = 0;
+    let reading = allocations_during(|| {
+        for name in &names {
+            if let Some(schemas) = declared.parameter(name, "limit") {
+                black_box(schemas);
+                found += 1;
+            }
+        }
+    });
+    assert_eq!(found, 10, "every function declares the parameter");
+    assert_eq!(
+        reading, 0,
+        "reading ten parameters' schemas allocated {reading} times"
+    );
+    assert_eq!(
+        Arc::strong_count(&tools),
+        2,
+        "the tools are shared, not copied"
+    );
+}

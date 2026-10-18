@@ -664,7 +664,7 @@ impl ToolReference {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Tool {
     #[serde(rename = "type")]
     pub tool_type: String, // "function"
@@ -691,7 +691,7 @@ fn deserialize_parameters<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 }
 
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Function {
     pub name: String,
     pub description: Option<String>,
