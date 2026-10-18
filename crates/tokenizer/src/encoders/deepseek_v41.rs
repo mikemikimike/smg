@@ -15,6 +15,15 @@ use serde_json::Value;
 // here because it is part of this module's public API, and `pub(super)` items
 // are not reachable from outside `encoders` on their own.
 pub use super::deepseek_common::DsEncodingError;
+use super::deepseek_common::{ASSISTANT_SP_TOKEN, LATEST_REMINDER_SP_TOKEN, USER_SP_TOKEN};
+// ---------------------------------------------------------------------------
+// Special-token constants: the family's shared ones come from `deepseek_common`
+// (re-exported under this renderer's path), this version's own follow. Copied
+// verbatim from the Python source.
+// ---------------------------------------------------------------------------
+pub use super::deepseek_common::{
+    BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
+};
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
@@ -35,22 +44,10 @@ use crate::{
     chat_template::{ChatTemplateContentFormat, ThinkingKeyName, ThinkingToggle},
     traits::RendererCapabilities,
 };
-
-// ---------------------------------------------------------------------------
-// Special-token constants — copied verbatim from the Python source.
-// ---------------------------------------------------------------------------
-pub const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";
-pub const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
-pub const THINKING_START_TOKEN: &str = "<think>";
-pub const THINKING_END_TOKEN: &str = "</think>";
-pub const DSML_TOKEN: &str = "｜DSML｜";
 /// What every image content part renders as; the image payload itself is the
 /// serving layer's business, the prompt only carries this marker.
 pub const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
-const USER_SP_TOKEN: &str = "<｜User｜>";
-const ASSISTANT_SP_TOKEN: &str = "<｜Assistant｜>";
 const SYSTEM_SP_TOKEN: &str = "<｜System｜>";
-const LATEST_REMINDER_SP_TOKEN: &str = "<｜latest_reminder｜>";
 /// V4.1's DSML dialect: a leading space on the block name and on both tags
 /// (V4 uses bare `tool_calls`/`invoke`/`parameter`).
 const TOOL_CALLS_BLOCK_NAME: &str = " calls";

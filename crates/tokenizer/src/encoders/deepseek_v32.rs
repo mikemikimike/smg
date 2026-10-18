@@ -81,14 +81,14 @@ pub enum DsEncodingError {
 }
 
 // ---------------------------------------------------------------------------
-// Special-token constants — copied verbatim from the Python source.
+// Special-token constants: the family's shared ones come from `deepseek_common`
+// (re-exported under this renderer's path), this version's own follow. Copied
+// verbatim from the Python source.
 // ---------------------------------------------------------------------------
 
-pub const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";
-pub const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
-pub const THINKING_START_TOKEN: &str = "<think>";
-pub const THINKING_END_TOKEN: &str = "</think>";
-pub const DSML_TOKEN: &str = "｜DSML｜";
+pub use super::deepseek_common::{
+    BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
+};
 
 /// What this renderer answers around a render (see [`RendererProfile`]).
 pub(crate) const PROFILE: RendererProfile = RendererProfile {
@@ -106,8 +106,7 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     thinking_mode: None,
 };
 
-const USER_PREFIX: &str = "<｜User｜>";
-const ASSISTANT_SUFFIX: &str = "<｜Assistant｜>";
+use super::deepseek_common::{ASSISTANT_SP_TOKEN, USER_SP_TOKEN};
 
 // ---------------------------------------------------------------------------
 // Templates
@@ -163,7 +162,7 @@ fn response_format_block(schema: &str) -> String {
 }
 
 fn user_msg(content: &str) -> String {
-    format!("{USER_PREFIX}{content}{ASSISTANT_SUFFIX}")
+    format!("{USER_SP_TOKEN}{content}{ASSISTANT_SP_TOKEN}")
 }
 
 /// Mirrors `encode_arguments_to_dsml`. `tool_call["arguments"]` is a JSON
@@ -506,7 +505,7 @@ mod tests {
         let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
 
         let expected =
-            format!("{BOS_TOKEN}{USER_PREFIX}Hello{ASSISTANT_SUFFIX}{THINKING_END_TOKEN}",);
+            format!("{BOS_TOKEN}{USER_SP_TOKEN}Hello{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}",);
         assert_eq!(out, expected);
     }
 
@@ -516,7 +515,7 @@ mod tests {
         let out = encode_messages(&msgs, ThinkingMode::Thinking, &EncodeParams::default()).unwrap();
 
         let expected =
-            format!("{BOS_TOKEN}{USER_PREFIX}Hello{ASSISTANT_SUFFIX}{THINKING_START_TOKEN}",);
+            format!("{BOS_TOKEN}{USER_SP_TOKEN}Hello{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}",);
         assert_eq!(out, expected);
     }
 
@@ -639,7 +638,7 @@ mod tests {
         };
         let out = encode_messages(&msgs, ThinkingMode::Chat, &params).unwrap();
         assert!(!out.starts_with(BOS_TOKEN));
-        assert!(out.starts_with(USER_PREFIX));
+        assert!(out.starts_with(USER_SP_TOKEN));
     }
 
     #[test]
