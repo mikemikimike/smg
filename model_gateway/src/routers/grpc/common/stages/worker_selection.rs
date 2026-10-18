@@ -30,8 +30,9 @@ use crate::{
         error,
         grpc::{
             context::{
-                stage_output, DispatchContext, EncodeWorkerAssignment, RequestContext, RequestType,
-                RoutingSnapshot, WireConstraint, WorkerSelection,
+                stage_output, DispatchContext, EncodeWorkerAssignment, PreparationOutput,
+                RequestContext, RequestInput, RequestType, RoutingSnapshot, WireConstraint,
+                WorkerSelection,
             },
             multimodal,
         },
@@ -297,37 +298,69 @@ impl PipelineStage for WorkerSelectionStage {
     }
 }
 
-impl WorkerSelectionStage {
-    /// The selection behind [`PipelineStage::execute`]; a refusal it returns
-    /// is reported there by [`Self::report_refusal`].
-    async fn select(&self, ctx: &mut RequestContext) -> Result<(), Response> {
-        let accepted = self.acceptance_for_selection(ctx);
-        if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
-            return Err(refused);
-        }
-        let prep = stage_output(
-            ctx.state.preparation.as_ref(),
-            "WorkerSelectionStage::execute",
-        )?;
+/// What one selection reads from the request before any worker is picked:
+/// the media it carries and what that demands of a worker, the context
+/// requirements, the routing text and token ids, the keys, the wire the
+/// request type pins, and the model. Gathered once ([`Self::gather`]), kept
+/// for the retries in the routing snapshot ([`Self::snapshot`]), read by the
+/// pick ([`WorkerSelectionStage::pick`]).
+struct SelectionInputs<'a> {
+    intermediate: Option<&'a multimodal::MultimodalIntermediate>,
+    /// Media references are forwarded: only a worker that advertises
+    /// worker-side processing takes them.
+    media_refs: bool,
+    /// Pixel media (an image or a video) only goes to workers that accept
+    /// vision input: regular mode's single worker takes the whole request,
+    /// and the disaggregated legs their shares of it (see `PairDemands`).
+    needs_vision: bool,
+    context_requirements: ContextRequirements,
+    demand: PairDemands,
+    text: Option<&'a str>,
+    /// The prepared request's token ids, for PrefixHash policy support.
+    ids: &'a [u32],
+    headers: Option<&'a HeaderMap>,
+    rid_key: Option<String>,
+    /// Whether the routing snapshot keeps a copy of the text: always without
+    /// token ids, and with them only for a policy that reads text next to
+    /// the ids (cache_aware routes on the ids and would copy the whole
+    /// rendered prompt for nothing).
+    keep_text: bool,
+    cache_namespace: Option<CacheNamespace>,
+    /// The request's media demands. The single worker takes the whole
+    /// request, so it must meet every one of them; the disaggregated legs
+    /// take the references' predicate (a worker that processes them, on
+    /// the side of the pipeline pin the plan carries) from the inputs and
+    /// their vision demands from `PairDemands` in the pair selection.
+    media: MediaDemands,
+    wire: Option<WireConstraint>,
+    model_id: &'a str,
+}
 
-        let intermediate = ctx.state.multimodal_intermediate.as_ref();
+impl<'a> SelectionInputs<'a> {
+    fn gather(
+        stage: &WorkerSelectionStage,
+        input: &'a RequestInput,
+        prep: &'a PreparationOutput,
+        intermediate: Option<&'a multimodal::MultimodalIntermediate>,
+        refs: Option<&'a multimodal::MediaPlan>,
+        media_refs_pipeline: PipelinePin,
+    ) -> Self {
         // Media references only go to workers that advertise worker-side processing.
-        let media_refs = ctx.state.multimodal_refs.is_some();
+        let media_refs = refs.is_some();
         // Pixel media (an image or a video) only goes to workers that accept
         // vision input: regular mode's single worker takes the whole request,
         // and the disaggregated legs their shares of it (see `PairDemands`).
-        let needs_vision =
-            multimodal::request_needs_vision(intermediate, ctx.state.multimodal_refs.as_ref());
-        let context_requirements = if self.mode == WorkerSelectionMode::EncodePrefillDecode {
+        let needs_vision = multimodal::request_needs_vision(intermediate, refs);
+        let context_requirements = if stage.mode == WorkerSelectionMode::EncodePrefillDecode {
             ContextRequirements::default()
         } else {
-            ContextRequirements::new(prep, &ctx.input.request_type)
+            ContextRequirements::new(prep, &input.request_type)
         };
         let demand = PairDemands::new(
-            self.prefill_leg_needs_vision(needs_vision),
-            self.decode_leg_needs_vision(&ctx.input.request_type, intermediate, media_refs),
+            stage.prefill_leg_needs_vision(needs_vision),
+            stage.decode_leg_needs_vision(&input.request_type, intermediate, media_refs),
         )
-        .with_media_refs(media_refs, ctx.state.media_refs_pipeline)
+        .with_media_refs(media_refs, media_refs_pipeline)
         .with_context(context_requirements);
 
         let text = prep.routing_text();
@@ -336,14 +369,10 @@ impl WorkerSelectionStage {
         let ids = prep.token_ids();
         let tokens = if ids.is_empty() { None } else { Some(ids) };
 
-        let headers = ctx.input.headers.as_ref();
-        let rid_key = self
+        let headers = input.headers.as_ref();
+        let rid_key = stage
             .policy_registry
-            .derive_rid_key(ctx.input.request_type.rid())
-            .map(str::to_string);
-        ctx.state.sticky_key = self
-            .policy_registry
-            .sticky_key(headers, rid_key.as_deref())
+            .derive_rid_key(input.request_type.rid())
             .map(str::to_string);
 
         // Selection inputs that survive the request drop: retry attempts
@@ -353,7 +382,7 @@ impl WorkerSelectionStage {
         // routes on the ids and would copy the whole rendered prompt for
         // nothing).
         let keep_text = tokens.is_none()
-            || self
+            || stage
                 .policy_registry
                 .any_policy_needs_request_text_with_tokens(headers);
         // The typed engine wires (gRPC servicers, direct ZMQ) do not carry the
@@ -364,16 +393,6 @@ impl WorkerSelectionStage {
         // the forwarding change can derive it (as the HTTP proxy path does via
         // `GenerationRequest::cache_partition`) without touching selection.
         let cache_namespace: Option<CacheNamespace> = None;
-        ctx.state.routing_snapshot = Some(RoutingSnapshot {
-            context_requirements,
-            routing_text: keep_text.then(|| text.map(str::to_string)).flatten(),
-            token_ids: ids.to_vec(),
-            rid_key: rid_key.clone(),
-            cache_namespace,
-            needs_vision,
-            decode_needs_vision: demand.decode,
-        });
-        let rid_key = rid_key.as_deref();
         // The request's media demands. The single worker takes the whole
         // request, so it must meet every one of them; the disaggregated legs
         // take the references' predicate (a worker that processes them, on
@@ -383,124 +402,125 @@ impl WorkerSelectionStage {
             media_refs,
             vision: needs_vision,
             pipeline: if media_refs {
-                ctx.state.media_refs_pipeline
+                media_refs_pipeline
             } else {
                 PipelinePin::Any
             },
         };
-        let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
-        let inputs = PlacementInputs {
-            text,
-            tokens,
-            headers,
-            rid_key,
-            cache_namespace,
-            candidate_filter: media_refs.then_some(&accepts_refs),
-            tried: &[],
-        };
-        let sticky_key = ctx.state.sticky_key.as_deref();
 
-        let model_id = ctx.input.model_id.as_str();
+        let model_id = input.model_id.as_str();
         // Decisions needs selected-token scoring, currently supported only by
         // SGLang gRPC. Retries retain the selected wire via DispatchContext.
         let wire =
-            matches!(ctx.input.request_type, RequestType::Decisions(_)).then_some(WireConstraint {
+            matches!(input.request_type, RequestType::Decisions(_)).then_some(WireConstraint {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
                 pipeline: PipelinePin::Any,
             });
-        let accepts_media = |worker: &dyn Worker| {
-            media.accepts(worker) && context_requirements.admits(worker, model_id)
-        };
-        let media_filter: Option<CandidateFilter<'_>> = Some(&accepts_media);
-        let workers = match self.mode {
-            WorkerSelectionMode::Regular => {
-                match self.select_single_worker(
-                    model_id,
-                    text,
-                    tokens,
-                    headers,
-                    rid_key,
-                    cache_namespace,
-                    wire,
-                    media_filter,
-                ) {
-                    Some(w) => WorkerSelection::Single { worker: w },
-                    None => {
-                        return Err(self.context_selection_failure(
-                            model_id,
-                            wire,
-                            media,
-                            context_requirements,
-                        ))
-                    }
-                }
-            }
-            WorkerSelectionMode::PrefillDecode => {
-                let (pair, guard) = self
-                    .admit_selection_within_budget(
-                        ctx,
-                        accepted,
-                        self.admit_pd_pair(model_id, inputs, sticky_key, None, media, demand),
-                    )
-                    .await?;
-                ctx.state.pd_prefill_guard = Some(guard);
-                disaggregated(pair)
-            }
-            WorkerSelectionMode::EncodePrefillDecode => {
-                // Encode workers never process references: refuse strict
-                // worker mode here rather than silently bypass the encode fleet.
-                if media_refs {
-                    let err = multimodal::MmRefsError::EncodeNotSupported;
-                    return Err(error::bad_request(err.code(), err.to_string()));
-                }
-                let encode_item_hashes = match encode_item_hashes(intermediate) {
-                    Ok(hashes) => hashes,
-                    Err(err) => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            error = %err,
-                            "Failed to derive encode item routing hashes"
-                        );
-                        return Err(error::internal_error(
-                            "encode_routing_hash_failed",
-                            format!("Failed to derive encode routing hashes: {err}"),
-                        ));
-                    }
-                };
-                let ((encode_assignments, prefill, decode, runtime_type), guard) = self
-                    .admit_selection_within_budget(
-                        ctx,
-                        accepted,
-                        self.admit_encode_prefill_decode_workers(
-                            model_id,
-                            inputs,
-                            sticky_key,
-                            &encode_item_hashes,
-                        ),
-                    )
-                    .await?;
-                ctx.state.pd_prefill_guard = Some(guard);
-                WorkerSelection::Disaggregated {
-                    encode_assignments: if encode_assignments.is_empty() {
-                        None
-                    } else {
-                        Some(encode_assignments)
-                    },
-                    prefill,
-                    decode,
-                    runtime_type,
-                }
-            }
-        };
+        Self {
+            intermediate,
+            media_refs,
+            needs_vision,
+            context_requirements,
+            demand,
+            text,
+            ids,
+            headers,
+            rid_key,
+            keep_text,
+            cache_namespace,
+            media,
+            wire,
+            model_id,
+        }
+    }
+
+    /// The token ids as a routing hint: none when the request has none.
+    fn tokens(&self) -> Option<&'a [u32]> {
+        if self.ids.is_empty() {
+            None
+        } else {
+            Some(self.ids)
+        }
+    }
+
+    /// The selection inputs that survive the request drop: retry attempts
+    /// re-select from these.
+    fn snapshot(&self) -> RoutingSnapshot {
+        RoutingSnapshot {
+            context_requirements: self.context_requirements,
+            routing_text: self
+                .keep_text
+                .then(|| self.text.map(str::to_string))
+                .flatten(),
+            token_ids: self.ids.to_vec(),
+            rid_key: self.rid_key.clone(),
+            cache_namespace: self.cache_namespace,
+            needs_vision: self.needs_vision,
+            decode_needs_vision: self.demand.decode,
+        }
+    }
+
+    /// The inputs as the placement reads them, with the candidate predicate
+    /// the request's media references add.
+    fn placement<'b>(
+        &'b self,
+        candidate_filter: Option<CandidateFilter<'b>>,
+    ) -> PlacementInputs<'b> {
+        PlacementInputs {
+            text: self.text,
+            tokens: self.tokens(),
+            headers: self.headers,
+            rid_key: self.rid_key.as_deref(),
+            cache_namespace: self.cache_namespace,
+            candidate_filter,
+            tried: &[],
+        }
+    }
+}
+
+impl WorkerSelectionStage {
+    /// The selection behind [`PipelineStage::execute`]; a refusal it returns
+    /// is reported there by [`Self::report_refusal`]. The request's inputs are
+    /// gathered first and kept for the retries in the routing snapshot, the
+    /// mode's pick runs on them ([`Self::pick`]), and the selection is checked
+    /// against the request's modalities and media references before it is
+    /// stored.
+    async fn select(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+        let accepted = self.acceptance_for_selection(ctx);
+        if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
+            return Err(refused);
+        }
+        let prep = stage_output(
+            ctx.state.preparation.as_ref(),
+            "WorkerSelectionStage::execute",
+        )?;
+        let inputs = SelectionInputs::gather(
+            self,
+            &ctx.input,
+            prep,
+            ctx.state.multimodal_intermediate.as_ref(),
+            ctx.state.multimodal_refs.as_ref(),
+            ctx.state.media_refs_pipeline,
+        );
+        ctx.state.sticky_key = self
+            .policy_registry
+            .sticky_key(inputs.headers, inputs.rid_key.as_deref())
+            .map(str::to_string);
+        ctx.state.routing_snapshot = Some(inputs.snapshot());
+
+        let (workers, prefill_guard) = self.pick(ctx, accepted, &inputs).await?;
+        if let Some(guard) = prefill_guard {
+            ctx.state.pd_prefill_guard = Some(guard);
+        }
 
         // Reject an unsupported (backend, modality) combination now that the
         // runtime is known, before request building assembles the payload only
         // to fail deep in assembly. The prefill leg builds the request in
         // disaggregated mode, so its runtime is the one that must support the
         // request's modalities.
-        if let Some(intermediate) = intermediate {
+        if let Some(intermediate) = inputs.intermediate {
             if let Err(err) = multimodal::ensure_backend_supports_modalities(
                 selection_runtime(&workers),
                 intermediate,
@@ -524,6 +544,115 @@ impl WorkerSelectionStage {
 
         ctx.state.workers = Some(workers);
         Ok(())
+    }
+
+    /// The mode's pick over the gathered inputs: the single worker that
+    /// meets every demand, or the pair admitted within the queue budget (with
+    /// the encode assignments in EPD mode) and the Prefill admission slot it
+    /// holds.
+    async fn pick(
+        &self,
+        ctx: &RequestContext,
+        accepted: Option<Instant>,
+        inputs: &SelectionInputs<'_>,
+    ) -> Result<(WorkerSelection, Option<PrefillLoadGuard>), Response> {
+        let model_id = inputs.model_id;
+        let media = inputs.media;
+        let context_requirements = inputs.context_requirements;
+        let wire = inputs.wire;
+        let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
+        let placement = inputs.placement(inputs.media_refs.then_some(&accepts_refs));
+        let sticky_key = ctx.state.sticky_key.as_deref();
+        let accepts_media = |worker: &dyn Worker| {
+            media.accepts(worker) && context_requirements.admits(worker, model_id)
+        };
+        let media_filter: Option<CandidateFilter<'_>> = Some(&accepts_media);
+        match self.mode {
+            WorkerSelectionMode::Regular => {
+                match self.select_single_worker(
+                    model_id,
+                    inputs.text,
+                    inputs.tokens(),
+                    inputs.headers,
+                    inputs.rid_key.as_deref(),
+                    inputs.cache_namespace,
+                    wire,
+                    media_filter,
+                ) {
+                    Some(w) => Ok((WorkerSelection::Single { worker: w }, None)),
+                    None => Err(self.context_selection_failure(
+                        model_id,
+                        wire,
+                        media,
+                        context_requirements,
+                    )),
+                }
+            }
+            WorkerSelectionMode::PrefillDecode => {
+                let (pair, guard) = self
+                    .admit_selection_within_budget(
+                        ctx,
+                        accepted,
+                        self.admit_pd_pair(
+                            model_id,
+                            placement,
+                            sticky_key,
+                            None,
+                            media,
+                            inputs.demand,
+                        ),
+                    )
+                    .await?;
+                Ok((disaggregated(pair), Some(guard)))
+            }
+            WorkerSelectionMode::EncodePrefillDecode => {
+                // Encode workers never process references: refuse strict
+                // worker mode here rather than silently bypass the encode fleet.
+                if inputs.media_refs {
+                    let err = multimodal::MmRefsError::EncodeNotSupported;
+                    return Err(error::bad_request(err.code(), err.to_string()));
+                }
+                let encode_item_hashes = match encode_item_hashes(inputs.intermediate) {
+                    Ok(hashes) => hashes,
+                    Err(err) => {
+                        error!(
+                            function = "WorkerSelectionStage::execute",
+                            error = %err,
+                            "Failed to derive encode item routing hashes"
+                        );
+                        return Err(error::internal_error(
+                            "encode_routing_hash_failed",
+                            format!("Failed to derive encode routing hashes: {err}"),
+                        ));
+                    }
+                };
+                let ((encode_assignments, prefill, decode, runtime_type), guard) = self
+                    .admit_selection_within_budget(
+                        ctx,
+                        accepted,
+                        self.admit_encode_prefill_decode_workers(
+                            model_id,
+                            placement,
+                            sticky_key,
+                            &encode_item_hashes,
+                        ),
+                    )
+                    .await?;
+                Ok((
+                    WorkerSelection::Disaggregated {
+                        encode_assignments: if encode_assignments.is_empty() {
+                            None
+                        } else {
+                            Some(encode_assignments)
+                        },
+                        prefill,
+                        decode,
+                        runtime_type,
+                    },
+                    Some(guard),
+                ))
+            }
+        }
     }
 }
 
@@ -1785,43 +1914,13 @@ impl WorkerSelectionStage {
         // legs; the wildcard model maps to the global snapshot. Availability
         // stays a live per-request check.
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
-        let all_encode = Self::available_workers(&snapshot, RoutingPool::GrpcEncode);
-        let all_prefill = Self::available_workers(&snapshot, RoutingPool::GrpcPrefill);
-        let all_decode = Self::available_workers(&snapshot, RoutingPool::GrpcDecode);
-
         let needs_encode = !encode_item_hashes.is_empty();
-        if needs_encode && all_encode.is_empty() {
-            warn!("No available encode workers");
-            return Err(EpdSelectionFailure::Unavailable);
-        }
-        if all_prefill.is_empty() {
-            warn!("No available prefill workers");
-            return Err(EpdSelectionFailure::Unavailable);
-        }
-        if all_decode.is_empty() {
-            warn!("No available decode workers");
-            return Err(EpdSelectionFailure::Unavailable);
-        }
+        let all_encode = epd_leg_candidates(&snapshot, WorkerType::Encode, needs_encode)?;
+        let all_prefill = epd_leg_candidates(&snapshot, WorkerType::Prefill, true)?;
+        let all_decode = epd_leg_candidates(&snapshot, WorkerType::Decode, true)?;
 
-        // Disaggregated legs must share a runtime. Pick a runtime that has at
-        // least one available worker in every required EPD pool instead of
-        // blindly using the first prefill runtime.
-        let Some(target_runtime) = all_prefill
-            .iter()
-            .map(|w| w.metadata().spec.runtime_type)
-            .find(|runtime| {
-                // The current EPD multimodal encoder adapter is TokenSpeed-
-                // specific. Do not select a shared SGLang/vLLM runtime only to
-                // reject it later during request building.
-                (!needs_encode || *runtime == RuntimeType::TokenSpeed)
-                    && all_decode
-                        .iter()
-                        .any(|w| w.metadata().spec.runtime_type == *runtime)
-                    && (!needs_encode
-                        || all_encode
-                            .iter()
-                            .any(|w| w.metadata().spec.runtime_type == *runtime))
-            })
+        let Some(target_runtime) =
+            shared_epd_runtime(&all_encode, &all_prefill, &all_decode, needs_encode)
         else {
             warn!("No available encode/prefill/decode worker set with a shared runtime");
             return Err(EpdSelectionFailure::Unavailable);
@@ -1843,18 +1942,9 @@ impl WorkerSelectionStage {
         }
 
         // Filter all three pools to the target runtime
-        let available_encode: Vec<_> = all_encode
-            .into_iter()
-            .filter(|w| w.metadata().spec.runtime_type == target_runtime)
-            .collect();
-        let mut available_prefill: Vec<_> = all_prefill
-            .into_iter()
-            .filter(|w| w.metadata().spec.runtime_type == target_runtime)
-            .collect();
-        let available_decode: Vec<_> = all_decode
-            .into_iter()
-            .filter(|w| w.metadata().spec.runtime_type == target_runtime)
-            .collect();
+        let available_encode = on_runtime(all_encode, target_runtime);
+        let mut available_prefill = on_runtime(all_prefill, target_runtime);
+        let available_decode = on_runtime(all_decode, target_runtime);
 
         if (needs_encode && available_encode.is_empty())
             || available_prefill.is_empty()
@@ -1949,6 +2039,57 @@ impl WorkerSelectionStage {
             target_runtime,
         ))
     }
+}
+
+/// A leg's available candidates from the EPD membership snapshot. A demanded
+/// leg with none fails the selection as unavailable; the encode leg is
+/// demanded only when the request carries encode items.
+fn epd_leg_candidates(
+    snapshot: &ModelWorkerSnapshot,
+    leg: WorkerType,
+    demanded: bool,
+) -> Result<Vec<Arc<dyn Worker>>, EpdSelectionFailure> {
+    let candidates = WorkerSelectionStage::available_workers(snapshot, leg_pool(leg));
+    if demanded && candidates.is_empty() {
+        warn!("No available {} workers", leg_name(leg));
+        return Err(EpdSelectionFailure::Unavailable);
+    }
+    Ok(candidates)
+}
+
+/// The runtime the EPD legs share: disaggregated legs must share one, so it
+/// is a runtime that has at least one available worker in every required
+/// pool, instead of blindly the first prefill runtime.
+fn shared_epd_runtime(
+    all_encode: &[Arc<dyn Worker>],
+    all_prefill: &[Arc<dyn Worker>],
+    all_decode: &[Arc<dyn Worker>],
+    needs_encode: bool,
+) -> Option<RuntimeType> {
+    all_prefill
+        .iter()
+        .map(|w| w.metadata().spec.runtime_type)
+        .find(|runtime| {
+            // The current EPD multimodal encoder adapter is TokenSpeed-
+            // specific. Do not select a shared SGLang/vLLM runtime only to
+            // reject it later during request building.
+            (!needs_encode || *runtime == RuntimeType::TokenSpeed)
+                && all_decode
+                    .iter()
+                    .any(|w| w.metadata().spec.runtime_type == *runtime)
+                && (!needs_encode
+                    || all_encode
+                        .iter()
+                        .any(|w| w.metadata().spec.runtime_type == *runtime))
+        })
+}
+
+/// The candidates of `runtime` among a leg's.
+fn on_runtime(candidates: Vec<Arc<dyn Worker>>, runtime: RuntimeType) -> Vec<Arc<dyn Worker>> {
+    candidates
+        .into_iter()
+        .filter(|w| w.metadata().spec.runtime_type == runtime)
+        .collect()
 }
 
 fn encode_item_hashes(
