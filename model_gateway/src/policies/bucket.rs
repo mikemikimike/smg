@@ -717,20 +717,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(11)).await;
         {
-            let model_key = "default";
-
-            let bucket = policy
-                .buckets
-                .get(model_key)
-                .map(|entry| entry.value().clone());
-            if let Some(bucket) = bucket {
-                let bucket_guard = bucket.write();
-                {
-                    // Expected Boundary: [0, 33] [34, 67] [68, MAX]
-                    assert_eq!(bucket_guard.boundary[0].range[1], 33);
-                    assert_eq!(bucket_guard.boundary[1].range[1], 67);
-                }
-            }
+            let boundaries = boundaries(&policy, &prefill_workers);
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (33, 67));
         }
         // === Phase S2: Validate load balancing ===
         // Three consecutive len=33 requests (Should route to different buckets)
@@ -903,20 +891,8 @@ mod tests {
 
         // Initial boundary
         {
-            let model_key = "default";
-
-            let bucket = policy
-                .buckets
-                .get(model_key)
-                .map(|entry| entry.value().clone());
-            if let Some(bucket) = bucket {
-                let bucket_guard = bucket.write();
-                {
-                    // Expected Boundary: [0, 33] [34, 67] [68, MAX]
-                    assert_eq!(bucket_guard.boundary[0].range[1], 1364);
-                    assert_eq!(bucket_guard.boundary[1].range[1], 2729);
-                }
-            }
+            let boundaries = boundaries(&policy, &prefill_workers);
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (1364, 2729));
         }
 
         // ===Phase S1: Initial requests to trigger boundary adjustment ===
@@ -979,20 +955,8 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(4)).await;
         // Verify boundaries adjusted to: [0, 20], [21, 26], [27, MAX]
         {
-            let model_key = "default";
-
-            let bucket = policy
-                .buckets
-                .get(model_key)
-                .map(|entry| entry.value().clone());
-            if let Some(bucket) = bucket {
-                let bucket_guard = bucket.write();
-                {
-                    // Expected Boundary: [0, 33] [34, 67] [68, MAX]
-                    assert_eq!(bucket_guard.boundary[0].range[1], 20);
-                    assert_eq!(bucket_guard.boundary[1].range[1], 26);
-                }
-            }
+            let boundaries = boundaries(&policy, &prefill_workers);
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 26));
         }
 
         // ===Phase S2: Second set of  requests to trigger boundary adjustment ===
@@ -1055,20 +1019,8 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(4)).await;
         // Verify boundaries adjusted to: [0, 40], [41, 57], [58, MAX]
         {
-            let model_key = "default";
-
-            let bucket = policy
-                .buckets
-                .get(model_key)
-                .map(|entry| entry.value().clone());
-            if let Some(bucket) = bucket {
-                let bucket_guard = bucket.write();
-                {
-                    // Expected Boundary: [0, 33] [34, 67] [68, MAX]
-                    assert_eq!(bucket_guard.boundary[0].range[1], 40);
-                    assert_eq!(bucket_guard.boundary[1].range[1], 57);
-                }
-            }
+            let boundaries = boundaries(&policy, &prefill_workers);
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (40, 57));
         }
     }
 
@@ -1109,20 +1061,8 @@ mod tests {
 
         // Initial boundary
         {
-            let model_key = "default";
-
-            let bucket = policy
-                .buckets
-                .get(model_key)
-                .map(|entry| entry.value().clone());
-            if let Some(bucket) = bucket {
-                let bucket_guard = bucket.write();
-                {
-                    // Expected Boundary: [0, 33] [34, 67] [68, MAX]
-                    assert_eq!(bucket_guard.boundary[0].range[1], 1364);
-                    assert_eq!(bucket_guard.boundary[1].range[1], 2729);
-                }
-            }
+            let boundaries = boundaries(&policy, &prefill_workers);
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (1364, 2729));
         }
 
         // Send requests with char_count 20
@@ -1138,20 +1078,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
-            let model_key = "default";
-
-            let bucket = policy
-                .buckets
-                .get(model_key)
-                .map(|entry| entry.value().clone());
-            if let Some(bucket) = bucket {
-                let bucket_guard = bucket.write();
-                {
-                    // Expected Boundary: [0, 33] [34, 67] [68, MAX]
-                    assert_eq!(bucket_guard.boundary[0].range[1], 20);
-                    assert_eq!(bucket_guard.boundary[1].range[1], 27);
-                }
-            }
+            let boundaries = boundaries(&policy, &prefill_workers);
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 27));
         }
 
         policy
@@ -1166,20 +1094,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
-            let model_key = "default";
-
-            let bucket = policy
-                .buckets
-                .get(model_key)
-                .map(|entry| entry.value().clone());
-            if let Some(bucket) = bucket {
-                let bucket_guard = bucket.write();
-                {
-                    // Expected Boundary: [0, 33] [34, 67] [68, MAX]
-                    assert_eq!(bucket_guard.boundary[0].range[1], 7);
-                    assert_eq!(bucket_guard.boundary[1].range[1], 10);
-                }
-            }
+            let boundaries = boundaries(&policy, &prefill_workers);
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (7, 10));
         }
     }
 
@@ -1220,20 +1136,8 @@ mod tests {
 
         // Initial boundary
         {
-            let model_key = "default";
-
-            let bucket = policy
-                .buckets
-                .get(model_key)
-                .map(|entry| entry.value().clone());
-            if let Some(bucket) = bucket {
-                let bucket_guard = bucket.write();
-                {
-                    // Expected Boundary: [0, 33] [34, 67] [68, MAX]
-                    assert_eq!(bucket_guard.boundary[0].range[1], 1364);
-                    assert_eq!(bucket_guard.boundary[1].range[1], 2729);
-                }
-            }
+            let boundaries = boundaries(&policy, &prefill_workers);
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (1364, 2729));
         }
 
         policy
@@ -1293,20 +1197,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
-            let model_key = "default";
-
-            let bucket = policy
-                .buckets
-                .get(model_key)
-                .map(|entry| entry.value().clone());
-            if let Some(bucket) = bucket {
-                let bucket_guard = bucket.write();
-                {
-                    // Expected Boundary: [0, 33] [34, 67] [68, MAX]
-                    assert_eq!(bucket_guard.boundary[0].range[1], 20);
-                    assert_eq!(bucket_guard.boundary[1].range[1], 26);
-                }
-            }
+            let boundaries = boundaries(&policy, &prefill_workers);
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 26));
         }
 
         policy
@@ -1366,20 +1258,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(4)).await;
         {
-            let model_key = "default";
-
-            let bucket = policy
-                .buckets
-                .get(model_key)
-                .map(|entry| entry.value().clone());
-            if let Some(bucket) = bucket {
-                let bucket_guard = bucket.write();
-                {
-                    // Expected Boundary: [0, 33] [34, 67] [68, MAX]
-                    assert_eq!(bucket_guard.boundary[0].range[1], 20);
-                    assert_eq!(bucket_guard.boundary[1].range[1], 26);
-                }
-            }
+            let boundaries = boundaries(&policy, &prefill_workers);
+            assert_eq!((boundaries[0].1[1], boundaries[1].1[1]), (20, 26));
         }
     }
 
