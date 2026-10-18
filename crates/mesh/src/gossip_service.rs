@@ -224,12 +224,13 @@ impl GossipService {
         let mut state = self.state.write();
         let mut updated = false;
         for node in incoming_nodes {
-            let is_down_for_self =
-                node.name == self.self_name && node.status == NodeStatus::Down as i32;
+            let is_failure_for_self = node.name == self.self_name
+                && (node.status == NodeStatus::Down as i32
+                    || node.status == NodeStatus::Suspected as i32);
             match state.entry(node.name.clone()) {
                 Entry::Occupied(mut entry) => {
                     let current = entry.get_mut();
-                    if is_down_for_self {
+                    if is_failure_for_self {
                         // A node's local process state is authoritative for itself.
                         if current.status != NodeStatus::Leaving as i32
                             && current.status != NodeStatus::Alive as i32
@@ -255,7 +256,7 @@ impl GossipService {
                 }
                 Entry::Vacant(entry) => {
                     updated = true;
-                    if is_down_for_self {
+                    if is_failure_for_self {
                         entry.insert(NodeState {
                             name: self.self_name.clone(),
                             address: self.advertise_addr.to_string(),
@@ -614,6 +615,35 @@ mod tests {
         let node = local.get("node-a").unwrap();
         assert_eq!(node.status, NodeStatus::Alive as i32);
         assert_eq!(node.version, u64::MAX);
+    }
+
+    #[test]
+    fn merge_state_refutes_suspected_for_self_and_advances_version() {
+        let local_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let state = Arc::new(RwLock::new(BTreeMap::from([(
+            "node-a".to_string(),
+            NodeState {
+                name: "node-a".to_string(),
+                address: local_addr.to_string(),
+                status: NodeStatus::Alive as i32,
+                version: 2,
+                metadata: Default::default(),
+            },
+        )])));
+        let service = GossipService::new(state.clone(), local_addr, local_addr, "node-a");
+
+        assert!(service.merge_state(vec![NodeState {
+            name: "node-a".to_string(),
+            address: local_addr.to_string(),
+            status: NodeStatus::Suspected as i32,
+            version: 5,
+            metadata: Default::default(),
+        }]));
+
+        let local = state.read();
+        let node = local.get("node-a").unwrap();
+        assert_eq!(node.status, NodeStatus::Alive as i32);
+        assert_eq!(node.version, 6);
     }
 
     #[test]
