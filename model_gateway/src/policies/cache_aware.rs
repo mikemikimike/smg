@@ -70,6 +70,7 @@
 */
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -497,6 +498,84 @@ impl CacheAwarePolicy {
         self.populate_hash_index.load(Ordering::Relaxed)
     }
 
+    // ---- The four readings of a request's cache namespace ----
+    //
+    // A request in a cache namespace is keyed under the namespace's marker
+    // and an unpartitioned request under its plain key with any marker
+    // material stripped, so the two key spaces are disjoint by construction
+    // (see cache_namespace.rs). The approximate trees read the rule through
+    // `keyed_tokens` / `keyed_text`, hash mode through `placement_tokens`,
+    // the event-driven index through `event_content_hashes`.
+
+    /// The token tree's key for `tokens` and the length of the marker at its
+    /// head. A partitioned request keys under its namespace marker: another
+    /// namespace diverges at position 0 and can never match, and the marker
+    /// never counts toward the match ratio, so a match count read from the
+    /// tree has the marker length subtracted. The marker fills whole pages,
+    /// so the prompt's page grid is the unpartitioned one. An unpartitioned
+    /// request keys under its tokens stripped of marker material, marker
+    /// length 0.
+    #[inline]
+    fn keyed_tokens<'a>(
+        &self,
+        info: &SelectWorkerInfo,
+        tokens: &'a [u32],
+    ) -> (Cow<'a, [u32]>, usize) {
+        let page_size = self.config.block_size.max(1);
+        match info.cache_namespace {
+            Some(namespace) => (
+                Cow::Owned(namespace.prefixed_tokens(tokens, page_size)),
+                CacheNamespace::token_marker_len(page_size),
+            ),
+            None => (
+                Cow::Borrowed(CacheNamespace::unpartitioned_tokens(tokens)),
+                0,
+            ),
+        }
+    }
+
+    /// The string tree's key for `text` and the length of the marker at its
+    /// head: the rule of [`Self::keyed_tokens`], in chars.
+    #[inline]
+    fn keyed_text<'a>(info: &SelectWorkerInfo, text: &'a str) -> (Cow<'a, str>, usize) {
+        match info.cache_namespace {
+            Some(namespace) => (Cow::Owned(namespace.prefixed_text(text)), TEXT_MARKER_LEN),
+            None => (Cow::Borrowed(CacheNamespace::unpartitioned_text(text)), 0),
+        }
+    }
+
+    /// Hash mode's key material: a namespaced request's tokens as sent (its
+    /// head is hashed under the namespace, see `hash_token_head`); an
+    /// unpartitioned head stripped of marker material like the tree keys, so
+    /// the placement key spaces stay disjoint by construction too. `None`
+    /// for an untokenized request.
+    #[inline]
+    fn placement_tokens<'a>(info: &SelectWorkerInfo<'a>) -> Option<&'a [u32]> {
+        match info.cache_namespace {
+            Some(_) => info.tokens,
+            None => info.tokens.map(CacheNamespace::unpartitioned_tokens),
+        }
+    }
+
+    /// The event-driven index's block hashes for `tokens`. The engines fold
+    /// the LoRA name and cache salt into their block hashes and the monitor
+    /// recomputes stored blocks under the same seed, so a request in a
+    /// namespace is hashed under it and matches only its own blocks; a plain
+    /// request keeps the plain hash.
+    #[inline]
+    fn event_content_hashes(
+        info: &SelectWorkerInfo,
+        tokens: &[u32],
+        block_size: usize,
+    ) -> Vec<ContentHash> {
+        match info.cache_namespace {
+            Some(namespace) => {
+                request_content_hashes_with_seed(tokens, block_size, namespace.event_seed())
+            }
+            None => compute_request_content_hashes(tokens, block_size),
+        }
+    }
+
     /// Test-only view of the effective config so registry tests can
     /// assert operator tunables propagated.
     #[cfg(test)]
@@ -891,14 +970,8 @@ impl CacheAwarePolicy {
         // never seeds affinity for other partitions. Prefer the token tree for
         // gRPC requests, fall back to the string tree for HTTP.
         if let Some(tokens) = info.tokens {
-            let prefixed;
-            let tokens: &[u32] = match info.cache_namespace {
-                Some(namespace) => {
-                    prefixed = namespace.prefixed_tokens(tokens, self.config.block_size.max(1));
-                    &prefixed
-                }
-                None => CacheNamespace::unpartitioned_tokens(tokens),
-            };
+            let (keyed, _marker_len) = self.keyed_tokens(info, tokens);
+            let tokens: &[u32] = &keyed;
             // gRPC request: update token tree
             let tree = self
                 .token_trees
@@ -926,14 +999,8 @@ impl CacheAwarePolicy {
                 }
             }
         } else if let Some(text) = info.request_text {
-            let prefixed;
-            let text: &str = match info.cache_namespace {
-                Some(namespace) => {
-                    prefixed = namespace.prefixed_text(text);
-                    &prefixed
-                }
-                None => CacheNamespace::unpartitioned_text(text),
-            };
+            let (keyed, _marker_len) = Self::keyed_text(info, text);
+            let text: &str = &keyed;
             // HTTP request: update string tree
             let tree = self
                 .string_trees
@@ -2353,16 +2420,7 @@ impl CacheAwarePolicy {
             waiting_prefill_tokens: waiting_prefill_tokens.as_deref(),
         };
 
-        // The engines fold the LoRA name and cache salt into their block
-        // hashes and the monitor recomputes stored blocks under the same
-        // seed, so a request in a namespace is hashed under it and matches
-        // only its own blocks; a plain request keeps the plain hash.
-        let content_hashes = match info.cache_namespace {
-            Some(namespace) => {
-                request_content_hashes_with_seed(tokens, block_size, namespace.event_seed())
-            }
-            None => compute_request_content_hashes(tokens, block_size),
-        };
+        let content_hashes = Self::event_content_hashes(info, tokens, block_size);
         let table = self.pool_table(workers, indexer, liveness::now_ms());
         // Over a sampled pool the candidates read are bounded as the pool
         // is: a tie among the deepest holders is drawn from, and an
@@ -2866,12 +2924,7 @@ impl CacheAwarePolicy {
         let now = Instant::now();
 
         // Hash mode keys on token ids; untokenized requests stay load-balanced.
-        // Unpartitioned heads are stripped of marker material like the tree
-        // keys, so the placement key spaces stay disjoint by construction too.
-        let tokens = match info.cache_namespace {
-            Some(_) => info.tokens,
-            None => info.tokens.map(CacheNamespace::unpartitioned_tokens),
-        };
+        let tokens = Self::placement_tokens(info);
         let Some(tokens) = tokens.filter(|t| !t.is_empty()) else {
             return self.hash_expected_wait(
                 workers,
@@ -3120,19 +3173,10 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         let tree = tree_for_model(&self.token_trees, model_id, || self.new_token_tree());
 
-        // A partitioned request keys under its namespace marker: another
-        // namespace diverges at position 0 and can never match, and the
-        // marker never counts toward the match ratio. The marker fills whole
-        // pages, so the prompt's page grid is the unpartitioned one.
-        let page_size = self.config.block_size.max(1);
-        let prefixed;
-        let (keyed, marker_len): (&[u32], usize) = match info.cache_namespace {
-            Some(namespace) => {
-                prefixed = namespace.prefixed_tokens(tokens, page_size);
-                (&prefixed, CacheNamespace::token_marker_len(page_size))
-            }
-            None => (CacheNamespace::unpartitioned_tokens(tokens), 0),
-        };
+        // The namespaced key (see `keyed_tokens`); a match count read from
+        // the tree has `marker_len` subtracted.
+        let (keyed, marker_len) = self.keyed_tokens(info, tokens);
+        let keyed: &[u32] = &keyed;
 
         // One fused descent: match first, atomically choose+credit the final
         // worker from the affinity/spill candidate set, then insert only that
@@ -3206,14 +3250,8 @@ impl CacheAwarePolicy {
         let tree = tree_for_model(&self.string_trees, model_id, Tree::new);
 
         // Same partition rule as the token tree, in chars.
-        let prefixed;
-        let (keyed, marker_len): (&str, usize) = match info.cache_namespace {
-            Some(namespace) => {
-                prefixed = namespace.prefixed_text(text);
-                (&prefixed, TEXT_MARKER_LEN)
-            }
-            None => (CacheNamespace::unpartitioned_text(text), 0),
-        };
+        let (keyed, marker_len) = Self::keyed_text(info, text);
+        let keyed: &str = &keyed;
 
         let mut selected_idx: Option<usize> = None;
         let result = tree.match_and_insert_with(keyed, |result| {
@@ -7305,6 +7343,73 @@ mod tests {
             hash_token_head(Some(tenant_a), &head),
             hash_token_head(Some(tenant_b), &head)
         );
+    }
+
+    /// The trees' keying rule is written once: a namespaced and an
+    /// unpartitioned request of one prompt get the keys the trees expect,
+    /// and the marker length that comes with a namespaced key is exactly
+    /// what a match count read from the tree subtracts.
+    #[test]
+    fn a_request_is_keyed_once_for_both_trees_and_the_marker_length_is_what_a_match_subtracts() {
+        let block_size = 16;
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            block_size,
+            ..Default::default()
+        });
+        let tenant_a = salted("tenant-a").unwrap();
+        // Two whole pages, so the tree matches the key in full.
+        let prompt: Vec<u32> = (100..132).collect();
+        let text = "shared system prompt";
+        let namespaced = SelectWorkerInfo {
+            tokens: Some(&prompt),
+            request_text: Some(text),
+            cache_namespace: Some(tenant_a),
+            ..Default::default()
+        };
+        let plain = SelectWorkerInfo {
+            tokens: Some(&prompt),
+            request_text: Some(text),
+            ..Default::default()
+        };
+
+        let (keyed, marker_len) = policy.keyed_tokens(&namespaced, &prompt);
+        assert_eq!(marker_len, CacheNamespace::token_marker_len(block_size));
+        assert_eq!(
+            &keyed[..],
+            &tenant_a.prefixed_tokens(&prompt, block_size)[..]
+        );
+        assert_eq!(&keyed[marker_len..], &prompt[..]);
+        let (plain_key, plain_len) = policy.keyed_tokens(&plain, &prompt);
+        assert_eq!((&plain_key[..], plain_len), (&prompt[..], 0));
+
+        // What the token tree reads back for the namespaced key is the
+        // prompt plus the marker: the match count minus the marker length
+        // is the prompt's own match, and the plain key sees none of it.
+        let tree = policy.new_token_tree();
+        tree.insert_tokens(&keyed, "http://w1:8000");
+        let hit = tree.match_and_insert(&keyed, "http://w1:8000");
+        assert_eq!(hit.matched_token_count - marker_len, prompt.len());
+        assert_eq!(hit.input_token_count - marker_len, prompt.len());
+        let miss = tree.match_and_insert(&plain_key, "http://w2:8000");
+        assert_eq!(miss.matched_token_count, 0);
+
+        let (keyed_text, text_marker_len) = CacheAwarePolicy::keyed_text(&namespaced, text);
+        assert_eq!(text_marker_len, TEXT_MARKER_LEN);
+        assert_eq!(&*keyed_text, tenant_a.prefixed_text(text));
+        assert_eq!(&keyed_text[text_marker_len..], text);
+        let (plain_text, plain_text_len) = CacheAwarePolicy::keyed_text(&plain, text);
+        assert_eq!((&*plain_text, plain_text_len), (text, 0));
+
+        let string_tree = Tree::new();
+        string_tree.insert_text(&keyed_text, "http://w1:8000");
+        let hit = string_tree.match_and_insert(&keyed_text, "http://w1:8000");
+        assert_eq!(
+            hit.matched_char_count - text_marker_len,
+            text.chars().count()
+        );
+        let miss = string_tree.match_and_insert(&plain_text, "http://w2:8000");
+        assert_eq!(miss.matched_char_count, 0);
     }
 
     #[test]
