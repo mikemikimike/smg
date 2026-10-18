@@ -18,6 +18,8 @@ mod activity;
 mod fingerprint;
 mod l0;
 mod l1;
+#[cfg(test)]
+mod test_encoders;
 
 use std::sync::Arc;
 
@@ -539,12 +541,14 @@ impl Tokenizer for CachedTokenizer {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::test_encoders::{SplittingEncoder, Tail};
     use crate::{mock::MockTokenizer, *};
 
     /// Tokenizer that prepends a sentinel BOS when `add_special_tokens` is set,
     /// so duplicated specials across a prefix/suffix merge are observable.
     struct BosTokenizer {
         special_tokens: SpecialTokens,
+        splitting: SplittingEncoder,
     }
 
     const BOS_ID: TokenIdType = 99;
@@ -560,6 +564,7 @@ mod tests {
                     ],
                     ..Default::default()
                 },
+                splitting: atomic().with_bos(BOS_ID),
             }
         }
     }
@@ -569,18 +574,8 @@ mod tests {
     /// does it; one id per byte otherwise.
     const TEST_SPECIALS: [&str; 3] = ["<bos>", "<|im_start|>", "<|im_end|>"];
 
-    fn atomic_ids(input: &str, ids: &mut Vec<TokenIdType>) {
-        let matcher = aho_corasick::AhoCorasickBuilder::new()
-            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-            .build(TEST_SPECIALS)
-            .unwrap();
-        let mut last = 0;
-        for found in matcher.find_iter(input) {
-            ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
-            ids.push(200 + found.pattern().as_u32());
-            last = found.end();
-        }
-        ids.extend(input[last..].bytes().map(TokenIdType::from));
+    fn atomic() -> SplittingEncoder {
+        SplittingEncoder::new(TEST_SPECIALS, 200)
     }
 
     /// The bytes of the special tokens an L1 encode re-reads: each boundary's
@@ -599,19 +594,11 @@ mod tests {
 
     impl Encoder for BosTokenizer {
         fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-            let mut ids: Vec<TokenIdType> = Vec::new();
-            if add_special_tokens {
-                ids.push(BOS_ID);
-            }
-            atomic_ids(input, &mut ids);
-            Ok(Encoding::Plain(ids))
+            self.splitting.encode(input, add_special_tokens)
         }
 
         fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
+            self.splitting.encode_batch(inputs, add_special_tokens)
         }
     }
 
@@ -885,7 +872,7 @@ mod tests {
     /// per byte otherwise. Its short special token is a prefix of its long one.
     struct NestedSpecialsTokenizer {
         special_tokens: SpecialTokens,
-        matcher: aho_corasick::AhoCorasick,
+        splitting: SplittingEncoder,
     }
 
     const SHORT_SPECIAL: &str = "<|a|>";
@@ -899,32 +886,18 @@ mod tests {
                     additional_special_tokens: specials.iter().map(|s| s.to_string()).collect(),
                     ..Default::default()
                 },
-                matcher: aho_corasick::AhoCorasickBuilder::new()
-                    .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                    .build(specials)
-                    .unwrap(),
+                splitting: SplittingEncoder::new(specials, 1000),
             }
         }
     }
 
     impl Encoder for NestedSpecialsTokenizer {
-        fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
-            let mut ids = Vec::new();
-            let mut last = 0;
-            for found in self.matcher.find_iter(input) {
-                ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
-                ids.push(1000 + found.pattern().as_u32());
-                last = found.end();
-            }
-            ids.extend(input[last..].bytes().map(TokenIdType::from));
-            Ok(Encoding::Plain(ids))
+        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+            self.splitting.encode(input, add_special_tokens)
         }
 
         fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
+            self.splitting.encode_batch(inputs, add_special_tokens)
         }
     }
 
@@ -1063,27 +1036,20 @@ mod tests {
         assert_eq!((stats.misses, stats.hits), (1, 1), "{stats:?}");
     }
 
-    /// What [`FramesText`] puts after the text when `add_special_tokens` is set.
-    #[derive(Clone, Copy)]
-    enum Tail {
-        /// An EOS: a frame the cache can apply around a result.
-        Eos,
-        /// The input's length as an id: no frame.
-        TextLength,
-    }
-
     /// Tokenizer whose post-processor frames a text when `add_special_tokens`
     /// is set: a BOS in front, `tail` after it; the chat specials atomic.
     struct FramesText {
         special_tokens: SpecialTokens,
-        matcher: aho_corasick::AhoCorasick,
-        tail: Tail,
+        splitting: SplittingEncoder,
     }
 
     const FRAME_BOS: TokenIdType = 1;
     const FRAME_EOS: TokenIdType = 2;
 
     impl FramesText {
+        /// `tail` after the text when `add_special_tokens` is set: the EOS
+        /// (a frame the cache can apply around a result) or the input's
+        /// length as an id (no frame).
         fn new(tail: Tail) -> Self {
             let specials = ["<|im_start|>", "<|im_end|>"];
             Self {
@@ -1091,44 +1057,20 @@ mod tests {
                     additional_special_tokens: specials.iter().map(|s| s.to_string()).collect(),
                     ..Default::default()
                 },
-                matcher: aho_corasick::AhoCorasickBuilder::new()
-                    .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                    .build(specials)
-                    .unwrap(),
-                tail,
+                splitting: SplittingEncoder::new(specials, 1000)
+                    .with_bos(FRAME_BOS)
+                    .with_tail(tail),
             }
         }
     }
 
     impl Encoder for FramesText {
         fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-            let mut ids = Vec::new();
-            if add_special_tokens {
-                ids.push(FRAME_BOS);
-            }
-            let mut last = 0;
-            for found in self.matcher.find_iter(input) {
-                ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
-                ids.push(1000 + found.pattern().as_u32());
-                last = found.end();
-            }
-            ids.extend(input[last..].bytes().map(TokenIdType::from));
-            if add_special_tokens {
-                ids.push(match self.tail {
-                    Tail::Eos => FRAME_EOS,
-                    Tail::TextLength => {
-                        TokenIdType::try_from(input.len()).unwrap_or(TokenIdType::MAX)
-                    }
-                });
-            }
-            Ok(Encoding::Plain(ids))
+            self.splitting.encode(input, add_special_tokens)
         }
 
         fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
+            self.splitting.encode_batch(inputs, add_special_tokens)
         }
     }
 
@@ -1166,8 +1108,8 @@ mod tests {
             enable_l1: true,
             ..Default::default()
         };
-        let plain = FramesText::new(Tail::Eos);
-        let cached = CachedTokenizer::new(Arc::new(FramesText::new(Tail::Eos)), config);
+        let plain = FramesText::new(Tail::Id(FRAME_EOS));
+        let cached = CachedTokenizer::new(Arc::new(FramesText::new(Tail::Id(FRAME_EOS))), config);
         let next_turn = format!("{FRAMED_TEXT}<|im_start|>assistant\nHello");
         // Per flag: a miss, a hit, a hit with a suffix (the deepest boundary
         // cached too), the hit there.
@@ -1229,7 +1171,7 @@ mod tests {
     /// longer, non-special added token `</think>`, all extracted whole.
     struct ThinkTokenizer {
         special_tokens: SpecialTokens,
-        matcher: aho_corasick::AhoCorasick,
+        splitting: SplittingEncoder,
     }
 
     impl ThinkTokenizer {
@@ -1239,32 +1181,18 @@ mod tests {
                     additional_special_tokens: vec!["/think".to_owned(), "<|im_end|>".to_owned()],
                     ..Default::default()
                 },
-                matcher: aho_corasick::AhoCorasickBuilder::new()
-                    .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                    .build(["/think", "<|im_end|>", "</think>"])
-                    .unwrap(),
+                splitting: SplittingEncoder::new(["/think", "<|im_end|>", "</think>"], 1000),
             }
         }
     }
 
     impl Encoder for ThinkTokenizer {
-        fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
-            let mut ids = Vec::new();
-            let mut last = 0;
-            for found in self.matcher.find_iter(input) {
-                ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
-                ids.push(1000 + found.pattern().as_u32());
-                last = found.end();
-            }
-            ids.extend(input[last..].bytes().map(TokenIdType::from));
-            Ok(Encoding::Plain(ids))
+        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
+            self.splitting.encode(input, add_special_tokens)
         }
 
         fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
+            self.splitting.encode_batch(inputs, add_special_tokens)
         }
     }
 
@@ -1354,8 +1282,7 @@ mod tests {
 
     impl Encoder for PrependsToFirstPiece {
         fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
-            let mut ids: Vec<TokenIdType> = Vec::new();
-            atomic_ids(input, &mut ids);
+            let mut ids = atomic().ids(input, false);
             if ids.first().is_some_and(|&id| id < 200) {
                 ids.insert(0, MARKER_ID);
             }

@@ -842,7 +842,10 @@ pub struct L1CacheStats {
 
 #[cfg(test)]
 mod tests {
-    use super::{SpecialTokenBoundaries, SpecialTokenFrame};
+    use super::{
+        super::test_encoders::{SplittingEncoder, Tail},
+        SpecialTokenBoundaries, SpecialTokenFrame,
+    };
     use crate::*;
 
     /// Oversized prefixes must be rejected without displacing useful entries.
@@ -872,11 +875,11 @@ mod tests {
         for flag in [false, true] {
             let cache = L1Cache::new(4096);
             let encoded = cache
-                .populate_and_encode(&input, &BosTokenizer, &SPECIALS, flag)
+                .populate_and_encode(&input, &bos_tokenizer(), &SPECIALS, flag)
                 .unwrap();
             assert_eq!(
                 encoded.token_ids(),
-                BosTokenizer.encode(&input, flag).unwrap().token_ids()
+                bos_tokenizer().encode(&input, flag).unwrap().token_ids()
             );
             assert!(cache.stats().memory_bytes <= 4096);
         }
@@ -956,37 +959,11 @@ mod tests {
     /// Encoder with the atomic [`SPECIALS`] (ids 1000 and up) and one id per
     /// byte otherwise; a sentinel BOS when `add_special_tokens` is set, so the
     /// same text yields different tokens per flag.
-    struct BosTokenizer;
+    fn bos_tokenizer() -> SplittingEncoder {
+        SplittingEncoder::new(SPECIALS, 1000).with_bos(BOS_ID)
+    }
 
     const BOS_ID: TokenIdType = 99;
-
-    impl Encoder for BosTokenizer {
-        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-            let matcher = aho_corasick::AhoCorasickBuilder::new()
-                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                .build(SPECIALS)
-                .unwrap();
-            let mut ids: Vec<TokenIdType> = Vec::new();
-            if add_special_tokens {
-                ids.push(BOS_ID);
-            }
-            let mut last = 0;
-            for found in matcher.find_iter(input) {
-                ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
-                ids.push(1000 + found.pattern().as_u32());
-                last = found.end();
-            }
-            ids.extend(input[last..].bytes().map(TokenIdType::from));
-            Ok(Encoding::Plain(ids))
-        }
-
-        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
-        }
-    }
 
     /// The byte offsets of a matcher's boundaries.
     fn ends(boundaries: Vec<(usize, usize)>) -> Vec<usize> {
@@ -997,7 +974,7 @@ mod tests {
     fn test_basic_prefix_match() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // Realistic ChatML template with special tokens
         let input1 = "<|im_start|>system\nYou are a helpful assistant that provides clear and detailed responses.<|im_end|><|im_start|>user\nHello there! How are you doing today?<|im_end|>";
@@ -1025,7 +1002,7 @@ mod tests {
     fn test_short_input_with_boundaries() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // Short input with special tokens
         let input = "<|im_start|>user\nHi<|im_end|>";
@@ -1046,7 +1023,7 @@ mod tests {
     fn test_longest_match() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // Create multi-turn conversation with multiple special token boundaries (~400 bytes)
         let input = "<|im_start|>system\nYou are a helpful AI assistant that provides detailed and accurate responses.<|im_end|><|im_start|>user\nHello there! How are you today? Can you help me understand how tokenization works in language models?<|im_end|><|im_start|>assistant\nI'm doing well, thank you! I'd be happy to explain tokenization. Tokenization is the process of breaking text into smaller units called tokens.<|im_end|>";
@@ -1073,7 +1050,7 @@ mod tests {
     fn test_stats() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // ChatML input with special tokens
         let input = "<|im_start|>system\nYou are a helpful assistant that provides detailed answers.<|im_end|><|im_start|>user\nHello there! How are you today?<|im_end|>";
@@ -1095,7 +1072,7 @@ mod tests {
     fn test_clear() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // ChatML input with special tokens
         let input = "<|im_start|>system\nYou are a helpful assistant that provides clear and detailed responses.<|im_end|><|im_start|>user\nHello there!<|im_end|>";
@@ -1118,7 +1095,7 @@ mod tests {
         // Create a small cache (5KB) to trigger eviction
         let cache = L1Cache::new(5 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>", "<|eot_id|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         // Insert first conversation
         let input1 = "<|im_start|>system\nYou are a helpful assistant specialized in mathematics.<|im_end|><|im_start|>user\nCan you explain calculus to me?<|im_end|><|im_start|>assistant\nCertainly! Calculus is a branch of mathematics that studies continuous change.<|im_end|><|eot_id|>";
@@ -1172,7 +1149,7 @@ mod tests {
             let cache_clone = cache.clone();
             let st_clone = special_tokens_arc.clone();
             handles.push(thread::spawn(move || {
-                let tokenizer = BosTokenizer;
+                let tokenizer = bos_tokenizer();
                 let special_tokens: Vec<&str> = st_clone.iter().map(|s| s.as_str()).collect();
 
                 // Each thread uses a unique user message to avoid hash collisions
@@ -1237,7 +1214,7 @@ mod tests {
     fn test_add_special_tokens_separates_keys() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
         let input = "<|im_start|>system\nhi<|im_end|><|im_start|>user\nq<|im_end|>";
 
         // Insert the same input under both flags.
@@ -1266,7 +1243,7 @@ mod tests {
     fn test_opposite_flag_does_not_collide() {
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
         let input = "<|im_start|>system\nhi<|im_end|><|im_start|>user\nq<|im_end|>";
 
         // Only the `true` flag is populated.
@@ -1424,34 +1401,11 @@ mod tests {
 
     /// Encoder with the special `/think` and the longer, non-special added
     /// token `</think>` that contains it, both atomic.
-    struct ThinkTokens;
-
-    impl Encoder for ThinkTokens {
-        fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
-            let matcher = aho_corasick::AhoCorasickBuilder::new()
-                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                .build(["/think", "</think>", "<|im_end|>"])
-                .unwrap();
-            let mut ids: Vec<TokenIdType> = Vec::new();
-            let mut last = 0;
-            for found in matcher.find_iter(input) {
-                ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
-                ids.push(1000 + found.pattern().as_u32());
-                last = found.end();
-            }
-            ids.extend(input[last..].bytes().map(TokenIdType::from));
-            Ok(Encoding::Plain(ids))
-        }
-
-        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
-        }
+    fn think_tokens() -> SplittingEncoder {
+        SplittingEncoder::new(["/think", "</think>", "<|im_end|>"], 1000)
     }
 
-    /// Encoder like [`ThinkTokens`], but `</think>` is a special token the
+    /// Encoder like [`think_tokens`]'s, but `</think>` is a special token the
     /// encoder extracts only at the end of its input (so the self-check
     /// drops it), while `/think` is extracted anywhere.
     struct ThinkTokensEndOnly;
@@ -1507,7 +1461,7 @@ mod tests {
         let matcher = SpecialTokenBoundaries::for_encoder(
             &["/think", "<|im_end|>"],
             &["b /t", "zz"],
-            &ThinkTokens,
+            &think_tokens(),
         );
         // Declared as an added token, `b /t` begins before the `/think` after
         // `b ` and wins the leftmost match: that `/think` is text. `zz` can
@@ -1524,31 +1478,8 @@ mod tests {
 
     /// Encoder with the atomic special tokens `STOP` and `QQ` and the atomic
     /// added tokens `kSTO`, `mQQk`, `nm` and `Pp`, extracted leftmost-longest.
-    struct ChainedTokens;
-
-    impl Encoder for ChainedTokens {
-        fn encode(&self, input: &str, _add_special_tokens: bool) -> Result<Encoding> {
-            let matcher = aho_corasick::AhoCorasickBuilder::new()
-                .match_kind(aho_corasick::MatchKind::LeftmostLongest)
-                .build(["STOP", "QQ", "kSTO", "mQQk", "nm", "Pp"])
-                .unwrap();
-            let mut ids: Vec<TokenIdType> = Vec::new();
-            let mut last = 0;
-            for found in matcher.find_iter(input) {
-                ids.extend(input[last..found.start()].bytes().map(TokenIdType::from));
-                ids.push(1000 + found.pattern().as_u32());
-                last = found.end();
-            }
-            ids.extend(input[last..].bytes().map(TokenIdType::from));
-            Ok(Encoding::Plain(ids))
-        }
-
-        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
-        }
+    fn chained_tokens() -> SplittingEncoder {
+        SplittingEncoder::new(["STOP", "QQ", "kSTO", "mQQk", "nm", "Pp"], 1000)
     }
 
     #[test]
@@ -1556,7 +1487,7 @@ mod tests {
         let matcher = SpecialTokenBoundaries::for_encoder(
             &["STOP", "QQ"],
             &["kSTO", "mQQk", "nm", "Pp"],
-            &ChainedTokens,
+            &chained_tokens(),
         );
         // `kSTO` and `mQQk` can take a special token's place; `nm` can take
         // `mQQk`'s. On `nmQQkSTOPping` the tokenizer extracts `nm`, `QQ`,
@@ -1578,7 +1509,7 @@ mod tests {
         let matcher = SpecialTokenBoundaries::for_encoder(
             &["/think", "<|im_end|>"],
             &["</think>"],
-            &ThinkTokens,
+            &think_tokens(),
         );
         // `</think>` is extracted whole by the tokenizer: the `/think` inside
         // it is no boundary; a `/think` on its own still is.
@@ -1589,7 +1520,7 @@ mod tests {
         let without = SpecialTokenBoundaries::for_encoder::<_, &str, _>(
             &["/think", "<|im_end|>"],
             &[],
-            &ThinkTokens,
+            &think_tokens(),
         );
         assert_eq!(
             ends(without.find("a</think>b /think c<|im_end|>d")),
@@ -1603,7 +1534,7 @@ mod tests {
 
         let cache = L1Cache::new(1024 * 1024);
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
 
         let input = "<|im_start|>system\nYou are a helpful assistant.<|im_end|><|im_start|>user\nWhat is 2+2?<|im_end|>";
         cache
@@ -1629,32 +1560,17 @@ mod tests {
     /// Encoder with one id per byte and, when `add_special_tokens` is set,
     /// the input's length as a trailing id: what the flag adds depends on
     /// the text.
-    struct LengthTail;
-
-    impl Encoder for LengthTail {
-        fn encode(&self, input: &str, add_special_tokens: bool) -> Result<Encoding> {
-            let mut ids: Vec<TokenIdType> = input.bytes().map(TokenIdType::from).collect();
-            if add_special_tokens {
-                ids.push(TokenIdType::try_from(input.len()).unwrap_or(TokenIdType::MAX));
-            }
-            Ok(Encoding::Plain(ids))
-        }
-
-        fn encode_batch(&self, inputs: &[&str], add_special_tokens: bool) -> Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|i| self.encode(i, add_special_tokens))
-                .collect()
-        }
+    fn length_tail() -> SplittingEncoder {
+        SplittingEncoder::new(Vec::<&str>::new(), 1000).with_tail(Tail::TextLength)
     }
 
     #[test]
     fn the_frame_probe_reads_what_the_flag_adds() {
-        let frame = SpecialTokenFrame::probe(&BosTokenizer).expect("a constant frame");
+        let frame = SpecialTokenFrame::probe(&bos_tokenizer()).expect("a constant frame");
         assert_eq!(frame.prepended(), &[BOS_ID]);
         assert_eq!(frame.appended(), &[] as &[TokenIdType]);
         assert_eq!(
-            SpecialTokenFrame::probe(&LengthTail),
+            SpecialTokenFrame::probe(&length_tail()),
             None,
             "a text-dependent addition is no frame"
         );
@@ -1663,7 +1579,7 @@ mod tests {
     #[test]
     fn test_populate_and_encode_matches_uncached_and_seeds_cache() {
         let special_tokens = &["<|im_start|>", "<|im_end|>"];
-        let tokenizer = BosTokenizer;
+        let tokenizer = bos_tokenizer();
         let input = "<|im_start|>system\nhi<|im_end|><|im_start|>user\nquery<|im_end|>";
 
         for add_special_tokens in [false, true] {
