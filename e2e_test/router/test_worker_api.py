@@ -472,7 +472,9 @@ class TestIGWMixedWorkerClassification:
                         ), f"Local worker {url} should have local runtime, got {rt}"
                     logger.info("Worker %s → runtime_type=%s", url, rt)
 
-                # Verify /v1/models returns models from ALL workers
+                # Verify /v1/models returns models from ALL workers: the listing
+                # reads the registry alone (no provider is asked, no caller
+                # credential travels with it).
                 models = gateway.list_models()
                 model_ids = [m["id"] for m in models]
                 logger.info("All models (%d): %s", len(models), model_ids)
@@ -485,12 +487,18 @@ class TestIGWMixedWorkerClassification:
                     f"Expected a DeepSeek model from gRPC workers, got: {model_ids}"
                 )
 
-                # TODO: verify external providers discover many models via fan-out.
-                # The /v1/models endpoint with a Bearer token should fan out to
-                # external providers and return their full model lists. Currently
-                # external workers registered with disable_health_check only show
-                # their primary model in the registry. Needs investigation into
-                # model discovery for externally-registered workers.
+                # The external workers' models, discovered at their registration
+                # with the operator's key, are listed too: both providers are
+                # checked, and a worker without a discovered model fails the
+                # check rather than skipping it.
+                external = [w for w in workers if "api.openai.com" in w.url or "api.x.ai" in w.url]
+                assert len(external) == 2, (
+                    f"Expected the OpenAI and xAI workers, got: {worker_urls}"
+                )
+                for w in external:
+                    assert w.model in model_ids, (
+                        f"Expected {w.url}'s discovered model {w.model} in the listing, got: {model_ids}"
+                    )
             finally:
                 gateway.shutdown()
         finally:

@@ -1,33 +1,36 @@
 //! `GET /v1/models` and `GET /v1/models/{id}`: the gateway's model inventory.
 //!
-//! Self-hosted models are read from the worker registry. A caller presenting
-//! its own provider credential (bring your own key) is answered from the
-//! external upstreams instead, but never when that credential is one of the
-//! gateway's own keys: a tenant-scoped key must not be forwarded to a third
-//! party as if it were the caller's.
+//! The inventory is the registry's own: the self-hosted workers' model cards
+//! and, for an external worker, the cards its registration discovered with
+//! the key the operator configured. No provider is asked at request time and
+//! no credential is read here, so none can leave: a caller's own provider key
+//! travels with a serving request to the one upstream that request names,
+//! never with a listing, which could only show it to every configured
+//! provider at once.
+//!
+//! An external worker's cards as they stand are not read: a serving request
+//! for a model no worker serves refreshes them with that caller's own
+//! credential (worker selection's refresh on a miss), so they may be one
+//! caller's view of a provider; the listing reads the registration-time cards
+//! alone and shows no caller's view to another.
 //!
 //! The list and the single model come in the shape of the API family the
 //! caller speaks: a request carrying the `anthropic-version` header gets the
 //! Anthropic objects (`type`, `display_name`, `created_at`, page markers),
 //! every other request the OpenAI ones (`object`, `created`, `owned_by`).
 
-use std::collections::HashSet;
-
 use axum::{
-    http::{header, HeaderMap, HeaderValue},
+    http::HeaderMap,
     response::{IntoResponse, Response},
     Json,
 };
-use futures::future::select_all;
 use openai_protocol::{messages, model_card::ModelCard, models::ListModelsResponse};
-use serde_json::Value;
-use tracing::{debug, warn};
 
 use crate::{
     app_context::AppContext,
-    middleware::{into_messages_envelope, AuthConfig},
-    routers::{common::header_utils::apply_provider_headers, error},
-    worker::{ProviderType, RuntimeType, WorkerRegistry},
+    middleware::into_messages_envelope,
+    routers::error,
+    worker::{RuntimeType, WorkerRegistry},
 };
 
 /// The API family a models request speaks, read from its headers.
@@ -102,53 +105,26 @@ pub async fn list_models(
     headers: &HeaderMap,
     request_id: String,
 ) -> Response {
-    list_models_with(
-        &context.worker_registry,
-        &context.client,
-        &context.gateway_auth,
-        headers,
-        request_id,
-    )
-    .await
+    list_models_with(&context.worker_registry, headers, request_id).await
 }
 
-/// [`list_models`] over explicit collaborators.
+/// [`list_models`] over an explicit registry. The headers choose the shape
+/// of the answer and nothing else: a credential among them is not read, so
+/// none can be sent on.
 pub(crate) async fn list_models_with(
     registry: &WorkerRegistry,
-    client: &reqwest::Client,
-    gateway_auth: &AuthConfig,
     headers: &HeaderMap,
     request_id: String,
 ) -> Response {
-    let bearer_token = bearer_token(headers);
     let shape = ModelShape::from_headers(headers);
-
-    // Short-circuit: a token that is one of the gateway's own credentials
-    // is answered from the registry. It must never reach the BYOK fan-out
-    // below, which would forward it externally.
-    if let Some(ref token) = bearer_token {
-        if gateway_auth.contains_token(token) {
-            return registry_models_response(registry, shape, request_id).await;
-        }
-    }
-
-    // A foreign token is tried against the external upstreams first (bring
-    // your own key). On total failure fall through to the registry.
-    if let Some(ref token) = bearer_token {
-        let upstream_cards = fetch_upstream_models(registry, client, token).await;
-        if !upstream_cards.is_empty() {
-            return shape.list(upstream_cards);
-        }
-    }
-
     registry_models_response(registry, shape, request_id).await
 }
 
-/// Answer `GET /v1/models/{id}` from the self-hosted inventory: the card of
-/// the model `model_id` names (its id, or an alias the registry resolves),
-/// in the caller's API shape, or the 404 an unknown model gets on every other
-/// route, in the caller's error envelope (`request_id` names the request in
-/// the Messages envelope).
+/// Answer `GET /v1/models/{id}` from the inventory: the card of the model
+/// `model_id` names (its id, or an alias the registry resolves), in the
+/// caller's API shape, or the 404 an unknown model gets on every other route,
+/// in the caller's error envelope (`request_id` names the request in the
+/// Messages envelope).
 pub async fn retrieve_model(
     context: &AppContext,
     headers: &HeaderMap,
@@ -169,7 +145,7 @@ pub(crate) async fn retrieve_model_with(
 ) -> Response {
     let canonical = registry.resolve_model_alias(model_id);
     let wanted = canonical.as_deref().unwrap_or(model_id);
-    let card = self_hosted_cards(registry)
+    let card = inventory_cards(registry)
         .into_iter()
         .find(|card| card.id == wanted);
     let shape = ModelShape::from_headers(headers);
@@ -179,131 +155,38 @@ pub(crate) async fn retrieve_model_with(
     }
 }
 
-/// The caller's credential: a `Bearer` token (case-insensitive scheme per
-/// RFC 7235) or an Anthropic-style `x-api-key` header.
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        .and_then(|h| {
-            let lower = h.to_ascii_lowercase();
-            lower.starts_with("bearer ").then(|| h[7..].to_string())
-        })
-        .or_else(|| {
-            headers
-                .get("x-api-key")
-                .and_then(|h| h.to_str().ok())
-                .map(String::from)
-        })
-}
-
-/// The self-hosted inventory: every model card of every non-external worker.
-fn self_hosted_cards(registry: &WorkerRegistry) -> Vec<ModelCard> {
+/// The inventory: every self-hosted worker's model cards, and every external
+/// worker's registration-time cards (`spec.models`, discovered with the
+/// operator's key), never the cards a later refresh stored on it (the module
+/// doc); a wildcard external worker has none.
+fn inventory_cards(registry: &WorkerRegistry) -> Vec<ModelCard> {
     registry
         .get_all()
         .iter()
-        .filter(|w| !matches!(w.metadata().spec.runtime_type, RuntimeType::External))
-        .flat_map(|w| w.models())
+        .flat_map(|w| {
+            if matches!(w.metadata().spec.runtime_type, RuntimeType::External) {
+                w.metadata().spec.models.all().to_vec()
+            } else {
+                w.models()
+            }
+        })
         .collect()
 }
 
-/// The self-hosted inventory as a list in the caller's shape, or the 503 of
-/// an empty one in the caller's error envelope.
+/// The inventory as a list in the caller's shape. An empty list is the answer
+/// when workers are registered and none has a card to list (wildcard
+/// providers: the gateway serves, there is nothing to name); the 503 of an
+/// empty registry (no worker registered, or every worker gone) comes in the
+/// caller's error envelope.
 async fn registry_models_response(
     registry: &WorkerRegistry,
     shape: ModelShape,
     request_id: String,
 ) -> Response {
-    let cards = self_hosted_cards(registry);
-    if cards.is_empty() {
-        shape.no_models(request_id).await
-    } else {
-        shape.list(cards)
+    if registry.get_all().is_empty() {
+        return shape.no_models(request_id).await;
     }
-}
-
-/// Fan out to all healthy external upstreams concurrently with the caller's
-/// bearer token and return the first successful model inventory. Returns an
-/// empty vec on total failure.
-async fn fetch_upstream_models(
-    registry: &WorkerRegistry,
-    client: &reqwest::Client,
-    bearer_token: &str,
-) -> Vec<ModelCard> {
-    let unique_urls: Vec<_> = registry
-        .get_workers_filtered(None, None, None, Some(RuntimeType::External), true)
-        .iter()
-        .map(|w| w.url().to_string())
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    if unique_urls.is_empty() {
-        return Vec::new();
-    }
-
-    debug!(
-        "Trying {} upstream(s) for model discovery",
-        unique_urls.len()
-    );
-
-    let auth = match HeaderValue::from_str(&format!("Bearer {bearer_token}")) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            warn!("Bearer token contains invalid header characters: {e}");
-            return Vec::new();
-        }
-    };
-
-    // Fan out concurrently; return the first non-empty result.
-    let mut pending: Vec<_> = unique_urls
-        .into_iter()
-        .map(|url| Box::pin(fetch_models_from(client.clone(), url, auth.clone())))
-        .collect();
-
-    while !pending.is_empty() {
-        let (cards, _index, remaining) = select_all(pending).await;
-        if !cards.is_empty() {
-            return cards;
-        }
-        pending = remaining;
-    }
-
-    Vec::new()
-}
-
-/// Fetch models from a single upstream endpoint.
-async fn fetch_models_from(
-    client: reqwest::Client,
-    base_url: String,
-    auth: Option<HeaderValue>,
-) -> Vec<ModelCard> {
-    let url = format!("{base_url}/v1/models");
-    let req = apply_provider_headers(client.get(&url), &url, auth.as_ref());
-
-    let resp = match req.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            debug!("Failed to reach upstream {url}: {e}");
-            return Vec::new();
-        }
-    };
-
-    if !resp.status().is_success() {
-        debug!(
-            "Upstream {url} returned {} for model discovery",
-            resp.status()
-        );
-        return Vec::new();
-    }
-
-    match resp.json::<Value>().await {
-        Ok(json) => ListModelsResponse::parse_upstream(&json, ProviderType::from_url(&url)),
-        Err(e) => {
-            warn!("Failed to parse upstream models from {url}: {e}");
-            Vec::new()
-        }
-    }
+    shape.list(inventory_cards(registry))
 }
 
 #[cfg(test)]
@@ -313,14 +196,12 @@ mod tests {
         Arc,
     };
 
-    use axum::http::{Request, StatusCode};
+    use axum::http::{header, HeaderValue, StatusCode};
     use openai_protocol::worker::HealthCheckConfig;
+    use serde_json::Value;
 
     use super::*;
-    use crate::{
-        config::types::TenantApiKeyEntry,
-        worker::{BasicWorkerBuilder, Worker, WorkerType},
-    };
+    use crate::worker::{BasicWorkerBuilder, Worker, WorkerType};
 
     /// An inventory with no model in it answers the gateway's JSON error
     /// envelope with a typed code, as every other refusal does, in the
@@ -354,36 +235,110 @@ mod tests {
         assert_eq!(body["request_id"], "req_2", "{body}");
     }
 
-    /// A tenant-scoped credential must never reach the upstream fan-out:
-    /// that would forward the gateway's own secret to an external provider
-    /// as if it were the caller's BYOK token. Verified against a real mock
-    /// upstream that counts hits, since a stubbed HTTP client can't
-    /// distinguish "short-circuited" from "fell through and failed" by
-    /// response alone: both end up returning registry models on failure.
+    /// The listing is the registry's own inventory, an external worker's
+    /// registration-time card next to the self-hosted one, and no provider
+    /// is asked for it: neither a caller's bearer nor the provider's
+    /// configured key is sent anywhere by the listing (a real stub provider
+    /// counts hits), and the cards a refresh on a miss stored on the worker
+    /// with some caller's credential are never shown.
     #[tokio::test]
     #[expect(clippy::disallowed_methods, reason = "test infrastructure")]
-    async fn a_gateway_credential_never_fans_out_upstream() {
+    async fn the_listing_is_the_operators_inventory_and_no_credential_reaches_a_provider() {
         let hit_count = Arc::new(AtomicUsize::new(0));
-        let hit_count_clone = hit_count.clone();
-        let mock_app = axum::Router::new().route(
+        let hits = Arc::clone(&hit_count);
+        let provider = axum::Router::new().route(
             "/v1/models",
             axum::routing::get(move || {
-                let hit_count = hit_count_clone.clone();
+                let hits = Arc::clone(&hits);
                 async move {
-                    hit_count.fetch_add(1, Ordering::SeqCst);
-                    Json(serde_json::json!({"object": "list", "data": []}))
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    Json(serde_json::json!({
+                        "object": "list",
+                        "data": [{"id": "live-only", "object": "model"}]
+                    }))
                 }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, mock_app).await;
+            let _ = axum::serve(listener, provider).await;
         });
 
         let registry = WorkerRegistry::new();
+        // The provider's worker as its registration leaves it: the configured
+        // key and the card discovered with it.
         let external_worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(format!("http://{addr}"))
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::External)
+                .api_key("provider-key")
+                .models(vec![ModelCard::new("provider-model")])
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(Arc::clone(&external_worker));
+        let self_hosted: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://internal.invalid:8000")
+                .worker_type(WorkerType::Regular)
+                .models(vec![ModelCard::new("local-model")])
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        registry.register(self_hosted);
+
+        let mut with_bearer = HeaderMap::new();
+        with_bearer.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer callers-own-key"),
+        );
+        for headers in [with_bearer, HeaderMap::new()] {
+            let response = list_models_with(&registry, &headers, rid()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = json_body(response).await;
+            assert_eq!(
+                sorted_ids(&body),
+                ["local-model", "provider-model"],
+                "{body}"
+            );
+        }
+        assert_eq!(
+            hit_count.load(Ordering::SeqCst),
+            0,
+            "the listing asked the provider"
+        );
+
+        // A refresh on a miss stored what some caller's credential could see;
+        // the listing does not change.
+        external_worker.set_models(vec![ModelCard::new("ft:some-callers-private-model")]);
+        let body = json_body(list_models_with(&registry, &HeaderMap::new(), rid()).await).await;
+        assert_eq!(
+            sorted_ids(&body),
+            ["local-model", "provider-model"],
+            "{body}"
+        );
+
+        // The single-model route reads the same inventory.
+        let response =
+            retrieve_model_with(&registry, &HeaderMap::new(), "provider-model", rid()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["id"], "provider-model");
+    }
+
+    /// Workers with no card to list (a wildcard provider, whose registration
+    /// discovered nothing) answer an empty list in the caller's shape: the
+    /// gateway serves; the 503 is for an empty registry.
+    #[tokio::test]
+    async fn workers_without_a_card_list_nothing_and_an_empty_registry_refuses() {
+        let registry = WorkerRegistry::new();
+        let wildcard: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://provider.invalid")
                 .worker_type(WorkerType::Regular)
                 .runtime_type(RuntimeType::External)
                 .health_config(HealthCheckConfig {
@@ -392,69 +347,36 @@ mod tests {
                 })
                 .build(),
         );
-        registry.register(external_worker);
-        // A non-external worker so the short-circuit path has something to
-        // return besides 503.
-        let internal_worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://internal.invalid:8000")
-                .worker_type(WorkerType::Regular)
-                .models(vec![ModelCard::new("internal-model")])
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        );
-        registry.register(internal_worker);
+        registry.register(wildcard);
 
-        let client = crate::http_client::client();
-        let gateway_auth = AuthConfig::with_tenant_keys(
-            Some("shared-secret".to_string()),
-            &[TenantApiKeyEntry {
-                tenant_id: "team-red".to_string(),
-                key: "team-red-secret".to_string(),
-            }],
-        );
-
-        let req = Request::builder()
-            .header(header::AUTHORIZATION, "Bearer team-red-secret")
-            .body(())
-            .unwrap();
-        let response = list_models_with(
-            &registry,
-            &client,
-            &gateway_auth,
-            req.headers(),
-            "req_test".to_string(),
-        )
-        .await;
+        let response = list_models_with(&registry, &HeaderMap::new(), rid()).await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            hit_count.load(Ordering::SeqCst),
-            0,
-            "a tenant-scoped key must never trigger upstream BYOK fan-out"
-        );
+        let body = json_body(response).await;
+        assert_eq!(body["object"], "list", "{body}");
+        assert_eq!(body["data"], serde_json::json!([]), "{body}");
 
-        // Control: a genuinely unrecognized token still fans out, which
-        // confirms the short-circuit is keyed on the gateway's own
-        // credentials rather than disabled entirely.
-        let req = Request::builder()
-            .header(header::AUTHORIZATION, "Bearer not-a-gateway-key")
-            .body(())
-            .unwrap();
-        let _ = list_models_with(
-            &registry,
-            &client,
-            &gateway_auth,
-            req.headers(),
-            "req_test".to_string(),
-        )
-        .await;
-        assert_eq!(
-            hit_count.load(Ordering::SeqCst),
-            1,
-            "an unrecognized token should still fan out to upstream providers"
-        );
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        let response = list_models_with(&registry, &headers, rid()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["data"], serde_json::json!([]), "{body}");
+        assert_eq!(body["has_more"], false, "{body}");
+
+        let response = list_models_with(&WorkerRegistry::new(), &HeaderMap::new(), rid()).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The listed ids, sorted.
+    fn sorted_ids(body: &Value) -> Vec<&str> {
+        let mut ids: Vec<&str> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     fn registry_with(cards: Vec<ModelCard>) -> WorkerRegistry {
@@ -494,20 +416,8 @@ mod tests {
         let mut card = ModelCard::new("m1");
         card.display_name = Some("Model One".to_owned());
         let registry = registry_with(vec![card]);
-        let client = crate::http_client::client();
-        let gateway_auth = AuthConfig::with_tenant_keys(None, &[]);
 
-        let openai = json_body(
-            list_models_with(
-                &registry,
-                &client,
-                &gateway_auth,
-                &HeaderMap::new(),
-                "req_test".to_string(),
-            )
-            .await,
-        )
-        .await;
+        let openai = json_body(list_models_with(&registry, &HeaderMap::new(), rid()).await).await;
         assert_eq!(openai["object"], "list");
         assert_eq!(openai["data"][0]["object"], "model");
         assert_eq!(openai["data"][0]["id"], "m1");
@@ -515,17 +425,7 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        let anthropic = json_body(
-            list_models_with(
-                &registry,
-                &client,
-                &gateway_auth,
-                &headers,
-                "req_test".to_string(),
-            )
-            .await,
-        )
-        .await;
+        let anthropic = json_body(list_models_with(&registry, &headers, rid()).await).await;
         assert_eq!(anthropic["has_more"], false);
         assert_eq!(anthropic["first_id"], "m1");
         assert_eq!(anthropic["last_id"], "m1");

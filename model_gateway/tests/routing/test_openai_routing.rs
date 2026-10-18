@@ -143,14 +143,29 @@ async fn test_openai_router_server_info() {
     assert!(body_str.contains("openai"));
 }
 
-/// Test the models endpoint: a bearer token triggers upstream fan-out to the
-/// mock server.
+/// The models endpoint lists the registry's own inventory, the external
+/// worker's registration-time card next to the self-hosted one, and a
+/// caller's bearer does not make it ask the provider (the mock provider's
+/// own catalogue, `gpt-4` among it, never shows).
 #[tokio::test]
 async fn test_openai_router_models() {
     let mock_server = MockOpenAIServer::new().await;
     let ctx = create_test_app_context().await;
     register_external_worker(&ctx, &mock_server.base_url(), None);
-    // Send a bearer token to trigger BYOK fan-out to the mock upstream.
+    let self_hosted: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("http://localhost:8000")
+            .worker_type(WorkerType::Regular)
+            .runtime_type(RuntimeType::Sglang)
+            .models(vec![openai_protocol::model_card::ModelCard::new(
+                "local-model",
+            )])
+            .health_config(openai_protocol::worker::HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build(),
+    );
+    ctx.worker_registry.register(self_hosted);
     let req = Request::builder()
         .method(Method::GET)
         .uri("/models")
@@ -167,7 +182,14 @@ async fn test_openai_router_models() {
     let models: serde_json::Value = serde_json::from_str(&body_str).unwrap();
 
     assert_eq!(models["object"], "list");
-    assert!(models["data"].is_array());
+    let mut ids: Vec<&str> = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, ["gpt-3.5-turbo", "local-model"], "{models}");
 }
 
 #[expect(clippy::disallowed_methods, reason = "test infrastructure")]

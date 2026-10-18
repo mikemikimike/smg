@@ -65,9 +65,8 @@ pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
     /// Every credential that authenticates as this gateway: the shared
-    /// `api_key` plus any per-tenant keys, derived once from `router_config`.
-    /// The serving auth layer and the `/v1/models` BYOK short-circuit both
-    /// read this set, so they cannot drift apart.
+    /// `api_key` plus any per-tenant keys, derived once from `router_config`
+    /// for the serving auth layer.
     pub gateway_auth: AuthConfig,
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub rate_limit_manager: Option<Arc<RateLimitManager>>,

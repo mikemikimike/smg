@@ -66,12 +66,9 @@ impl AuthConfig {
         !self.keys.is_empty()
     }
 
-    /// Whether `token` matches any configured key (shared or per-tenant).
-    /// For callers outside `auth_middleware` that need to distinguish "this
-    /// is one of our own gateway credentials" from "unrecognized token" —
-    /// e.g. `/v1/models`' BYOK short-circuit, which must not treat a
-    /// tenant-scoped key as a foreign upstream-provider credential and
-    /// forward it externally.
+    /// Whether `token` matches any configured key (shared or per-tenant),
+    /// for a caller outside `auth_middleware` that needs to tell one of the
+    /// gateway's own credentials from an unrecognized token.
     pub fn contains_token(&self, token: &str) -> bool {
         self.keys.contains_key(&hash_key(token))
     }
