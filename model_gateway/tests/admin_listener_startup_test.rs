@@ -71,6 +71,22 @@ impl Gateway {
     fn log(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
+
+    /// Whether the log carries `needle` within `within`. The process writes
+    /// its start-up lines on its own schedule after the listeners answer, so
+    /// a one-shot read can miss a line the serving listener already proves.
+    fn log_has(&self, needle: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if self.log().contains(needle) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
 impl Drop for Gateway {
@@ -153,12 +169,11 @@ fn the_admin_listener_carries_the_control_plane_and_the_data_listener_answers_40
         );
     }
 
-    let log = gateway.log();
+    let admin_line = format!("Admin listener serving the control plane on {admin} (--admin-port)");
     assert!(
-        log.contains(&format!(
-            "Admin listener serving the control plane on {admin} (--admin-port)"
-        )),
-        "the start does not report the admin listener\n{log}"
+        gateway.log_has(&admin_line, EXIT_TIMEOUT),
+        "the start does not report the admin listener\n{}",
+        gateway.log()
     );
     drop(gateway);
 }
