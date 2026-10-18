@@ -3,13 +3,15 @@ use std::{future::Future, pin::Pin};
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
     messages::CreateMessageRequest, responses::ResponsesRequest,
-    sampling_params::SamplingParams as GenerateSamplingParams,
 };
 use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
 use crate::{
-    request_fields::{response_format_schema, stop_strings, PlainSampling},
+    request_fields::{
+        completion_constraint, plain_constraint, response_format_schema, stop_strings,
+        ConstraintKind, PlainSampling,
+    },
     AbortOnDropClient, BoxedTraceInjector,
 };
 
@@ -205,7 +207,7 @@ impl TrtllmServiceClient {
         };
 
         let guided_decoding = match &body.sampling_params {
-            Some(params) => Self::build_guided_decoding_from_plain(params)?,
+            Some(params) => Self::guide_of(plain_constraint(params)?),
             None => None,
         };
 
@@ -564,7 +566,7 @@ impl TrtllmServiceClient {
             return_perf_metrics: false,
         };
 
-        let guided_decoding = Self::build_guided_decoding_from_completion(body)?;
+        let guided_decoding = Self::guide_of(completion_constraint(body)?);
 
         let stop = stop_strings(body.stop.as_ref());
 
@@ -625,55 +627,21 @@ impl TrtllmServiceClient {
         }
     }
 
-    fn build_guided_decoding_from_completion(
-        request: &CompletionRequest,
-    ) -> Result<Option<proto::GuidedDecodingParams>, String> {
-        Self::single_guide(
-            request.json_schema.as_ref(),
-            request.regex.as_ref(),
-            request.ebnf.as_ref(),
-        )
-    }
-
-    /// The one structured constraint a request may carry, a JSON schema, a
-    /// regex or an EBNF grammar, as the engine's guide. Two or more are
-    /// refused, on the completion and the plain path alike.
-    fn single_guide(
-        json_schema: Option<&String>,
-        regex: Option<&String>,
-        ebnf: Option<&String>,
-    ) -> Result<Option<proto::GuidedDecodingParams>, String> {
-        let mut guides = Vec::new();
-        if let Some(json_schema) = json_schema {
-            guides.push((
-                proto::guided_decoding_params::GuideType::JsonSchema,
-                json_schema.clone(),
-            ));
-        }
-        if let Some(regex) = regex {
-            guides.push((
-                proto::guided_decoding_params::GuideType::Regex,
-                regex.clone(),
-            ));
-        }
-        if let Some(ebnf) = ebnf {
-            guides.push((
-                proto::guided_decoding_params::GuideType::EbnfGrammar,
-                ebnf.clone(),
-            ));
-        }
-        match guides.len() {
-            0 => Ok(None),
-            1 => {
-                #[expect(clippy::expect_used, reason = "INVARIANT: checked len == 1 above")]
-                let (guide_type, guide) = guides.pop().expect("checked len == 1");
-                Ok(Some(proto::GuidedDecodingParams {
-                    guide_type: guide_type as i32,
-                    guide,
-                }))
+    /// The engine's guide for the structured constraint a request names.
+    fn guide_of(
+        constraint: Option<(ConstraintKind, String)>,
+    ) -> Option<proto::GuidedDecodingParams> {
+        constraint.map(|(kind, guide)| {
+            let guide_type = match kind {
+                ConstraintKind::JsonSchema => proto::guided_decoding_params::GuideType::JsonSchema,
+                ConstraintKind::Regex => proto::guided_decoding_params::GuideType::Regex,
+                ConstraintKind::Ebnf => proto::guided_decoding_params::GuideType::EbnfGrammar,
+            };
+            proto::GuidedDecodingParams {
+                guide_type: guide_type as i32,
+                guide,
             }
-            _ => Err("Multiple structured constraints are not allowed".to_string()),
-        }
+        })
     }
 
     fn build_sampling_config_from_plain(plain: &PlainSampling) -> proto::SamplingConfig {
@@ -699,16 +667,6 @@ impl TrtllmServiceClient {
             min_p: plain.min_p,
             beam_width_array: vec![],
         }
-    }
-
-    fn build_guided_decoding_from_plain(
-        params: &GenerateSamplingParams,
-    ) -> Result<Option<proto::GuidedDecodingParams>, String> {
-        Self::single_guide(
-            params.json_schema.as_ref(),
-            params.regex.as_ref(),
-            params.ebnf.as_ref(),
-        )
     }
 }
 
@@ -760,8 +718,7 @@ mod tests {
             "regex": "[a-z]+"
         }))
         .unwrap();
-        let on_completions =
-            TrtllmServiceClient::build_guided_decoding_from_completion(&completion).unwrap_err();
+        let on_completions = completion_constraint(&completion).unwrap_err();
         assert_eq!(refused, on_completions);
         assert_eq!(refused, "Multiple structured constraints are not allowed");
 

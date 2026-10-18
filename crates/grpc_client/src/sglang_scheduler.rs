@@ -9,7 +9,10 @@ use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
 use crate::{
-    request_fields::{response_format_schema, stop_strings, PlainSampling},
+    request_fields::{
+        completion_constraint, plain_constraint, response_format_schema, stop_strings,
+        ConstraintKind, PlainSampling,
+    },
     AbortOnDropClient, BoxedTraceInjector,
 };
 
@@ -644,7 +647,7 @@ impl SglangSchedulerClient {
     ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = stop_strings(request.stop.as_ref());
 
-        let constraint = Self::build_single_constraint_from_completion(request)?;
+        let constraint = Self::constraint_of(completion_constraint(request)?);
 
         Ok(proto::SamplingParams {
             temperature: request.temperature.unwrap_or(1.0),
@@ -668,54 +671,15 @@ impl SglangSchedulerClient {
         })
     }
 
-    fn build_single_constraint_from_completion(
-        request: &CompletionRequest,
-    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
-        let mut constraints = Vec::new();
-        if let Some(json_schema) = &request.json_schema {
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(
-                json_schema.clone(),
-            ));
-        }
-        if let Some(regex) = &request.regex {
-            constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
-        }
-        if let Some(ebnf) = &request.ebnf {
-            constraints.push(proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
-            ));
-        }
-
-        match constraints.len() {
-            0 => Ok(None),
-            1 => Ok(constraints.pop()),
-            _ => Err("Multiple structured constraints are not allowed".to_string()),
-        }
-    }
-
-    fn build_single_constraint_from_plain(
-        params: &GenerateSamplingParams,
-    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
-        let mut constraints = Vec::new();
-        if let Some(json_schema) = &params.json_schema {
-            constraints.push(proto::sampling_params::Constraint::JsonSchema(
-                json_schema.clone(),
-            ));
-        }
-        if let Some(regex) = &params.regex {
-            constraints.push(proto::sampling_params::Constraint::Regex(regex.clone()));
-        }
-        if let Some(ebnf) = &params.ebnf {
-            constraints.push(proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
-            ));
-        }
-
-        match constraints.len() {
-            0 => Ok(None),
-            1 => Ok(constraints.pop()),
-            _ => Err("Multiple structured constraints are not allowed".to_string()),
-        }
+    /// The engine's variant for the structured constraint a request names.
+    fn constraint_of(
+        constraint: Option<(ConstraintKind, String)>,
+    ) -> Option<proto::sampling_params::Constraint> {
+        constraint.map(|(kind, value)| match kind {
+            ConstraintKind::JsonSchema => proto::sampling_params::Constraint::JsonSchema(value),
+            ConstraintKind::Regex => proto::sampling_params::Constraint::Regex(value),
+            ConstraintKind::Ebnf => proto::sampling_params::Constraint::EbnfGrammar(value),
+        })
     }
 
     fn build_sampling_params_from_plain(
@@ -740,7 +704,7 @@ impl SglangSchedulerClient {
             n: plain.n,
             min_new_tokens: plain.min_new_tokens.unwrap_or(0),
             constraint: match params {
-                Some(p) => Self::build_single_constraint_from_plain(p)?,
+                Some(p) => Self::constraint_of(plain_constraint(p)?),
                 None => None,
             },
             ..Default::default()

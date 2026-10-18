@@ -18,7 +18,10 @@ use tonic::{transport::Channel, Request};
 use tracing::{debug, warn};
 
 use crate::{
-    request_fields::{response_format_schema, stop_strings, PlainSampling},
+    request_fields::{
+        completion_constraint, plain_constraint, response_format_schema, stop_strings,
+        ConstraintKind, PlainSampling,
+    },
     AbortOnDropClient, BoxedTraceInjector, NoopTraceInjector,
 };
 
@@ -413,7 +416,7 @@ impl TokenSpeedSchedulerClient {
             no_stop_trim: request.no_stop_trim,
             sampling_seed: Self::completion_sampling_seed(request)?,
             n: request.n.unwrap_or(1),
-            constraint: Self::build_constraint_from_completion(request)?,
+            constraint: Self::constraint_of(completion_constraint(request)?),
             ..Default::default()
         })
     }
@@ -441,7 +444,7 @@ impl TokenSpeedSchedulerClient {
             sampling_seed: plain.sampling_seed,
             n: plain.n,
             constraint: match params {
-                Some(p) => Self::build_constraint_from_plain(p)?,
+                Some(p) => Self::constraint_of(plain_constraint(p)?),
                 None => None,
             },
             ..Default::default()
@@ -527,58 +530,19 @@ impl TokenSpeedSchedulerClient {
         }
     }
 
-    fn build_constraint_from_completion(
-        request: &CompletionRequest,
-    ) -> Result<Option<tokenspeed_proto::sampling_params::Constraint>, String> {
-        let mut constraints = Vec::new();
-        if let Some(json_schema) = &request.json_schema {
-            constraints.push(tokenspeed_proto::sampling_params::Constraint::JsonSchema(
-                json_schema.clone(),
-            ));
-        }
-        if let Some(regex) = &request.regex {
-            constraints.push(tokenspeed_proto::sampling_params::Constraint::Regex(
-                regex.clone(),
-            ));
-        }
-        if let Some(ebnf) = &request.ebnf {
-            constraints.push(tokenspeed_proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
-            ));
-        }
-
-        match constraints.len() {
-            0 => Ok(None),
-            1 => Ok(constraints.pop()),
-            _ => Err("Multiple structured constraints are not allowed".to_string()),
-        }
-    }
-
-    fn build_constraint_from_plain(
-        params: &GenerateSamplingParams,
-    ) -> Result<Option<tokenspeed_proto::sampling_params::Constraint>, String> {
-        let mut constraints = Vec::new();
-        if let Some(json_schema) = &params.json_schema {
-            constraints.push(tokenspeed_proto::sampling_params::Constraint::JsonSchema(
-                json_schema.clone(),
-            ));
-        }
-        if let Some(regex) = &params.regex {
-            constraints.push(tokenspeed_proto::sampling_params::Constraint::Regex(
-                regex.clone(),
-            ));
-        }
-        if let Some(ebnf) = &params.ebnf {
-            constraints.push(tokenspeed_proto::sampling_params::Constraint::EbnfGrammar(
-                ebnf.clone(),
-            ));
-        }
-
-        match constraints.len() {
-            0 => Ok(None),
-            1 => Ok(constraints.pop()),
-            _ => Err("Multiple structured constraints are not allowed".to_string()),
-        }
+    /// The engine's variant for the structured constraint a request names.
+    fn constraint_of(
+        constraint: Option<(ConstraintKind, String)>,
+    ) -> Option<tokenspeed_proto::sampling_params::Constraint> {
+        constraint.map(|(kind, value)| match kind {
+            ConstraintKind::JsonSchema => {
+                tokenspeed_proto::sampling_params::Constraint::JsonSchema(value)
+            }
+            ConstraintKind::Regex => tokenspeed_proto::sampling_params::Constraint::Regex(value),
+            ConstraintKind::Ebnf => {
+                tokenspeed_proto::sampling_params::Constraint::EbnfGrammar(value)
+            }
+        })
     }
 
     fn unsigned_sampling_seed(seed: Option<i64>) -> Result<Option<u64>, String> {

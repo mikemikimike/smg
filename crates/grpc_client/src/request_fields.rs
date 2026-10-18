@@ -1,12 +1,14 @@
 //! The parts of a request every engine client reads alike: the schema a chat
 //! request's `response_format` asks for, and a plain generate request's sampling
-//! parameters with the shared defaults applied. Each client places the values in
-//! its own proto; what differs between engines (the constraint variant, how a
-//! disabled `top_k` is spelled, which fields its proto has) stays in the client.
+//! parameters with the shared defaults applied, and the one structured constraint
+//! a completion or plain request names. Each client places the values in its own
+//! proto; what differs between engines (the constraint variant, how a disabled
+//! `top_k` is spelled, which fields its proto has) stays in the client.
 
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ResponseFormat, StringOrArray},
+    completion::CompletionRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
 
@@ -32,6 +34,59 @@ pub fn response_format_schema(request: &ChatCompletionRequest) -> Result<Option<
 /// when the request has no `stop`.
 pub fn stop_strings(stop: Option<&StringOrArray>) -> Vec<String> {
     stop.map_or_else(Vec::new, StringOrArray::to_vec)
+}
+
+/// The kind of structured constraint a request names: a JSON schema, a regex
+/// or an EBNF grammar. Each client spells it in its own proto.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintKind {
+    JsonSchema,
+    Regex,
+    Ebnf,
+}
+
+/// The one structured constraint among `json_schema`, `regex` and `ebnf`, with
+/// its text: none when the request names none, the refusal when it names more
+/// than one.
+pub fn single_constraint(
+    json_schema: Option<&str>,
+    regex: Option<&str>,
+    ebnf: Option<&str>,
+) -> Result<Option<(ConstraintKind, String)>, String> {
+    let mut named = [
+        (ConstraintKind::JsonSchema, json_schema),
+        (ConstraintKind::Regex, regex),
+        (ConstraintKind::Ebnf, ebnf),
+    ]
+    .into_iter()
+    .filter_map(|(kind, value)| value.map(|value| (kind, value.to_string())));
+    match (named.next(), named.next()) {
+        (None, _) => Ok(None),
+        (Some(one), None) => Ok(Some(one)),
+        (Some(_), Some(_)) => Err("Multiple structured constraints are not allowed".to_string()),
+    }
+}
+
+/// A completion request's structured constraint, by [`single_constraint`].
+pub fn completion_constraint(
+    request: &CompletionRequest,
+) -> Result<Option<(ConstraintKind, String)>, String> {
+    single_constraint(
+        request.json_schema.as_deref(),
+        request.regex.as_deref(),
+        request.ebnf.as_deref(),
+    )
+}
+
+/// A plain generate request's structured constraint, by [`single_constraint`].
+pub fn plain_constraint(
+    params: &GenerateSamplingParams,
+) -> Result<Option<(ConstraintKind, String)>, String> {
+    single_constraint(
+        params.json_schema.as_deref(),
+        params.regex.as_deref(),
+        params.ebnf.as_deref(),
+    )
 }
 
 /// A plain generate request's sampling parameters as every engine client reads
@@ -192,5 +247,43 @@ mod tests {
             PlainSampling::read(Some(&one)).stop,
             vec!["END".to_string()]
         );
+    }
+
+    #[test]
+    fn the_structured_constraint_is_one_of_three() {
+        assert_eq!(single_constraint(None, None, None), Ok(None));
+        assert_eq!(
+            single_constraint(Some("{}"), None, None),
+            Ok(Some((ConstraintKind::JsonSchema, "{}".to_string())))
+        );
+        assert_eq!(
+            single_constraint(None, Some("[a-z]+"), None),
+            Ok(Some((ConstraintKind::Regex, "[a-z]+".to_string())))
+        );
+        assert_eq!(
+            single_constraint(None, None, Some("root ::= \"a\"")),
+            Ok(Some((ConstraintKind::Ebnf, "root ::= \"a\"".to_string())))
+        );
+        let refused: Result<Option<(ConstraintKind, String)>, String> =
+            Err("Multiple structured constraints are not allowed".to_string());
+        assert_eq!(single_constraint(Some("{}"), Some("a"), None), refused);
+        assert_eq!(single_constraint(Some("{}"), None, Some("g")), refused);
+        assert_eq!(single_constraint(None, Some("a"), Some("g")), refused);
+        assert_eq!(single_constraint(Some("{}"), Some("a"), Some("g")), refused);
+    }
+
+    #[test]
+    fn the_completion_and_plain_readers_read_the_same_fields() {
+        let completion: CompletionRequest = serde_json::from_value(
+            serde_json::json!({"model": "m", "prompt": "hi", "regex": "[a-z]+"}),
+        )
+        .unwrap();
+        let plain: GenerateSamplingParams =
+            serde_json::from_value(serde_json::json!({"regex": "[a-z]+"})).unwrap();
+        assert_eq!(
+            completion_constraint(&completion),
+            Ok(Some((ConstraintKind::Regex, "[a-z]+".to_string())))
+        );
+        assert_eq!(plain_constraint(&plain), completion_constraint(&completion));
     }
 }
