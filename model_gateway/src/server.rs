@@ -16,6 +16,7 @@ use axum::{
     Json, Router,
 };
 use llm_tokenizer::TokenizerRegistry;
+use metrics_exporter_prometheus::PrometheusHandle;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -42,7 +43,7 @@ use openai_protocol::{
 };
 use serde::Deserialize;
 use serde_json::Value;
-use smg_mesh::{MeshServerBuilder, MeshServerConfig, MeshServerHandler};
+use smg_mesh::{ClusterState, MeshServerBuilder, MeshServerConfig, MeshServerHandler};
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -1485,6 +1486,123 @@ fn supervise_discovery(
     abort
 }
 
+/// The observability the gateway serves beside its routes, started once every
+/// configuration read that can still fail is behind us and right before the
+/// listeners: the O(1) readiness state the probes read (maintained from
+/// WorkerRegistry events plus a short checkpoint for broadcast-bypassing
+/// mutations, served by `/readiness` on the main listener and on the optional
+/// probe listener); the metrics listener (the recorder exists since the top of
+/// start-up, the port binds only now, eagerly, so a conflict or a bad address
+/// fails the start before the HTTP listener) with the Tokio runtime observer
+/// on it (event-loop canary and sampler; `startup` runs on the main runtime,
+/// so the observer lands on, and measures, the runtime that serves requests);
+/// the sweeper of unstored background responses whose polling window ended
+/// with no gateway there to retire them (swept now whatever this gateway's
+/// background setting, an earlier one may have had it on, then once per window
+/// while background mode is on); and the optional isolated probe listener
+/// (`--health-check-port`: /liveness, /readiness, /health on a dedicated
+/// single-worker runtime on its own OS thread, so probes cannot be starved by
+/// the request runtime; the same routes stay on the main listener). The
+/// maintainer's and the sweeper's join handles detach on drop; the tasks run
+/// on. Returns the probe state the app and the probe listener share.
+async fn start_observability(
+    config: &ServerConfig,
+    app_context: &Arc<AppContext>,
+    metrics_handle: Option<PrometheusHandle>,
+) -> Result<Arc<crate::health::ProbeState>, Box<dyn std::error::Error>> {
+    let probe_state = crate::health::ProbeState::new(app_context.inflight_tracker.clone());
+    let _readiness_maintainer = crate::health::spawn_readiness_maintainer(
+        probe_state.clone(),
+        app_context.worker_registry.clone(),
+        app_context.tokenizer_registry.clone(),
+        config.router_config.clone(),
+    );
+
+    if let (Some(handle), Some(prometheus_config)) = (metrics_handle, &config.prometheus_config) {
+        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
+            handle,
+            prometheus_config.host.clone(),
+            prometheus_config.port,
+        )
+        .await?;
+        runtime_metrics::spawn_observer();
+    }
+
+    let _unstored_sweeper = spawn_unstored_sweeper(
+        app_context.response_storage.clone(),
+        config.router_config.max_background_responses > 0,
+    );
+
+    if let Some(probe_port) = config.health_check_port {
+        let probe_addr =
+            crate::health::start_probe_listener(&config.host, probe_port, probe_state.clone())?;
+        info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
+    }
+    Ok(probe_state)
+}
+
+/// Worker discovery and mesh-router discovery, two independent lifetimes:
+/// either may run without the other, each is supervised for an unexpected exit
+/// (see [`supervise_discovery`]) and its abort handle sits in the returned
+/// [`DiscoveryTasks`] so shutdown cancels it. A discovery that fails to start
+/// is logged and the gateway goes on without it. The mesh-router discovery
+/// needs the mesh's cluster state and advertised port; configured without a
+/// mesh, it is skipped with a warning.
+async fn start_discovery(
+    service_discovery_config: Option<RuntimeDiscoveryConfig>,
+    mesh_discovery_config: Option<MeshDiscoveryConfig>,
+    app_context: &Arc<AppContext>,
+    mesh_cluster_state: Option<ClusterState>,
+    mesh_port: Option<u16>,
+) -> DiscoveryTasks {
+    let mut discovery_tasks = DiscoveryTasks::default();
+
+    if let Some(service_discovery_config) = service_discovery_config {
+        let app_context_arc = Arc::clone(app_context);
+        match start_service_discovery(service_discovery_config, app_context_arc).await {
+            Ok(handle) => {
+                info!("Service discovery started");
+                discovery_tasks
+                    .0
+                    .push(supervise_discovery("Worker discovery", handle));
+            }
+            Err(e) => {
+                error!("Failed to start service discovery: {e}");
+                warn!("Continuing without service discovery");
+            }
+        }
+    }
+
+    if let Some(mesh_discovery_config) = mesh_discovery_config {
+        match (
+            mesh_discovery_config.is_enabled(),
+            mesh_cluster_state,
+            mesh_port,
+        ) {
+            (true, Some(cluster_state), Some(port)) => {
+                match start_mesh_discovery(mesh_discovery_config, cluster_state, port).await {
+                    Ok(handle) => {
+                        info!("Mesh router discovery started");
+                        discovery_tasks
+                            .0
+                            .push(supervise_discovery("Mesh router discovery", handle));
+                    }
+                    Err(e) => {
+                        error!("Failed to start mesh router discovery: {e}");
+                        warn!("Continuing without mesh router discovery");
+                    }
+                }
+            }
+            (true, _, _) => warn!(
+                "Router selector configured but mesh is not enabled (mesh cluster state or \
+                 mesh port not provided). Skipping router discovery."
+            ),
+            (false, _, _) => {}
+        }
+    }
+    discovery_tasks
+}
+
 /// [`startup`] on `runtime` to its end, then the process-wide observability
 /// closed behind it, on every exit alike: the log writers are flushed and
 /// stopped, then the tracer is flushed and shut down (a bounded wait, see
@@ -1898,55 +2016,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .as_ref()
         .map(|c| c.advertise_addr.port());
 
-    // O(1) readiness state: maintained from WorkerRegistry events (plus a
-    // short checkpoint for broadcast-bypassing mutations), read by
-    // `/readiness` on the main listener and on the optional dedicated
-    // probe listener below. Dropping the JoinHandle detaches the task.
-    let probe_state = crate::health::ProbeState::new(app_context.inflight_tracker.clone());
-    let _readiness_maintainer = crate::health::spawn_readiness_maintainer(
-        probe_state.clone(),
-        app_context.worker_registry.clone(),
-        app_context.tokenizer_registry.clone(),
-        config.router_config.clone(),
-    );
-
-    // The metrics listener: the recorder exists since the top of start-up,
-    // the port binds only now (see there). It still binds eagerly, so a port
-    // conflict or a bad address fails the start before the HTTP listener.
-    if let (Some(handle), Some(prometheus_config)) = (metrics_handle, &config.prometheus_config) {
-        let (_metrics_addr, _server_handle) = metrics_server::start_metrics_server(
-            handle,
-            prometheus_config.host.clone(),
-            prometheus_config.port,
-        )
-        .await?;
-        // Tokio runtime self-observability (event-loop canary + sampler).
-        // `startup` runs on the main runtime, so the observer lands on —
-        // and therefore measures — the runtime that serves requests.
-        runtime_metrics::spawn_observer();
-    }
-
-    // The records of unstored background responses whose polling window
-    // ended with no gateway there to retire them (a stop or a crash inside
-    // the window, with a store that outlives the process) are swept now,
-    // whatever this gateway's background setting (an earlier one may have had
-    // it on), and then once per window while background mode is on, where new
-    // unstored records can appear. Dropping the JoinHandle detaches the task.
-    let _unstored_sweeper = spawn_unstored_sweeper(
-        app_context.response_storage.clone(),
-        config.router_config.max_background_responses > 0,
-    );
-
-    // Optional isolated probe listener (additive): when `--health-check-port`
-    // is set, serves /liveness, /readiness, /health on that port from a
-    // dedicated single-worker runtime on its own OS thread, so probes
-    // cannot be starved by the request runtime. The same routes always remain
-    // on the main listener.
-    if let Some(probe_port) = config.health_check_port {
-        let probe_addr =
-            crate::health::start_probe_listener(&config.host, probe_port, probe_state.clone())?;
-        info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
-    }
+    // The readiness state, the metrics listener, the sweeper and the probe
+    // listener: every configuration read that can still fail is behind us,
+    // so the listeners among them bind now, before the HTTP listener.
+    let probe_state = start_observability(&config, &app_context, metrics_handle).await?;
 
     let app_state = Arc::new(AppState {
         router,
@@ -1963,51 +2036,14 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // Worker discovery and mesh-router discovery are independent lifetimes:
     // either may run without the other. Each is supervised for unexpected exit
     // and its abort handle held so shutdown cancels it.
-    let mut discovery_tasks = DiscoveryTasks::default();
-
-    if let Some(service_discovery_config) = config.service_discovery_config {
-        let app_context_arc = Arc::clone(&app_state.context);
-        match start_service_discovery(service_discovery_config, app_context_arc).await {
-            Ok(handle) => {
-                info!("Service discovery started");
-                discovery_tasks
-                    .0
-                    .push(supervise_discovery("Worker discovery", handle));
-            }
-            Err(e) => {
-                error!("Failed to start service discovery: {e}");
-                warn!("Continuing without service discovery");
-            }
-        }
-    }
-
-    if let Some(mesh_discovery_config) = config.mesh_discovery_config {
-        match (
-            mesh_discovery_config.is_enabled(),
-            mesh_cluster_state,
-            mesh_port,
-        ) {
-            (true, Some(cluster_state), Some(port)) => {
-                match start_mesh_discovery(mesh_discovery_config, cluster_state, port).await {
-                    Ok(handle) => {
-                        info!("Mesh router discovery started");
-                        discovery_tasks
-                            .0
-                            .push(supervise_discovery("Mesh router discovery", handle));
-                    }
-                    Err(e) => {
-                        error!("Failed to start mesh router discovery: {e}");
-                        warn!("Continuing without mesh router discovery");
-                    }
-                }
-            }
-            (true, _, _) => warn!(
-                "Router selector configured but mesh is not enabled (mesh cluster state or \
-                 mesh port not provided). Skipping router discovery."
-            ),
-            (false, _, _) => {}
-        }
-    }
+    let discovery_tasks = start_discovery(
+        config.service_discovery_config,
+        config.mesh_discovery_config,
+        &app_state.context,
+        mesh_cluster_state,
+        mesh_port,
+    )
+    .await;
 
     info!(
         "Router ready | workers: {:?}",
