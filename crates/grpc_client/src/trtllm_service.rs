@@ -891,4 +891,33 @@ mod tests {
         );
         assert_eq!(guided.guide, r#"{"type": "object"}"#);
     }
+
+    /// Each constraint kind reaches the engine as its guide type; none stays none.
+    #[test]
+    fn guide_of_maps_each_kind_to_the_engines_guide_type() {
+        use crate::request_fields::ConstraintKind;
+        for (kind, guide_type) in [
+            (
+                ConstraintKind::JsonSchema,
+                proto::guided_decoding_params::GuideType::JsonSchema,
+            ),
+            (
+                ConstraintKind::Regex,
+                proto::guided_decoding_params::GuideType::Regex,
+            ),
+            (
+                ConstraintKind::Ebnf,
+                proto::guided_decoding_params::GuideType::EbnfGrammar,
+            ),
+        ] {
+            assert_eq!(
+                TrtllmServiceClient::guide_of(Some((kind, "v".to_string()))),
+                Some(proto::GuidedDecodingParams {
+                    guide_type: guide_type as i32,
+                    guide: "v".to_string(),
+                })
+            );
+        }
+        assert_eq!(TrtllmServiceClient::guide_of(None), None);
+    }
 }

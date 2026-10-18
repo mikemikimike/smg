@@ -790,3 +790,34 @@ mod seed_resolution_tests {
         assert_eq!(resolved, None);
     }
 }
+
+#[cfg(test)]
+mod constraint_mapping_tests {
+    use super::*;
+    use crate::request_fields::ConstraintKind;
+
+    /// Each constraint kind reaches the engine as its own variant; none stays none.
+    #[test]
+    fn constraint_of_maps_each_kind_to_the_engines_variant() {
+        for (kind, expected) in [
+            (
+                ConstraintKind::JsonSchema,
+                tokenspeed_proto::sampling_params::Constraint::JsonSchema("v".to_string()),
+            ),
+            (
+                ConstraintKind::Regex,
+                tokenspeed_proto::sampling_params::Constraint::Regex("v".to_string()),
+            ),
+            (
+                ConstraintKind::Ebnf,
+                tokenspeed_proto::sampling_params::Constraint::EbnfGrammar("v".to_string()),
+            ),
+        ] {
+            assert_eq!(
+                TokenSpeedSchedulerClient::constraint_of(Some((kind, "v".to_string()))),
+                Some(expected)
+            );
+        }
+        assert_eq!(TokenSpeedSchedulerClient::constraint_of(None), None);
+    }
+}

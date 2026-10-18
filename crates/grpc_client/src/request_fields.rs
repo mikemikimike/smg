@@ -273,17 +273,21 @@ mod tests {
     }
 
     #[test]
-    fn the_completion_and_plain_readers_read_the_same_fields() {
-        let completion: CompletionRequest = serde_json::from_value(
-            serde_json::json!({"model": "m", "prompt": "hi", "regex": "[a-z]+"}),
-        )
-        .unwrap();
-        let plain: GenerateSamplingParams =
-            serde_json::from_value(serde_json::json!({"regex": "[a-z]+"})).unwrap();
-        assert_eq!(
-            completion_constraint(&completion),
-            Ok(Some((ConstraintKind::Regex, "[a-z]+".to_string())))
-        );
-        assert_eq!(plain_constraint(&plain), completion_constraint(&completion));
+    fn the_completion_and_plain_readers_read_each_of_the_three_fields() {
+        for (field, kind) in [
+            ("json_schema", ConstraintKind::JsonSchema),
+            ("regex", ConstraintKind::Regex),
+            ("ebnf", ConstraintKind::Ebnf),
+        ] {
+            let completion: CompletionRequest = serde_json::from_value(
+                serde_json::json!({"model": "m", "prompt": "hi", field: "v"}),
+            )
+            .unwrap();
+            let plain: GenerateSamplingParams =
+                serde_json::from_value(serde_json::json!({field: "v"})).unwrap();
+            let read = Ok(Some((kind, "v".to_string())));
+            assert_eq!(completion_constraint(&completion), read, "{field}");
+            assert_eq!(plain_constraint(&plain), read, "{field}");
+        }
     }
 }

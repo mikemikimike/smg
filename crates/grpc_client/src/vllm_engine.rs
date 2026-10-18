@@ -954,4 +954,30 @@ mod tests {
     }
 
     // TODO: ModelInfo not in current proto - skip test
+
+    /// Each constraint kind reaches the engine as its own variant; none stays none.
+    #[test]
+    fn constraint_of_maps_each_kind_to_the_engines_variant() {
+        use crate::request_fields::ConstraintKind;
+        for (kind, expected) in [
+            (
+                ConstraintKind::JsonSchema,
+                proto::sampling_params::Constraint::JsonSchema("v".to_string()),
+            ),
+            (
+                ConstraintKind::Regex,
+                proto::sampling_params::Constraint::Regex("v".to_string()),
+            ),
+            (
+                ConstraintKind::Ebnf,
+                proto::sampling_params::Constraint::Grammar("v".to_string()),
+            ),
+        ] {
+            assert_eq!(
+                VllmEngineClient::constraint_of(Some((kind, "v".to_string()))),
+                Some(expected)
+            );
+        }
+        assert_eq!(VllmEngineClient::constraint_of(None), None);
+    }
 }
