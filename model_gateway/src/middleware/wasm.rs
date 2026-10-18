@@ -8,7 +8,7 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    body::Body,
+    body::{Body, HttpBody},
     extract::{Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::Next,
@@ -205,9 +205,10 @@ async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response)
 
     // A response the WASM cap cannot hold passes through unhooked, as a
     // streaming one does: the upstream answered, and the modules do not see
-    // bodies over the cap. A declared length says so before the read.
+    // bodies over the cap. A declared length or a body already in memory
+    // says so before the read.
     let max_body_size = wasm_manager.get_max_body_size();
-    if declared_length(response.headers()).is_some_and(|length| length > max_body_size) {
+    if known_to_exceed(&response, max_body_size) {
         warn!(
             "Skipping WASM OnResponse for a response over the body limit ({} bytes); OnResponse modules do not apply to it",
             max_body_size
@@ -221,10 +222,10 @@ async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response)
     let mut body_bytes = match axum::body::to_bytes(response.into_body(), max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) if super::body_timeout::crossed_payload_limit(&e) => {
-            // Undeclared length, over the cap: the body is consumed by now,
-            // so the answer is a refusal, under its own code.
+            // A size unknown before the read, over the cap: the body is
+            // consumed by now, so the answer is a refusal, under its own code.
             error!(
-                "Response body over the WASM body limit ({} bytes) with no declared length; the response cannot be relayed",
+                "Response body over the WASM body limit ({} bytes) whose size was not known before the read; the response cannot be relayed",
                 max_body_size
             );
             return error::internal_error(
@@ -279,16 +280,21 @@ async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response)
     rebuild_response(status, headers, body_bytes)
 }
 
-/// Whether `response` streams: an event stream, newline-delimited JSON or a
-/// chunked transfer, none of which the response hook may buffer.
-/// The response's declared body length, when it declares one.
-fn declared_length(headers: &HeaderMap) -> Option<usize> {
-    headers
+/// Whether `response` is known to be over `max_body_size` before it is read:
+/// by the length it declares, or by the lower bound of its body's size hint,
+/// exact for a body already in memory and zero for a stream.
+fn known_to_exceed(response: &Response, max_body_size: usize) -> bool {
+    let declared: Option<usize> = response
+        .headers()
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse().ok());
+    declared.is_some_and(|length| length > max_body_size)
+        || response.body().size_hint().lower() > max_body_size as u64
 }
 
+/// Whether `response` streams: an event stream, newline-delimited JSON or a
+/// chunked transfer, none of which the response hook may buffer.
 fn is_streaming(response: &Response) -> bool {
     response
         .headers()
@@ -632,8 +638,27 @@ mod tests {
         assert_eq!(body_of(response.into_body()).await, payload);
     }
 
-    /// A response over the cap with no declared length cannot be relayed once
-    /// read: its refusal carries its own code, not the unreadable one.
+    /// A response whose body is already in memory, over the cap, passes
+    /// through as a declared one does though it declares no length: a typed
+    /// JSON response carries none before it is written out.
+    #[tokio::test]
+    async fn the_response_hook_passes_an_in_memory_body_over_the_cap_through() {
+        let manager = manager_with_an_inert_module_under(small_cap());
+        let payload = vec![b'y'; 4096];
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.clone()))
+            .expect("a response");
+        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
+        let response = run_response_hook(&manager, response).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_of(response.into_body()).await, payload);
+    }
+
+    /// A response over the cap whose size is not known before the read (a
+    /// stream) cannot be relayed once read: its refusal carries its own code,
+    /// not the unreadable one.
     #[tokio::test]
     async fn the_response_hook_names_an_undeclared_body_over_the_cap() {
         let manager = manager_with_an_inert_module_under(small_cap());
