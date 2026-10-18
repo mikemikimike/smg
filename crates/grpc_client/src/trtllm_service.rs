@@ -182,10 +182,6 @@ impl TrtllmServiceClient {
     }
 
     /// [`Self::build_plain_generate_request`] without a receiver.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "returns Result for API consistency with sglang/vllm backends which can fail"
-    )]
     pub fn build_plain_generate_request_parts(
         request_id: String,
         body: &GenerateRequest,
@@ -208,11 +204,9 @@ impl TrtllmServiceClient {
             return_perf_metrics: false,
         };
 
-        // Build guided decoding from plain sampling params
-        let guided_decoding = if let Some(params) = &body.sampling_params {
-            Self::build_guided_decoding_from_plain(params)
-        } else {
-            None
+        let guided_decoding = match &body.sampling_params {
+            Some(params) => Self::build_guided_decoding_from_plain(params)?,
+            None => None,
         };
 
         let max_tokens = plain.max_new_tokens.unwrap_or(2048);
@@ -634,27 +628,40 @@ impl TrtllmServiceClient {
     fn build_guided_decoding_from_completion(
         request: &CompletionRequest,
     ) -> Result<Option<proto::GuidedDecodingParams>, String> {
-        let mut guides = Vec::new();
+        Self::single_guide(
+            request.json_schema.as_ref(),
+            request.regex.as_ref(),
+            request.ebnf.as_ref(),
+        )
+    }
 
-        if let Some(json_schema) = &request.json_schema {
+    /// The one structured constraint a request may carry, a JSON schema, a
+    /// regex or an EBNF grammar, as the engine's guide. Two or more are
+    /// refused, on the completion and the plain path alike.
+    fn single_guide(
+        json_schema: Option<&String>,
+        regex: Option<&String>,
+        ebnf: Option<&String>,
+    ) -> Result<Option<proto::GuidedDecodingParams>, String> {
+        let mut guides = Vec::new();
+        if let Some(json_schema) = json_schema {
             guides.push((
                 proto::guided_decoding_params::GuideType::JsonSchema,
                 json_schema.clone(),
             ));
         }
-        if let Some(regex) = &request.regex {
+        if let Some(regex) = regex {
             guides.push((
                 proto::guided_decoding_params::GuideType::Regex,
                 regex.clone(),
             ));
         }
-        if let Some(ebnf) = &request.ebnf {
+        if let Some(ebnf) = ebnf {
             guides.push((
                 proto::guided_decoding_params::GuideType::EbnfGrammar,
                 ebnf.clone(),
             ));
         }
-
         match guides.len() {
             0 => Ok(None),
             1 => {
@@ -696,26 +703,12 @@ impl TrtllmServiceClient {
 
     fn build_guided_decoding_from_plain(
         params: &GenerateSamplingParams,
-    ) -> Option<proto::GuidedDecodingParams> {
-        if let Some(json_schema) = &params.json_schema {
-            return Some(proto::GuidedDecodingParams {
-                guide_type: proto::guided_decoding_params::GuideType::JsonSchema as i32,
-                guide: json_schema.clone(),
-            });
-        }
-        if let Some(regex) = &params.regex {
-            return Some(proto::GuidedDecodingParams {
-                guide_type: proto::guided_decoding_params::GuideType::Regex as i32,
-                guide: regex.clone(),
-            });
-        }
-        if let Some(ebnf) = &params.ebnf {
-            return Some(proto::GuidedDecodingParams {
-                guide_type: proto::guided_decoding_params::GuideType::EbnfGrammar as i32,
-                guide: ebnf.clone(),
-            });
-        }
-        None
+    ) -> Result<Option<proto::GuidedDecodingParams>, String> {
+        Self::single_guide(
+            params.json_schema.as_ref(),
+            params.regex.as_ref(),
+            params.ebnf.as_ref(),
+        )
     }
 }
 
@@ -740,6 +733,57 @@ mod tests {
         .unwrap();
         assert_eq!(request.sampling_config.unwrap().seed, Some(7));
         assert_eq!(request.stop_token_ids, vec![1, 2]);
+    }
+
+    /// A plain request names at most one structured constraint, as a completion
+    /// request does: two are refused with the completion path's words, one still
+    /// reaches the request as its guide.
+    #[test]
+    fn a_plain_request_with_two_structured_constraints_is_refused_as_a_completion_is() {
+        let schema = "{\"type\":\"object\"}";
+        let two: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "sampling_params": {"json_schema": schema, "regex": "[a-z]+"}
+        }))
+        .unwrap();
+        let refused = TrtllmServiceClient::build_plain_generate_request_parts(
+            "r".into(),
+            &two,
+            None,
+            vec![3],
+        )
+        .unwrap_err();
+        let completion: CompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "prompt": "hi",
+            "json_schema": schema,
+            "regex": "[a-z]+"
+        }))
+        .unwrap();
+        let on_completions =
+            TrtllmServiceClient::build_guided_decoding_from_completion(&completion).unwrap_err();
+        assert_eq!(refused, on_completions);
+        assert_eq!(refused, "Multiple structured constraints are not allowed");
+
+        let one: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "sampling_params": {"regex": "[a-z]+"}
+        }))
+        .unwrap();
+        let request = TrtllmServiceClient::build_plain_generate_request_parts(
+            "r".into(),
+            &one,
+            None,
+            vec![3],
+        )
+        .unwrap();
+        assert_eq!(
+            request.guided_decoding,
+            Some(proto::GuidedDecodingParams {
+                guide_type: proto::guided_decoding_params::GuideType::Regex as i32,
+                guide: "[a-z]+".to_string(),
+            })
+        );
     }
 
     #[test]
