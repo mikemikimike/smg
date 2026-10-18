@@ -14,13 +14,17 @@ on:
 permissions:
   contents: read
 
-# One group per PR and one for main: a newer push cancels the superseded run.
-# On main this tests HEAD rather than every intermediate commit: back-to-back
-# merges otherwise stack full GPU matrices on one runner pool and time each
-# other out. Re-run an intermediate commit via workflow_dispatch if needed.
+# One group per PR and one for main. On a PR a newer push cancels the
+# superseded run. On main a run that has started runs to its end, and the
+# newest push waits as the group's one pending run, superseding the pushes
+# that were waiting before it: back-to-back merges test the head of each
+# batch rather than every intermediate commit (full GPU matrices would
+# otherwise stack on one runner pool and time each other out), and a merge
+# cadence faster than one run still leaves main with a completed run per
+# batch. Re-run an intermediate commit via workflow_dispatch if needed.
 concurrency:
   group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'main' }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   RUSTC_WRAPPER: sccache
