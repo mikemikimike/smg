@@ -345,11 +345,7 @@ impl<'a> SelectionInputs<'a> {
         refs: Option<&'a multimodal::MediaPlan>,
         media_refs_pipeline: PipelinePin,
     ) -> Self {
-        // Media references only go to workers that advertise worker-side processing.
         let media_refs = refs.is_some();
-        // Pixel media (an image or a video) only goes to workers that accept
-        // vision input: regular mode's single worker takes the whole request,
-        // and the disaggregated legs their shares of it (see `PairDemands`).
         let needs_vision = multimodal::request_needs_vision(intermediate, refs);
         let context_requirements = if stage.mode == WorkerSelectionMode::EncodePrefillDecode {
             ContextRequirements::default()
@@ -365,9 +361,7 @@ impl<'a> SelectionInputs<'a> {
 
         let text = prep.routing_text();
 
-        // Get tokens for PrefixHash policy support
         let ids = prep.token_ids();
-        let tokens = if ids.is_empty() { None } else { Some(ids) };
 
         let headers = input.headers.as_ref();
         let rid_key = stage
@@ -375,13 +369,9 @@ impl<'a> SelectionInputs<'a> {
             .derive_rid_key(input.request_type.rid())
             .map(str::to_string);
 
-        // Selection inputs that survive the request drop: retry attempts
-        // re-select from these. Text is copied only when a configured policy
-        // would actually read it: always without token ids, and with them
-        // only for a policy that reads text next to the ids (cache_aware
-        // routes on the ids and would copy the whole rendered prompt for
-        // nothing).
-        let keep_text = tokens.is_none()
+        // Text is copied only when a configured policy would actually read it
+        // (see the `keep_text` field).
+        let keep_text = ids.is_empty()
             || stage
                 .policy_registry
                 .any_policy_needs_request_text_with_tokens(headers);
@@ -393,11 +383,6 @@ impl<'a> SelectionInputs<'a> {
         // the forwarding change can derive it (as the HTTP proxy path does via
         // `GenerationRequest::cache_partition`) without touching selection.
         let cache_namespace: Option<CacheNamespace> = None;
-        // The request's media demands. The single worker takes the whole
-        // request, so it must meet every one of them; the disaggregated legs
-        // take the references' predicate (a worker that processes them, on
-        // the side of the pipeline pin the plan carries) from the inputs and
-        // their vision demands from `PairDemands` in the pair selection.
         let media = MediaDemands {
             media_refs,
             vision: needs_vision,
