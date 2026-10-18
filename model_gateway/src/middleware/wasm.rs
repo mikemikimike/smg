@@ -13,13 +13,12 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
-use serde_json::json;
 use tracing::{error, warn};
 
 use super::request_id::{generate_request_id, RequestId};
 use crate::{
+    routers::error,
     server::AppState,
     wasm::{
         module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
@@ -108,13 +107,10 @@ async fn run_request_hook(
         Ok(bytes) => bytes.to_vec(),
         Err(e) => {
             error!("Failed to read request body for WASM processing: {}", e);
-            return RequestHook::Answer(
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({"error": format!("Failed to read request body: {e}")})),
-                )
-                    .into_response(),
-            );
+            return RequestHook::Answer(error::bad_request(
+                "wasm_request_body_unreadable",
+                format!("Failed to read request body: {e}"),
+            ));
         }
     };
 
@@ -205,11 +201,10 @@ async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response)
         Ok(bytes) => bytes.to_vec(),
         Err(e) => {
             error!("Failed to read response body for WASM processing: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Failed to read response body"})),
-            )
-                .into_response();
+            return error::internal_error(
+                "wasm_response_body_unreadable",
+                "Failed to read response body",
+            );
         }
     };
 
@@ -286,14 +281,16 @@ fn now_epoch_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{io, sync::Arc};
 
     use axum::{
-        body::Body,
+        body::{Body, Bytes},
         extract::Request,
         http::{header, StatusCode},
         response::Response,
     };
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
     use uuid::Uuid;
 
     use super::{is_streaming, run_request_hook, run_response_hook, RequestHook};
@@ -471,5 +468,72 @@ mod tests {
             "application/json"
         )));
         assert!(!is_streaming(&Response::new(Body::empty())));
+    }
+
+    /// A body that cannot be read answers in the gateway's error envelope,
+    /// not a bare text under `error`: the request hook a 400 with the code
+    /// `wasm_request_body_unreadable`, the response hook a 500 with
+    /// `wasm_response_body_unreadable`, each with the envelope's `type`.
+    async fn envelope_of(response: Response) -> (StatusCode, String, serde_json::Value) {
+        let status = response.status();
+        let code = response
+            .headers()
+            .get("x-smg-error-code")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_of(response.into_body()).await).expect("a JSON body");
+        (status, code, body)
+    }
+
+    fn unreadable_body() -> Body {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(1);
+        tx.try_send(Err(io::Error::other("the stream broke")))
+            .expect("the channel takes one item");
+        drop(tx);
+        Body::from_stream(ReceiverStream::new(rx))
+    }
+
+    #[tokio::test]
+    async fn the_request_hook_answers_an_unreadable_body_with_the_error_envelope() {
+        let manager = manager_with_an_inert_module();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(unreadable_body())
+            .expect("a request");
+        let RequestHook::Answer(response) = run_request_hook(&manager, request, "req-1").await
+        else {
+            panic!("an unreadable body is answered, not forwarded");
+        };
+        let (status, code, body) = envelope_of(response).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(code, "wasm_request_body_unreadable");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "wasm_request_body_unreadable");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("Failed to read request body")),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_response_hook_answers_an_unreadable_body_with_the_error_envelope() {
+        let manager = manager_with_an_inert_module();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(unreadable_body())
+            .expect("a response");
+        let response = run_response_hook(&manager, response).await;
+        let (status, code, body) = envelope_of(response).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "wasm_response_body_unreadable");
+        assert_eq!(body["error"]["type"], "server_error");
+        assert_eq!(body["error"]["code"], "wasm_response_body_unreadable");
+        assert_eq!(body["error"]["message"], "Failed to read response body");
     }
 }
