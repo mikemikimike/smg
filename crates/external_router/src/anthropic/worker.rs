@@ -13,15 +13,13 @@ use axum::{
 use openai_protocol::messages::{CreateMessageRequest, Message};
 use tracing::{debug, error, info, warn};
 
-use super::utils::{read_response_body_limited, should_propagate_header, ReadBodyResult};
+use super::utils::should_propagate_header;
 use crate::{
     error,
     metrics::{bool_to_static_str, metrics_labels, Metrics},
+    upstream_body::{read_response_body_limited, ReadBodyResult, MAX_ERROR_RESPONSE_SIZE},
     worker::ExternalWorker,
 };
-
-/// Maximum error response body size to prevent DoS (1 MB)
-const MAX_ERROR_RESPONSE_SIZE: usize = 1024 * 1024;
 
 /// Build the target URL and propagated headers for a worker request.
 pub(crate) fn build_request(
@@ -157,13 +155,16 @@ pub(crate) async fn handle_error_response(
             format!("Backend returned error: {status}")
         }
     };
-
+    // The provider's own words go to the operator's log; the caller gets the
+    // body with the provider's account identifiers (the operator's, not the
+    // caller's) removed.
     warn!(
         model = %model_id,
         status = %status,
         body_preview = %body.chars().take(200).collect::<String>(),
         "Backend error"
     );
+    let body = error::sanitize_error_body(&body);
 
     Metrics::record_router_duration(
         metrics_labels::ROUTER_HTTP,
@@ -225,4 +226,34 @@ fn record_success_metrics(model_id: &str, message: &Message, start_time: Instant
         metrics_labels::TOKEN_OUTPUT,
         message.usage.output_tokens as u64,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::to_bytes, http::StatusCode};
+
+    use super::*;
+
+    const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
+
+    /// A provider's refusal reaches the Messages caller under its status with
+    /// the operator's organization and project gone.
+    #[tokio::test]
+    async fn an_upstream_errors_body_loses_the_operators_identifiers() {
+        let upstream = reqwest::Response::from(
+            http::Response::builder()
+                .status(429)
+                .body(reqwest::Body::from(UPSTREAM_REFUSAL))
+                .expect("a response"),
+        );
+        let response = handle_error_response(upstream, "m", Instant::now()).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        let text = std::str::from_utf8(&body).expect("utf-8");
+        assert!(!text.contains("org-abc123"), "{text}");
+        assert!(!text.contains("proj_xyz789"), "{text}");
+        assert!(text.contains("Rate limit reached for model"), "{text}");
+    }
 }
