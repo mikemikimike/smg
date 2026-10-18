@@ -21,11 +21,12 @@ permissions:
 # batch rather than every intermediate commit (full GPU matrices would
 # otherwise stack on one runner pool and time each other out), and a merge
 # cadence faster than one run still leaves main with a completed run per
-# batch. An intermediate commit that needs its own run gets it by re-running
-# the cancelled push run by its run id (a re-run keeps the run's commit; a
-# dispatch takes a branch or a tag, not a commit). A manual dispatch runs in
-# a group of its own, so it neither waits behind main's run nor takes the
-# place of main's pending one.
+# batch. An intermediate commit that needs its own run gets it by putting a
+# tag (or branch) on the commit and dispatching the workflow on that ref: a
+# manual dispatch runs in a group of its own, so it neither waits behind
+# main's run nor takes the place of main's pending one. Re-running the
+# cancelled push run does not do it: the re-run is still a push event, joins
+# main's group, and displaces (then is displaced by) main's pending run.
 concurrency:
   group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'workflow_dispatch' && format('dispatch-{0}', github.run_id) || 'main' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
