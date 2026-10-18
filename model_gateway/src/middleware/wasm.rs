@@ -179,10 +179,12 @@ async fn run_request_hook(
 }
 
 /// Run the modules attached at `OnResponse` over `response`: a streaming
-/// response passes untouched (the hook would have to buffer the whole
-/// stream); otherwise the body is read within the manager's body limit,
-/// each module shown the status, headers and body as the modules before it
-/// left them, and the response put back together with the modifications.
+/// response (the hook would have to buffer the whole stream), or one known
+/// before the read to be over the manager's body limit (a declared length,
+/// a body already in memory), passes untouched; otherwise the body is read
+/// within that limit, each module shown the status, headers and body as the
+/// modules before it left them, and the response put back together with
+/// the modifications.
 async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response) -> Response {
     let attach_point = WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnResponse);
     let modules = match wasm_manager.get_modules_by_attach_point(attach_point.clone()) {
@@ -660,7 +662,7 @@ mod tests {
     /// stream) cannot be relayed once read: its refusal carries its own code,
     /// not the unreadable one.
     #[tokio::test]
-    async fn the_response_hook_names_an_undeclared_body_over_the_cap() {
+    async fn the_response_hook_names_a_streamed_body_over_the_cap() {
         let manager = manager_with_an_inert_module_under(small_cap());
         let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
         for _ in 0..3 {
