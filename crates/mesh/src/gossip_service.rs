@@ -248,7 +248,8 @@ impl GossipService {
                     } else if node.version > current.version
                         || (node.version == current.version
                             && node.status == NodeStatus::Alive as i32
-                            && current.status == NodeStatus::Down as i32)
+                            && (current.status == NodeStatus::Down as i32
+                                || current.status == NodeStatus::Suspected as i32))
                     {
                         *current = node;
                         updated = true;
@@ -673,6 +674,35 @@ mod tests {
         let node = peer.get("node-b").unwrap();
         assert_eq!(node.status, NodeStatus::Alive as i32);
         assert_eq!(node.version, u64::MAX);
+    }
+
+    #[test]
+    fn merge_state_accepts_alive_over_suspected_at_equal_version() {
+        let local_addr: SocketAddr = "127.0.0.1:8001".parse().unwrap();
+        let state = Arc::new(RwLock::new(BTreeMap::from([(
+            "node-b".to_string(),
+            NodeState {
+                name: "node-b".to_string(),
+                address: "127.0.0.1:8002".to_string(),
+                status: NodeStatus::Suspected as i32,
+                version: 5,
+                metadata: Default::default(),
+            },
+        )])));
+        let service = GossipService::new(state.clone(), local_addr, local_addr, "node-a");
+
+        assert!(service.merge_state(vec![NodeState {
+            name: "node-b".to_string(),
+            address: "127.0.0.1:8002".to_string(),
+            status: NodeStatus::Alive as i32,
+            version: 5,
+            metadata: Default::default(),
+        }]));
+
+        let peer = state.read();
+        let node = peer.get("node-b").unwrap();
+        assert_eq!(node.status, NodeStatus::Alive as i32);
+        assert_eq!(node.version, 5);
     }
 
     /// A mesh node on an ephemeral loopback port, joining `init_peer` when
