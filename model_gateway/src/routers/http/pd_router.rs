@@ -93,6 +93,44 @@ struct PdLoadGuards {
     decode: WorkerLoadGuard,
 }
 
+/// What every dispatch body sets up before its first leg goes out: the two
+/// serialized legs and the two load guards taken apart, the request headers
+/// with the trace context injected (every leg is sent under them), and the
+/// prefill engine's runtime label the PD metrics are recorded under.
+struct LegSetup {
+    prefill_body: Bytes,
+    decode_body: Bytes,
+    prefill_guard: PrefillLoadGuard,
+    decode_guard: WorkerLoadGuard,
+    headers_with_trace: HeaderMap,
+    runtime: &'static str,
+}
+
+impl LegSetup {
+    fn new(
+        headers: Option<&HeaderMap>,
+        leg_bodies: (Bytes, Bytes),
+        guards: PdLoadGuards,
+        prefill: &dyn Worker,
+    ) -> Self {
+        let (prefill_body, decode_body) = leg_bodies;
+        let PdLoadGuards {
+            prefill: prefill_guard,
+            decode: decode_guard,
+        } = guards;
+        let mut headers_with_trace = headers.cloned().unwrap_or_default();
+        inject_trace_context_http(&mut headers_with_trace);
+        Self {
+            prefill_body,
+            decode_body,
+            prefill_guard,
+            decode_guard,
+            headers_with_trace,
+            runtime: prefill.metadata().spec.runtime_type.as_str(),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum PdSelectionFailure {
     /// Every worker on one leg is vetoed: a ready-made, already-counted 503.
@@ -1158,6 +1196,93 @@ impl PDRouter {
         }
     }
 
+    /// The decode leg's response head, once the prefill leg is done with:
+    /// the leg's outcome recorded (a streamed head's success is the relay's
+    /// to record, before it spawns its task, see `create_streaming_response`;
+    /// the other outcomes here, before the body is forwarded), an error
+    /// status answered, the PD TTFT taken from the dispatch to this head
+    /// (the prefill wait is part of what the client experiences), and the
+    /// body forwarded.
+    async fn forward_decode_head(
+        &self,
+        decode_response: reqwest::Response,
+        context: &PDRequestContext<'_>,
+        decode: Arc<dyn Worker>,
+        decode_guard: WorkerLoadGuard,
+        runtime: &'static str,
+        dispatch_start: Instant,
+    ) -> Response {
+        events::RequestReceivedEvent {}.emit();
+        let status = StatusCode::from_u16(decode_response.status().as_u16())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if !(context.is_stream && status.is_success()) {
+            Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
+        }
+        if !status.is_success() {
+            error!(
+                "Decode server returned error status decode_url={} status={}",
+                decode.url(),
+                status
+            );
+            return self
+                .handle_decode_error_response(decode_response, context, decode, decode_guard)
+                .await;
+        }
+        Metrics::record_pd_ttft(
+            metrics_labels::BACKEND_PD,
+            context.model_id,
+            runtime,
+            dispatch_start.elapsed(),
+        );
+        self.forward_decode_body(decode_response, status, context, decode, decode_guard, None)
+            .await
+    }
+
+    /// A prefill leg that failed below HTTP: logged, recorded on its worker
+    /// as a 502, answered as one.
+    fn prefill_transport_failed(prefill: &dyn Worker, e: &reqwest::Error) -> Response {
+        error!("PD prefill transport error: {e}");
+        Self::record_sequential_leg(
+            prefill,
+            metrics_labels::WORKER_PREFILL,
+            StatusCode::BAD_GATEWAY,
+        );
+        error::bad_gateway(
+            "prefill_request_failed",
+            format!("Prefill transport error: {e}"),
+        )
+    }
+
+    /// A prefill leg whose answer could not be read to its end: the same
+    /// record and answer shape as a transport failure, under its own code.
+    fn prefill_read_failed(prefill: &dyn Worker, e: &reqwest::Error) -> Response {
+        error!("Failed to read prefill response: {e}");
+        Self::record_sequential_leg(
+            prefill,
+            metrics_labels::WORKER_PREFILL,
+            StatusCode::BAD_GATEWAY,
+        );
+        error::bad_gateway(
+            "prefill_read_failed",
+            format!("Failed to read prefill response: {e}"),
+        )
+    }
+
+    /// A decode leg that failed below HTTP: logged, recorded on its worker
+    /// as a 502, answered as one.
+    fn decode_transport_failed(decode: &dyn Worker, e: &reqwest::Error) -> Response {
+        error!("PD decode transport error: {e}");
+        Self::record_sequential_leg(
+            decode,
+            metrics_labels::WORKER_DECODE,
+            StatusCode::BAD_GATEWAY,
+        );
+        error::bad_gateway(
+            "decode_request_failed",
+            format!("Decode transport error: {e}"),
+        )
+    }
+
     // Internal method that performs the actual dual dispatch (without retry logic)
     #[expect(
         clippy::too_many_arguments,
@@ -1173,14 +1298,14 @@ impl PDRouter {
         guards: PdLoadGuards,
         prefill_outcome: &mut PrefillOutcome,
     ) -> Response {
-        let (prefill_body, decode_body) = leg_bodies;
-        let PdLoadGuards {
-            prefill: prefill_guard,
-            decode: decode_guard,
-        } = guards;
-
-        let mut headers_with_trace = headers.cloned().unwrap_or_default();
-        inject_trace_context_http(&mut headers_with_trace);
+        let LegSetup {
+            prefill_body,
+            decode_body,
+            prefill_guard,
+            decode_guard,
+            headers_with_trace,
+            runtime,
+        } = LegSetup::new(headers, leg_bodies, guards, prefill.as_ref());
         let headers = Some(&headers_with_trace);
 
         // Build both requests
@@ -1222,7 +1347,6 @@ impl PDRouter {
             Buffered(Option<Bytes>),
             Draining(tokio_util::task::AbortOnDropHandle<()>),
         }
-        let runtime = prefill.metadata().spec.runtime_type.as_str();
         let dispatch_start = Instant::now();
         let prefill_fut = async {
             let resp = send_with_stale_conn_retry(prefill_request)
@@ -1515,16 +1639,15 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
     ) -> Response {
-        let (prefill_body, decode_body) = leg_bodies;
-        let PdLoadGuards {
-            prefill: prefill_guard,
-            decode: decode_guard,
-        } = guards;
-
-        let mut headers_with_trace = headers.cloned().unwrap_or_default();
-        inject_trace_context_http(&mut headers_with_trace);
+        let LegSetup {
+            prefill_body,
+            decode_body,
+            prefill_guard,
+            decode_guard,
+            headers_with_trace,
+            runtime,
+        } = LegSetup::new(headers, leg_bodies, guards, prefill.as_ref());
         let headers = Some(&headers_with_trace);
-        let runtime = prefill.metadata().spec.runtime_type.as_str();
 
         let decode_leg = match RawBody::parse(&decode_body) {
             Ok(body) => body,
@@ -1556,18 +1679,7 @@ impl PDRouter {
             );
             let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
                 Ok(response) => response,
-                Err(e) => {
-                    error!("PD prefill transport error: {e}");
-                    Self::record_sequential_leg(
-                        prefill.as_ref(),
-                        metrics_labels::WORKER_PREFILL,
-                        StatusCode::BAD_GATEWAY,
-                    );
-                    return error::bad_gateway(
-                        "prefill_request_failed",
-                        format!("Prefill transport error: {e}"),
-                    );
-                }
+                Err(e) => return Self::prefill_transport_failed(prefill.as_ref(), &e),
             };
             let prefill_status = StatusCode::from_u16(prefill_response.status().as_u16())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1586,18 +1698,7 @@ impl PDRouter {
             }
             let prefill_bytes = match prefill_response.bytes().await {
                 Ok(bytes) => bytes,
-                Err(e) => {
-                    error!("Failed to read prefill response: {e}");
-                    Self::record_sequential_leg(
-                        prefill.as_ref(),
-                        metrics_labels::WORKER_PREFILL,
-                        StatusCode::BAD_GATEWAY,
-                    );
-                    return error::bad_gateway(
-                        "prefill_read_failed",
-                        format!("Failed to read prefill response: {e}"),
-                    );
-                }
+                Err(e) => return Self::prefill_read_failed(prefill.as_ref(), &e),
             };
             Self::record_sequential_leg(
                 prefill.as_ref(),
@@ -1705,57 +1806,16 @@ impl PDRouter {
         );
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
             Ok(response) => response,
-            Err(e) => {
-                error!("PD decode transport error: {e}");
-                Self::record_sequential_leg(
-                    decode.as_ref(),
-                    metrics_labels::WORKER_DECODE,
-                    StatusCode::BAD_GATEWAY,
-                );
-                return error::bad_gateway(
-                    "decode_request_failed",
-                    format!("Decode transport error: {e}"),
-                );
-            }
+            Err(e) => return Self::decode_transport_failed(decode.as_ref(), &e),
         };
 
-        events::RequestReceivedEvent {}.emit();
-
-        let status = StatusCode::from_u16(decode_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        // A streamed decode head's success is the relay's to record, before
-        // it spawns its task (`create_streaming_response`); the leg's other
-        // outcomes are recorded here, before the body is forwarded.
-        if !(context.is_stream && status.is_success()) {
-            Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
-        }
-        if !status.is_success() {
-            error!(
-                "Decode server returned error status decode_url={} status={}",
-                decode.url(),
-                status
-            );
-            return self
-                .handle_decode_error_response(decode_response, &context, decode, decode_guard)
-                .await;
-        }
-
-        // Honest sequential TTFT: prefill dispatch to the decode response
-        // head — the prefill wait is part of what the client experiences.
-        Metrics::record_pd_ttft(
-            metrics_labels::BACKEND_PD,
-            context.model_id,
-            runtime,
-            dispatch_start.elapsed(),
-        );
-
-        self.forward_decode_body(
+        self.forward_decode_head(
             decode_response,
-            status,
             &context,
             decode,
             decode_guard,
-            None,
+            runtime,
+            dispatch_start,
         )
         .await
     }
@@ -1784,15 +1844,15 @@ impl PDRouter {
         decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
     ) -> Response {
-        let (prefill_body, decode_body) = leg_bodies;
-        let PdLoadGuards {
-            prefill: prefill_guard,
-            decode: decode_guard,
-        } = guards;
-        let mut headers_with_trace = headers.cloned().unwrap_or_default();
-        inject_trace_context_http(&mut headers_with_trace);
+        let LegSetup {
+            prefill_body,
+            decode_body,
+            prefill_guard,
+            decode_guard,
+            headers_with_trace,
+            runtime,
+        } = LegSetup::new(headers, leg_bodies, guards, prefill.as_ref());
         let headers = Some(&headers_with_trace);
-        let runtime = prefill.metadata().spec.runtime_type.as_str();
         Metrics::record_pd_kv_connector_mode(KvConnectorMode::MoriIo.metrics_label());
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
@@ -1824,18 +1884,7 @@ impl PDRouter {
         let prefill_leg = async {
             let response = match send_with_stale_conn_retry(prefill_request).await {
                 Ok(response) => response,
-                Err(e) => {
-                    error!("PD prefill transport error: {e}");
-                    Self::record_sequential_leg(
-                        prefill.as_ref(),
-                        metrics_labels::WORKER_PREFILL,
-                        StatusCode::BAD_GATEWAY,
-                    );
-                    return Err(error::bad_gateway(
-                        "prefill_request_failed",
-                        format!("Prefill transport error: {e}"),
-                    ));
-                }
+                Err(e) => return Err(Self::prefill_transport_failed(prefill.as_ref(), &e)),
             };
             let status = StatusCode::from_u16(response.status().as_u16())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1861,18 +1910,7 @@ impl PDRouter {
                     );
                     Ok(bytes)
                 }
-                Err(e) => {
-                    error!("Failed to read prefill response: {e}");
-                    Self::record_sequential_leg(
-                        prefill.as_ref(),
-                        metrics_labels::WORKER_PREFILL,
-                        StatusCode::BAD_GATEWAY,
-                    );
-                    Err(error::bad_gateway(
-                        "prefill_read_failed",
-                        format!("Failed to read prefill response: {e}"),
-                    ))
-                }
+                Err(e) => Err(Self::prefill_read_failed(prefill.as_ref(), &e)),
             }
         };
         let decode_leg = send_with_stale_conn_retry(decode_request);
@@ -1890,18 +1928,7 @@ impl PDRouter {
                             decode_head = Some(response);
                         }
                         Ok(response) => break Err(response),
-                        Err(e) => {
-                            error!("PD decode transport error: {e}");
-                            Self::record_sequential_leg(
-                                decode.as_ref(),
-                                metrics_labels::WORKER_DECODE,
-                                StatusCode::BAD_GATEWAY,
-                            );
-                            return error::bad_gateway(
-                                "decode_request_failed",
-                                format!("Decode transport error: {e}"),
-                            );
-                        }
+                        Err(e) => return Self::decode_transport_failed(decode.as_ref(), &e),
                     },
                 }
             }
@@ -1948,54 +1975,18 @@ impl PDRouter {
                     Some(response) => response,
                     None => match decode_leg.await {
                         Ok(response) => response,
-                        Err(e) => {
-                            error!("PD decode transport error: {e}");
-                            Self::record_sequential_leg(
-                                decode.as_ref(),
-                                metrics_labels::WORKER_DECODE,
-                                StatusCode::BAD_GATEWAY,
-                            );
-                            return error::bad_gateway(
-                                "decode_request_failed",
-                                format!("Decode transport error: {e}"),
-                            );
-                        }
+                        Err(e) => return Self::decode_transport_failed(decode.as_ref(), &e),
                     },
                 }
             }
         };
-        events::RequestReceivedEvent {}.emit();
-        let status = StatusCode::from_u16(decode_response.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        // A streamed decode head's success is the relay's to record, before
-        // it spawns its task (`create_streaming_response`); the leg's other
-        // outcomes are recorded here, before the body is forwarded.
-        if !(context.is_stream && status.is_success()) {
-            Self::record_sequential_leg(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
-        }
-        if !status.is_success() {
-            error!(
-                "Decode server returned error status decode_url={} status={}",
-                decode.url(),
-                status
-            );
-            return self
-                .handle_decode_error_response(decode_response, &context, decode, decode_guard)
-                .await;
-        }
-        Metrics::record_pd_ttft(
-            metrics_labels::BACKEND_PD,
-            context.model_id,
-            runtime,
-            dispatch_start.elapsed(),
-        );
-        self.forward_decode_body(
+        self.forward_decode_head(
             decode_response,
-            status,
             &context,
             decode,
             decode_guard,
-            None,
+            runtime,
+            dispatch_start,
         )
         .await
     }
@@ -6408,5 +6399,57 @@ mod tests {
             .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"unavailable\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// What every dispatch body takes from the setup: the legs and the
+    /// guards as given (the guards keep both workers loaded until the setup
+    /// is dropped), the request headers kept under the trace injection, the
+    /// prefill engine's runtime as the label.
+    #[test]
+    fn leg_setup_keeps_the_legs_the_guards_and_the_headers() {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://prefill:30000".to_string())
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Vllm)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://decode:30000".to_string())
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .build(),
+        );
+        let guards = PdLoadGuards {
+            prefill: PrefillLoadGuard::Unbounded {
+                _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            },
+            decode: WorkerLoadGuard::new(Arc::clone(&decode), None),
+        };
+        assert_eq!((prefill.load(), decode.load()), (1, 1));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("req-1"));
+
+        let setup = LegSetup::new(
+            Some(&headers),
+            (
+                Bytes::from_static(b"{\"leg\":\"prefill\"}"),
+                Bytes::from_static(b"{\"leg\":\"decode\"}"),
+            ),
+            guards,
+            prefill.as_ref(),
+        );
+        assert_eq!(setup.prefill_body.as_ref(), b"{\"leg\":\"prefill\"}");
+        assert_eq!(setup.decode_body.as_ref(), b"{\"leg\":\"decode\"}");
+        assert_eq!(
+            setup
+                .headers_with_trace
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("req-1")
+        );
+        assert_eq!(setup.runtime, RuntimeType::Vllm.as_str());
+        assert_eq!((prefill.load(), decode.load()), (1, 1));
+        drop(setup);
+        assert_eq!((prefill.load(), decode.load()), (0, 0));
     }
 }
