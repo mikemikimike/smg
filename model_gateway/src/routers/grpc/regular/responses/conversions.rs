@@ -70,205 +70,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
             // Assistant-side items are merged into one assistant turn by
             // `push_chat_message`; see its doc comment.
             for item in items {
-                match item {
-                    ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
-                        let content = match content {
-                            StringOrContentParts::String(s) => MessageContent::Text(s.clone()),
-                            StringOrContentParts::Array(parts) => {
-                                response_parts_to_message_content(parts)
-                            }
-                        };
-                        push_role_message(&mut messages, role, content);
-                    }
-                    ResponseInputOutputItem::Message { role, content, .. } => {
-                        push_role_message(
-                            &mut messages,
-                            role,
-                            response_parts_to_message_content(content),
-                        );
-                    }
-                    ResponseInputOutputItem::FunctionToolCall {
-                        call_id,
-                        name,
-                        namespace,
-                        arguments,
-                        output,
-                        ..
-                    } => {
-                        // Tool call from history: the assistant's decision,
-                        // then the tool result if the output is present.
-                        push_chat_message(
-                            &mut messages,
-                            assistant_tool_call(
-                                call_id,
-                                name,
-                                namespace.as_deref(),
-                                arguments.clone(),
-                            ),
-                        );
-                        if let Some(output_text) = output {
-                            messages.push(ChatMessage::Tool {
-                                content: MessageContent::Text(output_text.clone()),
-                                tool_call_id: call_id.clone(),
-                            });
-                        }
-                    }
-                    ResponseInputOutputItem::Reasoning {
-                        content,
-                        encrypted_content,
-                        ..
-                    } => {
-                        // Prefer the plain text; a `store=false` client may hand
-                        // back only the opaque blob this gateway produced.
-                        let mut reasoning_text = content
-                            .iter()
-                            .map(|c| match c {
-                                ReasoningText { text } => text.as_str(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if reasoning_text.is_empty() {
-                            reasoning_text = encrypted_content
-                                .as_deref()
-                                .and_then(decode_reasoning_content)
-                                .unwrap_or_default();
-                        }
-                        if !reasoning_text.is_empty() {
-                            let assistant = ChatMessage::Assistant {
-                                content: None,
-                                name: None,
-                                tool_calls: None,
-                                reasoning_content: Some(reasoning_text),
-                                ext: Default::default(),
-                            };
-                            push_chat_message(&mut messages, assistant);
-                        }
-                    }
-                    ResponseInputOutputItem::FunctionCallOutput {
-                        call_id, output, ..
-                    } => {
-                        // Function call output - add as tool message
-                        // Note: The function name is looked up from prev_outputs in Harmony path
-                        // For Chat path, we just use the call_id
-                        messages.push(ChatMessage::Tool {
-                            content: MessageContent::Text(output.to_text_only()?),
-                            tool_call_id: call_id.clone(),
-                        });
-                    }
-                    // A hosted tool call of a stored turn replays as the
-                    // assistant's call and, once it ran, its result: the
-                    // model sees what it asked for and what it got, as it
-                    // does for a function call.
-                    ResponseInputOutputItem::McpCall {
-                        id,
-                        name,
-                        arguments,
-                        output,
-                        error,
-                        status,
-                        ..
-                    } => {
-                        push_chat_message(
-                            &mut messages,
-                            assistant_tool_call(id, name, None, arguments.clone()),
-                        );
-                        if let Some(result) =
-                            hosted_call_result(output.as_deref(), error.as_ref(), status.as_deref())
-                        {
-                            messages.push(ChatMessage::Tool {
-                                content: MessageContent::Text(result),
-                                tool_call_id: id.clone(),
-                            });
-                        }
-                    }
-                    // The gateway's own record of a hosted tool session (the
-                    // tools it listed, the approval it asked for): nothing
-                    // the model said or was told.
-                    ResponseInputOutputItem::McpListTools { .. }
-                    | ResponseInputOutputItem::McpApprovalRequest { .. } => {}
-                    ResponseInputOutputItem::McpApprovalResponse { .. }
-                    | ResponseInputOutputItem::ComputerCall { .. }
-                    | ResponseInputOutputItem::ComputerCallOutput { .. } => {
-                        warn!(
-                            function = "responses_to_chat",
-                            "Approval item reached chat conversion"
-                        );
-                        return Err("Unsupported input item type".to_string());
-                    }
-                    ResponseInputOutputItem::ImageGenerationCall { .. } => {
-                        warn!(
-                            function = "responses_to_chat",
-                            "image_generation_call input item reached chat conversion"
-                        );
-                        return Err("Unsupported input item type".to_string());
-                    }
-                    ResponseInputOutputItem::Compaction { .. }
-                    | ResponseInputOutputItem::ItemReference { .. } => {
-                        return Err("Unsupported input item type".to_string());
-                    }
-                    // Custom tool history replays as the function tool_call the
-                    // request-side downgrade produces ({"input": "..."}) plus a
-                    // plain tool message for the client's output.
-                    ResponseInputOutputItem::CustomToolCall {
-                        call_id,
-                        input,
-                        name,
-                        namespace,
-                        ..
-                    } => {
-                        push_chat_message(
-                            &mut messages,
-                            assistant_tool_call(
-                                call_id,
-                                name,
-                                namespace.as_deref(),
-                                serde_json::json!({ "input": input }).to_string(),
-                            ),
-                        );
-                    }
-                    ResponseInputOutputItem::CustomToolCallOutput {
-                        call_id, output, ..
-                    } => {
-                        let output_text = match output {
-                            CustomToolCallOutputContent::Text(s) => s.clone(),
-                            CustomToolCallOutputContent::Parts(parts) => parts
-                                .iter()
-                                .filter_map(|p| match p {
-                                    CustomToolInputContentPart::InputText { text } => {
-                                        Some(text.as_str())
-                                    }
-                                    _ => None,
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        };
-                        messages.push(ChatMessage::Tool {
-                            content: MessageContent::Text(output_text),
-                            tool_call_id: call_id.clone(),
-                        });
-                    }
-                    ResponseInputOutputItem::ShellCall { .. }
-                    | ResponseInputOutputItem::ShellCallOutput { .. } => {
-                        warn!(
-                            function = "responses_to_chat",
-                            "Shell tool item reached chat conversion"
-                        );
-                        return Err("Unsupported input item type".to_string());
-                    }
-                    ResponseInputOutputItem::ApplyPatchCall { .. }
-                    | ResponseInputOutputItem::ApplyPatchCallOutput { .. } => {
-                        warn!(
-                            function = "responses_to_chat",
-                            "apply_patch item reached chat conversion"
-                        );
-                        return Err("Unsupported input item type".to_string());
-                    }
-                    // T5 schema-only: forced-cascade arm, no behavior.
-                    ResponseInputOutputItem::LocalShellCall { .. }
-                    | ResponseInputOutputItem::LocalShellCallOutput { .. } => {
-                        return Err("Unsupported input item type".to_string());
-                    }
-                }
+                push_item(&mut messages, item)?;
             }
         }
     }
@@ -279,22 +81,9 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
     }
 
     // 3. Extract function tools from ResponseTools.
-    // MCP tools are merged later by the tool loop (see tool_loop.rs:prepare_chat_tools_and_choice).
-    // `tool_choice: none` forbids calls; offering the schemas anyway makes the
-    // model re-issue calls on replayed histories, and with parsing disabled the
-    // raw call markup leaks into the message text.
-    let tool_choice = req.tool_choice.as_ref().map(|tc| tc.to_chat_tool_choice());
-    let function_tools = extract_tools_from_response_tools(req.tools.as_deref());
-    let tools = if function_tools.is_empty()
-        || matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)))
-    {
-        None
-    } else {
-        Some(function_tools)
-    };
+    let (tools, tool_choice) = chat_tools(req);
 
     // 4. Build ChatCompletionRequest
-    let is_streaming = req.stream.unwrap_or(false);
     let model = if req.model.is_empty() {
         UNKNOWN_MODEL_ID.to_string()
     } else {
@@ -311,7 +100,243 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         ));
     }
 
-    Ok(ChatCompletionRequest {
+    Ok(chat_request(req, model, messages, tools, tool_choice))
+}
+
+/// Fold one Responses input item into the chat messages: a message for its
+/// role, a tool call of the history (and its result, once it ran), a
+/// reasoning item as the assistant's thought, a tool output as a tool
+/// message; the gateway's own records of a hosted tool session add nothing,
+/// and the item kinds this path does not carry are refused.
+fn push_item(
+    messages: &mut Vec<ChatMessage>,
+    item: &ResponseInputOutputItem,
+) -> Result<(), String> {
+    match item {
+        ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
+            let content = match content {
+                StringOrContentParts::String(s) => MessageContent::Text(s.clone()),
+                StringOrContentParts::Array(parts) => response_parts_to_message_content(parts),
+            };
+            push_role_message(messages, role, content);
+        }
+        ResponseInputOutputItem::Message { role, content, .. } => {
+            push_role_message(messages, role, response_parts_to_message_content(content));
+        }
+        ResponseInputOutputItem::FunctionToolCall {
+            call_id,
+            name,
+            namespace,
+            arguments,
+            output,
+            ..
+        } => {
+            // Tool call from history: the assistant's decision,
+            // then the tool result if the output is present.
+            push_chat_message(
+                messages,
+                assistant_tool_call(call_id, name, namespace.as_deref(), arguments.clone()),
+            );
+            if let Some(output_text) = output {
+                messages.push(tool_result(call_id, output_text.clone()));
+            }
+        }
+        ResponseInputOutputItem::Reasoning {
+            content,
+            encrypted_content,
+            ..
+        } => {
+            let reasoning_text = reasoning_text(content, encrypted_content.as_deref());
+            if !reasoning_text.is_empty() {
+                let assistant = ChatMessage::Assistant {
+                    content: None,
+                    name: None,
+                    tool_calls: None,
+                    reasoning_content: Some(reasoning_text),
+                    ext: Default::default(),
+                };
+                push_chat_message(messages, assistant);
+            }
+        }
+        ResponseInputOutputItem::FunctionCallOutput {
+            call_id, output, ..
+        } => {
+            // Function call output - add as tool message
+            // Note: The function name is looked up from prev_outputs in Harmony path
+            // For Chat path, we just use the call_id
+            messages.push(tool_result(call_id, output.to_text_only()?));
+        }
+        // A hosted tool call of a stored turn replays as the
+        // assistant's call and, once it ran, its result: the
+        // model sees what it asked for and what it got, as it
+        // does for a function call.
+        ResponseInputOutputItem::McpCall {
+            id,
+            name,
+            arguments,
+            output,
+            error,
+            status,
+            ..
+        } => {
+            push_chat_message(
+                messages,
+                assistant_tool_call(id, name, None, arguments.clone()),
+            );
+            if let Some(result) =
+                hosted_call_result(output.as_deref(), error.as_ref(), status.as_deref())
+            {
+                messages.push(tool_result(id, result));
+            }
+        }
+        // The gateway's own record of a hosted tool session (the
+        // tools it listed, the approval it asked for): nothing
+        // the model said or was told.
+        ResponseInputOutputItem::McpListTools { .. }
+        | ResponseInputOutputItem::McpApprovalRequest { .. } => {}
+        ResponseInputOutputItem::McpApprovalResponse { .. }
+        | ResponseInputOutputItem::ComputerCall { .. }
+        | ResponseInputOutputItem::ComputerCallOutput { .. } => {
+            return unsupported(Some("Approval item reached chat conversion"));
+        }
+        ResponseInputOutputItem::ImageGenerationCall { .. } => {
+            return unsupported(Some(
+                "image_generation_call input item reached chat conversion",
+            ));
+        }
+        ResponseInputOutputItem::Compaction { .. }
+        | ResponseInputOutputItem::ItemReference { .. } => {
+            return unsupported(None);
+        }
+        // Custom tool history replays as the function tool_call the
+        // request-side downgrade produces ({"input": "..."}) plus a
+        // plain tool message for the client's output.
+        ResponseInputOutputItem::CustomToolCall {
+            call_id,
+            input,
+            name,
+            namespace,
+            ..
+        } => {
+            push_chat_message(
+                messages,
+                assistant_tool_call(
+                    call_id,
+                    name,
+                    namespace.as_deref(),
+                    serde_json::json!({ "input": input }).to_string(),
+                ),
+            );
+        }
+        ResponseInputOutputItem::CustomToolCallOutput {
+            call_id, output, ..
+        } => {
+            messages.push(tool_result(call_id, custom_tool_output_text(output)));
+        }
+        ResponseInputOutputItem::ShellCall { .. }
+        | ResponseInputOutputItem::ShellCallOutput { .. } => {
+            return unsupported(Some("Shell tool item reached chat conversion"));
+        }
+        ResponseInputOutputItem::ApplyPatchCall { .. }
+        | ResponseInputOutputItem::ApplyPatchCallOutput { .. } => {
+            return unsupported(Some("apply_patch item reached chat conversion"));
+        }
+        // T5 schema-only: forced-cascade arm, no behavior.
+        ResponseInputOutputItem::LocalShellCall { .. }
+        | ResponseInputOutputItem::LocalShellCallOutput { .. } => {
+            return unsupported(None);
+        }
+    }
+    Ok(())
+}
+
+/// The refusal of an item kind this path does not carry, warned about where
+/// the kind says why.
+fn unsupported(warning: Option<&'static str>) -> Result<(), String> {
+    if let Some(warning) = warning {
+        warn!(function = "responses_to_chat", "{warning}");
+    }
+    Err("Unsupported input item type".to_string())
+}
+
+/// A tool's result for the call it answers, as the chat history carries it.
+fn tool_result(call_id: &str, content: String) -> ChatMessage {
+    ChatMessage::Tool {
+        content: MessageContent::Text(content),
+        tool_call_id: call_id.to_string(),
+    }
+}
+
+/// A reasoning item's text: the plain text, else what a `store=false`
+/// client handed back as the opaque blob this gateway produced.
+fn reasoning_text(
+    content: &[openai_protocol::responses::ResponseReasoningContent],
+    encrypted_content: Option<&str>,
+) -> String {
+    let reasoning_text = content
+        .iter()
+        .map(|c| match c {
+            ReasoningText { text } => text.as_str(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if reasoning_text.is_empty() {
+        return encrypted_content
+            .and_then(decode_reasoning_content)
+            .unwrap_or_default();
+    }
+    reasoning_text
+}
+
+/// A custom tool's output as text: its string, or its text parts joined.
+fn custom_tool_output_text(output: &CustomToolCallOutputContent) -> String {
+    match output {
+        CustomToolCallOutputContent::Text(s) => s.clone(),
+        CustomToolCallOutputContent::Parts(parts) => parts
+            .iter()
+            .filter_map(|p| match p {
+                CustomToolInputContentPart::InputText { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+/// The function tools the chat request offers, and the tool choice.
+/// MCP tools are merged later by the tool loop (see tool_loop.rs:prepare_chat_tools_and_choice).
+/// `tool_choice: none` forbids calls; offering the schemas anyway makes the
+/// model re-issue calls on replayed histories, and with parsing disabled the
+/// raw call markup leaks into the message text.
+fn chat_tools(
+    req: &ResponsesRequest,
+) -> (
+    Option<Vec<openai_protocol::common::Tool>>,
+    Option<ToolChoice>,
+) {
+    let tool_choice = req.tool_choice.as_ref().map(|tc| tc.to_chat_tool_choice());
+    let function_tools = extract_tools_from_response_tools(req.tools.as_deref());
+    let tools = if function_tools.is_empty()
+        || matches!(tool_choice, Some(ToolChoice::Value(ToolChoiceValue::None)))
+    {
+        None
+    } else {
+        Some(function_tools)
+    };
+    (tools, tool_choice)
+}
+
+/// The chat request of the converted messages and tools, with the sampling,
+/// streaming and reasoning fields the Responses request sets.
+fn chat_request(
+    req: &ResponsesRequest,
+    model: String,
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<openai_protocol::common::Tool>>,
+    tool_choice: Option<ToolChoice>,
+) -> ChatCompletionRequest {
+    let is_streaming = req.stream.unwrap_or(false);
+    ChatCompletionRequest {
         messages,
         model,
         temperature: req.temperature,
@@ -347,7 +372,7 @@ pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletion
         separate_reasoning: true,
         stream_reasoning: is_streaming,
         ..Default::default()
-    })
+    }
 }
 
 /// Convert Responses content parts to chat message content. Text, output
