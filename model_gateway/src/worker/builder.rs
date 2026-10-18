@@ -59,42 +59,12 @@ pub struct BasicWorkerBuilder {
 impl BasicWorkerBuilder {
     /// Create a new builder with only the URL (uses default WorkerSpec)
     pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            spec: WorkerSpec::new(url),
-            health_config: None,
-            health_endpoint: "/health".to_string(),
-            circuit_breaker_config: CircuitBreakerConfig::default(),
-            backend_client: None,
-            http_client: None,
-            http2: false,
-            resilience: None,
-            initial_status: None,
-            connect_signal_tx: None,
-            overload_defaults: OverloadThresholds::default(),
-        }
+        Self::from_spec(WorkerSpec::new(url))
     }
 
-    /// Create a builder from an existing WorkerSpec.
+    /// Create a builder from an existing WorkerSpec. The one place the
+    /// builder's defaults are written: [`Self::new`] comes here.
     pub fn from_spec(spec: WorkerSpec) -> Self {
-        Self {
-            spec,
-            health_config: None,
-            health_endpoint: "/health".to_string(),
-            circuit_breaker_config: CircuitBreakerConfig::default(),
-            backend_client: None,
-            http_client: None,
-            http2: false,
-            resilience: None,
-            initial_status: None,
-            connect_signal_tx: None,
-            overload_defaults: OverloadThresholds::default(),
-        }
-    }
-
-    /// Create a new builder with URL and worker type (for backwards compatibility)
-    pub fn new_with_type(url: impl Into<String>, worker_type: WorkerType) -> Self {
-        let mut spec = WorkerSpec::new(url);
-        spec.worker_type = worker_type;
         Self {
             spec,
             health_config: None,
