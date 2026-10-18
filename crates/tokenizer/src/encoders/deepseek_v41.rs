@@ -15,12 +15,10 @@ use serde_json::Value;
 // here because it is part of this module's public API, and `pub(super)` items
 // are not reachable from outside `encoders` on their own.
 pub use super::deepseek_common::DsEncodingError;
+// The family's special tokens: the private markers for this module, the
+// public ones re-exported under this renderer's path (the formatter keeps
+// every `use` in this block; the version's own constants follow the imports).
 use super::deepseek_common::{ASSISTANT_SP_TOKEN, LATEST_REMINDER_SP_TOKEN, USER_SP_TOKEN};
-// ---------------------------------------------------------------------------
-// Special-token constants: the family's shared ones come from `deepseek_common`
-// (re-exported under this renderer's path), this version's own follow. Copied
-// verbatim from the Python source.
-// ---------------------------------------------------------------------------
 pub use super::deepseek_common::{
     BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
 };
@@ -44,6 +42,13 @@ use crate::{
     chat_template::{ChatTemplateContentFormat, ThinkingKeyName, ThinkingToggle},
     traits::RendererCapabilities,
 };
+
+// ---------------------------------------------------------------------------
+// Special-token constants: this version's own; the family's shared ones are
+// the `deepseek_common` re-exports above. Copied verbatim from the Python
+// source.
+// ---------------------------------------------------------------------------
+
 /// What every image content part renders as; the image payload itself is the
 /// serving layer's business, the prompt only carries this marker.
 pub const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";

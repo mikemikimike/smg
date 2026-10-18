@@ -12,7 +12,8 @@ use thiserror::Error;
 use super::{
     deepseek_common::{
         after_last_user, at_or_after_last_user, find_last_user_index, to_json,
-        tool_calls_from_openai_format, tool_schemas, tools_from_openai_format,
+        tool_calls_from_openai_format, tool_schemas, tools_from_openai_format, ASSISTANT_SP_TOKEN,
+        USER_SP_TOKEN,
     },
     RendererProfile,
 };
@@ -82,8 +83,8 @@ pub enum DsEncodingError {
 
 // ---------------------------------------------------------------------------
 // Special-token constants: the family's shared ones come from `deepseek_common`
-// (re-exported under this renderer's path), this version's own follow. Copied
-// verbatim from the Python source.
+// (re-exported under this renderer's path). Copied verbatim from the Python
+// source.
 // ---------------------------------------------------------------------------
 
 pub use super::deepseek_common::{
@@ -105,8 +106,6 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     capabilities: RendererProfile::NO_CAPABILITIES,
     thinking_mode: None,
 };
-
-use super::deepseek_common::{ASSISTANT_SP_TOKEN, USER_SP_TOKEN};
 
 // ---------------------------------------------------------------------------
 // Templates
