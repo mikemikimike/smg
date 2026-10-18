@@ -183,12 +183,10 @@ fn render_tools(tools: &[Value]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// render_message — direct port of the V4 Python function with the same name.
+// render_message — direct port of the V4 Python function with the same name:
+// the message read into its parts, one function per role for the arms of its
+// `match role`, and the turn opener after it.
 // ---------------------------------------------------------------------------
-#[expect(
-    clippy::too_many_lines,
-    reason = "mirrors the Python render_message function 1:1 for sync-ability"
-)]
 fn render_message(
     index: usize,
     messages: &[Value],
@@ -239,21 +237,7 @@ fn render_message(
     }
 
     match role {
-        "system" => {
-            prompt.push_str(content);
-            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-                prompt.push_str("\n\n");
-                prompt.push_str(&render_tools(tools));
-            }
-            if let Some(rf) = response_format {
-                prompt.push_str("\n\n");
-                prompt.push_str(&format!(
-                    "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{}",
-                    to_json(rf)
-                ));
-            }
-        }
-
+        "system" => render_system(&mut prompt, content, tools, response_format),
         "developer" => {
             if content.is_empty() {
                 return Err(DsEncodingError::InvalidMessage {
@@ -261,73 +245,9 @@ fn render_message(
                     msg: msg.to_string(),
                 });
             }
-            let mut content_developer = String::new();
-            content_developer.push_str(USER_SP_TOKEN);
-            content_developer.push_str(content);
-            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-                content_developer.push_str("\n\n");
-                content_developer.push_str(&render_tools(tools));
-            }
-            if let Some(rf) = response_format {
-                content_developer.push_str("\n\n");
-                let _ = write!(
-                    content_developer,
-                    "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{}",
-                    to_json(rf)
-                );
-            }
-            prompt.push_str(&content_developer);
+            render_developer(&mut prompt, content, tools, response_format);
         }
-
-        "user" => {
-            prompt.push_str(USER_SP_TOKEN);
-            // Handle content blocks (tool results mixed with text)
-            if let Some(content_blocks) = msg.get("content_blocks").and_then(|v| v.as_array()) {
-                let mut parts: Vec<String> = Vec::with_capacity(content_blocks.len());
-                for block in content_blocks {
-                    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    match block_type {
-                        "text" => {
-                            let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                            parts.push(text.to_string());
-                        }
-                        "tool_result" => {
-                            let tc = block.get("content");
-                            let tool_content = match tc {
-                                Some(Value::Array(items)) => {
-                                    let mut text_parts: Vec<String> =
-                                        Vec::with_capacity(items.len());
-                                    for b in items {
-                                        let bt =
-                                            b.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                        if bt == "text" {
-                                            text_parts.push(
-                                                b.get("text")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("")
-                                                    .to_string(),
-                                            );
-                                        } else {
-                                            text_parts.push(format!("[Unsupported {bt}]"));
-                                        }
-                                    }
-                                    text_parts.join("\n\n")
-                                }
-                                Some(Value::String(s)) => s.clone(),
-                                Some(other) => to_json(other),
-                                None => String::new(),
-                            };
-                            parts.push(format!("<tool_result>{tool_content}</tool_result>"));
-                        }
-                        other => parts.push(format!("[Unsupported {other}]")),
-                    }
-                }
-                prompt.push_str(&parts.join("\n\n"));
-            } else {
-                prompt.push_str(content);
-            }
-        }
-
+        "user" => render_user(&mut prompt, msg, content),
         "latest_reminder" => {
             prompt.push_str(LATEST_REMINDER_SP_TOKEN);
             prompt.push_str(content);
@@ -335,60 +255,214 @@ fn render_message(
         "tool" => {
             return Err(DsEncodingError::UnmergedToolRole(index));
         }
-
         "assistant" => {
-            let mut thinking_part = String::new();
-            let mut tc_content = String::new();
-            if let Some(tcs) = tool_calls.filter(|t| !t.is_empty()) {
-                let mut tc_list = Vec::with_capacity(tcs.len());
-                for tc in tcs {
-                    let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let arguments = tc.get("arguments").unwrap_or(&Value::Null);
-                    let args = encode_arguments_to_dsml(arguments, &DSML_TAGS);
-                    tc_list.push(format!(
-                        "<{DSML_TOKEN}{invoke} name=\"{name}\">\n{args}\n</{DSML_TOKEN}{invoke}>",
-                        invoke = DSML_TAGS.invoke,
-                    ));
-                }
-                let joined = tc_list.join("\n");
-                let _ = write!(
-                    tc_content,
-                    "\n\n<{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>\n{joined}\n</{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>"
-                );
-            }
             // prev_has_task: if previous message had a task, this is a task
             // output (no thinking).
-            let prev_has_task = if index >= 1 {
-                messages[index - 1].get("task").is_some()
-                    && !messages[index - 1]
-                        .get("task")
-                        .map(Value::is_null)
-                        .unwrap_or(true)
-            } else {
-                false
+            let prev_has_task = index >= 1
+                && messages[index - 1].get("task").is_some()
+                && !messages[index - 1]
+                    .get("task")
+                    .map(Value::is_null)
+                    .unwrap_or(true);
+            let assistant = AssistantParts {
+                content,
+                tool_calls,
+                reasoning_content,
+                wo_eos,
+                emits_thinking: thinking_mode == ThinkingMode::Thinking
+                    && !prev_has_task
+                    && (!drop_thinking || after_last_user(index, last_user_idx)),
             };
-            if thinking_mode == ThinkingMode::Thinking && !prev_has_task {
-                let emit = !drop_thinking || after_last_user(index, last_user_idx);
-                if emit {
-                    thinking_part.push_str(reasoning_content);
-                    thinking_part.push_str(THINKING_END_TOKEN);
-                }
-            }
-            prompt.push_str(&thinking_part);
-            prompt.push_str(content);
-            prompt.push_str(&tc_content);
-            if !wo_eos {
-                prompt.push_str(EOS_TOKEN);
-            }
+            render_assistant(&mut prompt, &assistant);
         }
         other => return Err(DsEncodingError::UnknownRole(other.to_string())),
     }
 
+    render_turn_open(
+        &mut prompt,
+        messages,
+        index,
+        role,
+        thinking_mode,
+        drop_thinking,
+        last_user_idx,
+    )?;
+    Ok(prompt)
+}
+
+/// The response-format section a system or developer message carries.
+fn render_response_format(prompt: &mut String, response_format: &Value) {
+    prompt.push_str("\n\n");
+    let _ = write!(
+        prompt,
+        "## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n{}",
+        to_json(response_format)
+    );
+}
+
+/// A system message: its content, then the tools and the response format
+/// it carries.
+fn render_system(
+    prompt: &mut String,
+    content: &str,
+    tools: Option<&[Value]>,
+    response_format: Option<&Value>,
+) {
+    prompt.push_str(content);
+    if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&render_tools(tools));
+    }
+    if let Some(rf) = response_format {
+        render_response_format(prompt, rf);
+    }
+}
+
+/// A developer message: the user token, its content, then the tools and
+/// the response format it carries (the content is never empty: the caller
+/// refused an empty one).
+fn render_developer(
+    prompt: &mut String,
+    content: &str,
+    tools: Option<&[Value]>,
+    response_format: Option<&Value>,
+) {
+    let mut content_developer = String::new();
+    content_developer.push_str(USER_SP_TOKEN);
+    content_developer.push_str(content);
+    if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+        content_developer.push_str("\n\n");
+        content_developer.push_str(&render_tools(tools));
+    }
+    if let Some(rf) = response_format {
+        render_response_format(&mut content_developer, rf);
+    }
+    prompt.push_str(&content_developer);
+}
+
+/// A user message: the user token, then its content blocks (tool results
+/// mixed with text) joined, or its plain content.
+fn render_user(prompt: &mut String, msg: &Value, content: &str) {
+    prompt.push_str(USER_SP_TOKEN);
+    // Handle content blocks (tool results mixed with text)
+    if let Some(content_blocks) = msg.get("content_blocks").and_then(|v| v.as_array()) {
+        let mut parts: Vec<String> = Vec::with_capacity(content_blocks.len());
+        for block in content_blocks {
+            let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match block_type {
+                "text" => {
+                    let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    parts.push(text.to_string());
+                }
+                "tool_result" => {
+                    let tool_content = render_tool_result_content(block.get("content"));
+                    parts.push(format!("<tool_result>{tool_content}</tool_result>"));
+                }
+                other => parts.push(format!("[Unsupported {other}]")),
+            }
+        }
+        prompt.push_str(&parts.join("\n\n"));
+    } else {
+        prompt.push_str(content);
+    }
+}
+
+/// A tool result's content as text: its text parts joined (another part
+/// kind named as unsupported), a string as it is, any other JSON as JSON,
+/// nothing for none.
+fn render_tool_result_content(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::Array(items)) => {
+            let mut text_parts: Vec<String> = Vec::with_capacity(items.len());
+            for b in items {
+                let bt = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if bt == "text" {
+                    text_parts.push(
+                        b.get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                } else {
+                    text_parts.push(format!("[Unsupported {bt}]"));
+                }
+            }
+            text_parts.join("\n\n")
+        }
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => to_json(other),
+        None => String::new(),
+    }
+}
+
+/// What an assistant message renders from: its content, its tool calls,
+/// its reasoning, and the two decisions the conversation makes for it.
+struct AssistantParts<'a> {
+    content: &'a str,
+    tool_calls: Option<&'a [Value]>,
+    reasoning_content: &'a str,
+    /// The message ends without the EOS token.
+    wo_eos: bool,
+    /// The turn's thinking goes out: thinking mode, the previous message
+    /// gave no task (a task output has no thinking), and the thinking is
+    /// kept (not dropped, or after the last user message).
+    emits_thinking: bool,
+}
+
+/// An assistant message: its thinking (reasoning and the thinking end
+/// token) when the turn keeps it, its content, its tool calls as a DSML
+/// block, and the EOS token unless the message says otherwise.
+fn render_assistant(prompt: &mut String, parts: &AssistantParts<'_>) {
+    let mut thinking_part = String::new();
+    let mut tc_content = String::new();
+    if let Some(tcs) = parts.tool_calls.filter(|t| !t.is_empty()) {
+        let mut tc_list = Vec::with_capacity(tcs.len());
+        for tc in tcs {
+            let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let arguments = tc.get("arguments").unwrap_or(&Value::Null);
+            let args = encode_arguments_to_dsml(arguments, &DSML_TAGS);
+            tc_list.push(format!(
+                "<{DSML_TOKEN}{invoke} name=\"{name}\">\n{args}\n</{DSML_TOKEN}{invoke}>",
+                invoke = DSML_TAGS.invoke,
+            ));
+        }
+        let joined = tc_list.join("\n");
+        let _ = write!(
+            tc_content,
+            "\n\n<{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>\n{joined}\n</{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>"
+        );
+    }
+    if parts.emits_thinking {
+        thinking_part.push_str(parts.reasoning_content);
+        thinking_part.push_str(THINKING_END_TOKEN);
+    }
+    prompt.push_str(&thinking_part);
+    prompt.push_str(parts.content);
+    prompt.push_str(&tc_content);
+    if !parts.wo_eos {
+        prompt.push_str(EOS_TOKEN);
+    }
+}
+
+/// The transition tokens after a message, by what follows it: nothing
+/// before a message that is neither the assistant's nor a latest reminder;
+/// a task's token (an action task after the assistant token and the
+/// thinking token); after a user or developer message the assistant token
+/// and the thinking token that opens or closes the thinking.
+fn render_turn_open(
+    prompt: &mut String,
+    messages: &[Value],
+    index: usize,
+    role: &str,
+    thinking_mode: ThinkingMode,
+    drop_thinking: bool,
+    last_user_idx: Option<usize>,
+) -> Result<(), DsEncodingError> {
     // Append transition tokens based on what follows.
     if let Some(next) = messages.get(index + 1) {
         let next_role = next.get("role").and_then(|v| v.as_str()).unwrap_or("");
         if !matches!(next_role, "assistant" | "latest_reminder") {
-            return Ok(prompt);
+            return Ok(());
         }
     }
 
@@ -423,7 +497,7 @@ fn render_message(
             prompt.push_str(THINKING_END_TOKEN);
         }
     }
-    Ok(prompt)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
