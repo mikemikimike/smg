@@ -40,7 +40,6 @@ struct PreparedMultimodalPart {
     encoder_input_key: Option<String>,
 }
 
-/// Process a protocol-independent, ordered media plan.
 /// What every step of a plan's processing reads: the components, the model
 /// and its type, the processor spec and the model config the registry
 /// resolved for it, the tokenizer the cache keys by, and the wire's dtype
@@ -156,6 +155,7 @@ impl Fetched {
     }
 }
 
+/// Process a protocol-independent, ordered media plan.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn process_multimodal_plan(
     plan: MediaPlan,
