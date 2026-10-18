@@ -105,6 +105,16 @@ async fn run_request_hook(
     let max_body_size = wasm_manager.get_max_body_size();
     let mut body_bytes = match axum::body::to_bytes(body, max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
+        Err(e) if super::body_timeout::crossed_payload_limit(&e) => {
+            // The edge limit or the WASM cap: the gateway's answer for a body
+            // over a limit, not a read failure.
+            warn!("Request body over the limit before WASM processing: {}", e);
+            return RequestHook::Answer(error::create_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                super::body_timeout::REQUEST_BODY_TOO_LARGE,
+                "Request body exceeded the payload limit",
+            ));
+        }
         Err(e) => {
             error!("Failed to read request body for WASM processing: {}", e);
             return RequestHook::Answer(error::bad_request(
@@ -193,12 +203,35 @@ async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response)
         return response;
     }
 
+    // A response the WASM cap cannot hold passes through unhooked, as a
+    // streaming one does: the upstream answered, and the modules do not see
+    // bodies over the cap. A declared length says so before the read.
+    let max_body_size = wasm_manager.get_max_body_size();
+    if declared_length(response.headers()).is_some_and(|length| length > max_body_size) {
+        warn!(
+            "Skipping WASM OnResponse for a response over the body limit ({} bytes); OnResponse modules do not apply to it",
+            max_body_size
+        );
+        return response;
+    }
+
     // Extract response data once before processing modules
     let mut status = response.status();
     let mut headers = response.headers().clone();
-    let max_body_size = wasm_manager.get_max_body_size();
     let mut body_bytes = match axum::body::to_bytes(response.into_body(), max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
+        Err(e) if super::body_timeout::crossed_payload_limit(&e) => {
+            // Undeclared length, over the cap: the body is consumed by now,
+            // so the answer is a refusal, under its own code.
+            error!(
+                "Response body over the WASM body limit ({} bytes) with no declared length; the response cannot be relayed",
+                max_body_size
+            );
+            return error::internal_error(
+                "wasm_response_body_too_large",
+                "Response body exceeded the WASM middleware's body limit",
+            );
+        }
         Err(e) => {
             error!("Failed to read response body for WASM processing: {}", e);
             return error::internal_error(
@@ -248,6 +281,14 @@ async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response)
 
 /// Whether `response` streams: an event stream, newline-delimited JSON or a
 /// chunked transfer, none of which the response hook may buffer.
+/// The response's declared body length, when it declares one.
+fn declared_length(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+}
+
 fn is_streaming(response: &Response) -> bool {
     response
         .headers()
@@ -297,6 +338,7 @@ mod tests {
     use crate::wasm::{
         module::{MiddlewareAttachPoint, WasmModule, WasmModuleAttachPoint, WasmModuleMeta},
         module_manager::WasmModuleManager,
+        WasmRuntimeConfig,
     };
 
     /// A request extension the hook must carry across its reconstruction.
@@ -308,13 +350,18 @@ mod tests {
     /// walk their whole path (list, take apart, read, run, put back
     /// together) with no module changing the message.
     fn manager_with_an_inert_module() -> WasmModuleManager {
+        manager_with_an_inert_module_under(WasmRuntimeConfig::default())
+    }
+
+    /// [`manager_with_an_inert_module`] under `config` (a small body cap, say).
+    fn manager_with_an_inert_module_under(config: WasmRuntimeConfig) -> WasmModuleManager {
         use wasm_encoder::{Component, Module, ModuleSection, TypeSection};
         let mut module = Module::new();
         module.section(&TypeSection::new());
         let mut component = Component::new();
         component.section(&ModuleSection(&module));
         let bytes = component.as_slice().to_vec();
-        let manager = WasmModuleManager::with_default_config();
+        let manager = WasmModuleManager::new(config);
         manager
             .register_module_internal(WasmModule {
                 module_uuid: Uuid::now_v7(),
@@ -470,10 +517,8 @@ mod tests {
         assert!(!is_streaming(&Response::new(Body::empty())));
     }
 
-    /// A body that cannot be read answers in the gateway's error envelope,
-    /// not a bare text under `error`: the request hook a 400 with the code
-    /// `wasm_request_body_unreadable`, the response hook a 500 with
-    /// `wasm_response_body_unreadable`, each with the envelope's `type`.
+    /// The status, the `X-SMG-Error-Code` header and the JSON body of
+    /// `response`.
     async fn envelope_of(response: Response) -> (StatusCode, String, serde_json::Value) {
         let status = response.status();
         let code = response
@@ -495,6 +540,9 @@ mod tests {
         Body::from_stream(ReceiverStream::new(rx))
     }
 
+    /// A request body that cannot be read answers in the gateway's error
+    /// envelope, not a bare text under `error`: a 400 with the code
+    /// `wasm_request_body_unreadable` and the envelope's `type`.
     #[tokio::test]
     async fn the_request_hook_answers_an_unreadable_body_with_the_error_envelope() {
         let manager = manager_with_an_inert_module();
@@ -520,6 +568,9 @@ mod tests {
         );
     }
 
+    /// A response body that cannot be read answers in the gateway's error
+    /// envelope: a 500 with the code `wasm_response_body_unreadable` and the
+    /// envelope's `type`.
     #[tokio::test]
     async fn the_response_hook_answers_an_unreadable_body_with_the_error_envelope() {
         let manager = manager_with_an_inert_module();
@@ -535,5 +586,72 @@ mod tests {
         assert_eq!(body["error"]["type"], "server_error");
         assert_eq!(body["error"]["code"], "wasm_response_body_unreadable");
         assert_eq!(body["error"]["message"], "Failed to read response body");
+    }
+
+    fn small_cap() -> WasmRuntimeConfig {
+        WasmRuntimeConfig {
+            max_body_size: 1024,
+            ..WasmRuntimeConfig::default()
+        }
+    }
+
+    /// A request body over a limit (the edge limit or the WASM cap) is the
+    /// gateway's 413 `request_body_too_large`, not a read failure.
+    #[tokio::test]
+    async fn the_request_hook_answers_a_body_over_the_cap_with_the_gateways_413() {
+        let manager = manager_with_an_inert_module_under(small_cap());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(Body::from(vec![b'x'; 4096]))
+            .expect("a request");
+        let RequestHook::Answer(response) = run_request_hook(&manager, request, "req-2").await
+        else {
+            panic!("a body over the cap is answered, not forwarded");
+        };
+        let (status, code, body) = envelope_of(response).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(code, "request_body_too_large");
+        assert_eq!(body["error"]["code"], "request_body_too_large");
+    }
+
+    /// A response that declares a length over the cap passes through the hook
+    /// untouched, as a streaming response does.
+    #[tokio::test]
+    async fn the_response_hook_passes_a_declared_body_over_the_cap_through() {
+        let manager = manager_with_an_inert_module_under(small_cap());
+        let payload = vec![b'y'; 4096];
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, payload.len())
+            .body(Body::from(payload.clone()))
+            .expect("a response");
+        let response = run_response_hook(&manager, response).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_of(response.into_body()).await, payload);
+    }
+
+    /// A response over the cap with no declared length cannot be relayed once
+    /// read: its refusal carries its own code, not the unreadable one.
+    #[tokio::test]
+    async fn the_response_hook_names_an_undeclared_body_over_the_cap() {
+        let manager = manager_with_an_inert_module_under(small_cap());
+        let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+        for _ in 0..3 {
+            tx.try_send(Ok(Bytes::from(vec![b'z'; 1024])))
+                .expect("the channel takes the chunks");
+        }
+        drop(tx);
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(ReceiverStream::new(rx)))
+            .expect("a response");
+        let response = run_response_hook(&manager, response).await;
+        let (status, code, body) = envelope_of(response).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(code, "wasm_response_body_too_large");
+        assert_eq!(body["error"]["code"], "wasm_response_body_too_large");
     }
 }
