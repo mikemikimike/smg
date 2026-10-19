@@ -114,7 +114,6 @@ struct ContextLengthRejected {
 struct ContextRetryState {
     used: bool,
     minimum_window: Option<u32>,
-    selected_worker: Option<Arc<dyn Worker>>,
 }
 
 fn is_context_length_rejection(body: &[u8]) -> bool {
@@ -620,32 +619,33 @@ impl Router {
                     let Some(minimum_window) = rejection.window else {
                         return false;
                     };
-                    let selected_worker = lease.with_view(|view| {
-                        let tried = tried.lock();
-                        let has_larger_context = |worker: &dyn Worker| {
-                            ledger.admits(worker)
-                                && worker
-                                    .context_length(model_id)
-                                    .is_some_and(|window| window > minimum_window)
-                        };
-                        self.select_worker_for_model(
-                            model_id,
-                            view.text,
-                            view.tokens,
-                            headers,
-                            view.rid_key,
-                            view.cache_namespace,
-                            Some(&has_larger_context),
-                            &tried,
-                        )
-                    });
-                    let Some(selected_worker) = selected_worker else {
+                    let has_larger_worker = lease
+                        .with_view(|view| {
+                            let tried = tried.lock();
+                            let has_larger_context = |worker: &dyn Worker| {
+                                ledger.admits(worker)
+                                    && worker
+                                        .context_length(model_id)
+                                        .is_some_and(|window| window > minimum_window)
+                            };
+                            self.select_worker_for_model(
+                                model_id,
+                                view.text,
+                                view.tokens,
+                                headers,
+                                view.rid_key,
+                                view.cache_namespace,
+                                Some(&has_larger_context),
+                                &tried,
+                            )
+                        })
+                        .is_some();
+                    if !has_larger_worker {
                         return false;
-                    };
+                    }
 
                     state.used = true;
                     state.minimum_window = Some(minimum_window);
-                    state.selected_worker = Some(selected_worker);
                     true
                 },
                 // on_backoff hook
@@ -705,13 +705,7 @@ impl Router {
         tried: &parking_lot::Mutex<Vec<String>>,
         context_retry: &parking_lot::Mutex<ContextRetryState>,
     ) -> Response {
-        let (minimum_window, selected_context_worker) = {
-            let mut context_retry = context_retry.lock();
-            (
-                context_retry.minimum_window,
-                context_retry.selected_worker.take(),
-            )
-        };
+        let minimum_window = context_retry.lock().minimum_window;
         let admits = |worker: &dyn Worker| {
             ledger.admits(worker)
                 && minimum_window.is_none_or(|minimum| {
@@ -720,22 +714,20 @@ impl Router {
                         .is_some_and(|window| window > minimum)
                 })
         };
-        let worker = match selected_context_worker.or_else(|| {
-            lease.with_view(|view| {
-                // A retry re-selects away from tried engines and applies the
-                // context bound established by an earlier rejection.
-                let tried = tried.lock();
-                self.select_worker_for_model(
-                    model_id,
-                    view.text,
-                    view.tokens,
-                    headers,
-                    view.rid_key,
-                    view.cache_namespace,
-                    Some(&admits),
-                    &tried,
-                )
-            })
+        let worker = match lease.with_view(|view| {
+            // Re-select after backoff so current health and availability are
+            // honored along with the context bound from the rejection.
+            let tried = tried.lock();
+            self.select_worker_for_model(
+                model_id,
+                view.text,
+                view.tokens,
+                headers,
+                view.rid_key,
+                view.cache_namespace,
+                Some(&admits),
+                &tried,
+            )
         }) {
             Some(w) => w,
             None => {
@@ -2090,7 +2082,8 @@ impl Router {
             retries_enabled: self.retry_config.max_retries > 1
                 || self
                     .worker_registry
-                    .any_model_retry_override_enables_retries(),
+                    .any_model_retry_override_enables_retries()
+                || self.has_context_capacity_variance(crate::worker::UNKNOWN_MODEL_ID),
             max_buffered_request_bytes: self.max_buffered_request_bytes,
         })
     }
@@ -3583,27 +3576,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn context_retry_reselects_after_backoff_when_larger_worker_becomes_unavailable() {
+        const BODY: &str = r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#;
+        let (small_url, small_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, BODY).await;
+        let (larger_url, larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::OK, r#"{"ok":true}"#).await;
+        let larger_worker = context_worker(&larger_url, 32);
+        let mut router =
+            context_router(vec![context_worker(&small_url, 16), larger_worker.clone()]);
+        router.retry_config = RetryConfig {
+            max_retries: 1,
+            initial_backoff_ms: 2_000,
+            max_backoff_ms: 2_000,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        };
+        let router = Arc::new(router);
+        let request_router = Arc::clone(&router);
+        let request = tokio::spawn(async move {
+            context_request(&request_router, "beyond the first worker's window").await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while small_hits.load(AtomicOrdering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the small worker should receive the initial request");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        larger_worker.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+
+        let response = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(small_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(larger_hits.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn oversized_json_400_preserves_streamed_and_within_limit_buffered_responses() {
         let body = format!(
             r#"{{"error":{{"code":"context_length_exceeded","message":"too long"}}}}{}"#,
             " ".repeat(CONTEXT_REJECTION_BODY_LIMIT)
         );
-        let (url, hits) =
+        let (buffered_url, buffered_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
+        let (buffered_larger_url, buffered_larger_hits) =
             fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
         let buffered_router = streaming_router(
             PolicyConfig::RoundRobin,
             body.len() + 1,
-            vec![context_worker(&url, 16), context_worker(&url, 32)],
+            vec![
+                context_worker(&buffered_url, 16),
+                context_worker(&buffered_larger_url, 32),
+            ],
         );
         let response = context_request(&buffered_router, "oversized buffered upstream error").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(response_body.as_ref(), body.as_bytes());
+        assert_eq!(buffered_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(buffered_larger_hits.load(AtomicOrdering::SeqCst), 0);
 
+        let (streamed_url, streamed_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
+        let (streamed_larger_url, streamed_larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
         let streamed_router = streaming_router(
             PolicyConfig::RoundRobin,
             32,
-            vec![context_worker(&url, 16), context_worker(&url, 32)],
+            vec![
+                context_worker(&streamed_url, 16),
+                context_worker(&streamed_larger_url, 32),
+            ],
         );
         let response = streamed_router
             .route_typed_request(None, streaming_chat_request(), "/generate", "context-model")
@@ -3611,19 +3657,34 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(response_body.as_ref(), body.as_bytes());
+        assert_eq!(streamed_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(streamed_larger_hits.load(AtomicOrdering::SeqCst), 0);
 
+        let (capped_url, capped_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
+        let (capped_larger_url, capped_larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, body.clone()).await;
         let mut capped_router = streaming_router(
             PolicyConfig::RoundRobin,
             body.len() - 1,
-            vec![context_worker(&url, 16)],
+            vec![
+                context_worker(&capped_url, 16),
+                context_worker(&capped_larger_url, 32),
+            ],
         );
         capped_router.retry_config.max_retries = 1;
-        let hits_before = hits.load(AtomicOrdering::SeqCst);
+        let hits_before = capped_hits.load(AtomicOrdering::SeqCst);
+        let larger_hits_before = capped_larger_hits.load(AtomicOrdering::SeqCst);
         let response = context_request(&capped_router, "over-limit buffered upstream error").await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
-            hits.load(AtomicOrdering::SeqCst),
+            capped_hits.load(AtomicOrdering::SeqCst),
             hits_before + 1,
+            "a capped context probe must not issue an extra context retry"
+        );
+        assert_eq!(
+            capped_larger_hits.load(AtomicOrdering::SeqCst),
+            larger_hits_before,
             "a capped context probe must not issue an extra context retry"
         );
     }
@@ -3777,6 +3838,32 @@ mod tests {
         assert_eq!(
             router.request_body_path(&headers_with_content_length(Some("64")), false),
             BodyPath::Buffer(REASON_RETRYABLE)
+        );
+    }
+
+    #[test]
+    fn context_capacity_variance_buffers_replayable_bodies_only_within_limit() {
+        let mut router = streaming_router(
+            least_load_policy(),
+            1024 * 1024,
+            vec![
+                context_worker("http://worker1:8080", 16),
+                context_worker("http://worker2:8080", 32),
+            ],
+        );
+        router.retry_config = RetryConfig {
+            max_retries: 1,
+            ..Default::default()
+        };
+        router.max_buffered_request_bytes = 1024;
+
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("64")), false),
+            BodyPath::Buffer(REASON_RETRYABLE)
+        );
+        assert_eq!(
+            router.request_body_path(&headers_with_content_length(Some("1025")), false),
+            BodyPath::Stream(REASON_RETRY_FORFEITED)
         );
     }
 
