@@ -248,6 +248,11 @@ pub(crate) fn has_selectable_single(
 ) -> bool {
     let pool_candidates = candidates(registry, model_id, pool, wire);
     let policy = policies.get_policy_or_default(model_id);
+    if policy.name() == "consistent_hashing"
+        && header_utils::extract_target_worker(inputs.headers).is_some()
+    {
+        return false;
+    }
     let accepted = filter_candidates(pool_candidates.as_slice(), inputs.candidate_filter);
     let available = available_candidates(policy.as_ref(), accepted.as_ref());
     let retry_candidates = skip_tried_candidates(
@@ -2076,6 +2081,28 @@ mod tests {
                 "target {index}: the retry stays on the targeted worker"
             );
         }
+    }
+
+    #[test]
+    fn explicit_target_preflight_rejects_a_narrowed_consistent_hash_pool() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(PolicyConfig::ConsistentHashing);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-target-worker", "0".parse().unwrap());
+        let only_other_worker = |worker: &dyn Worker| worker.url() == "http://h:2";
+
+        assert!(!has_selectable_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs {
+                headers: Some(&headers),
+                candidate_filter: Some(&only_other_worker),
+                ..Default::default()
+            },
+        ));
     }
 
     /// Round robin never re-selects a tried worker while another is left,
