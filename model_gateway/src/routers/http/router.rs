@@ -619,27 +619,31 @@ impl Router {
                     let Some(minimum_window) = rejection.window else {
                         return false;
                     };
-                    let has_larger_worker = lease
-                        .with_view(|view| {
-                            let tried = tried.lock();
-                            let has_larger_context = |worker: &dyn Worker| {
-                                ledger.admits(worker)
-                                    && worker
-                                        .context_length(model_id)
-                                        .is_some_and(|window| window > minimum_window)
-                            };
-                            self.select_worker_for_model(
-                                model_id,
-                                view.text,
-                                view.tokens,
+                    let has_larger_worker = lease.with_view(|view| {
+                        let tried = tried.lock();
+                        let has_larger_context = |worker: &dyn Worker| {
+                            ledger.admits(worker)
+                                && worker
+                                    .context_length(model_id)
+                                    .is_some_and(|window| window > minimum_window)
+                        };
+                        placement::has_selectable_single(
+                            &self.worker_registry,
+                            &self.policy_registry,
+                            model_id,
+                            RoutingPool::HttpRegular,
+                            None,
+                            PlacementInputs {
+                                text: view.text,
+                                tokens: view.tokens,
                                 headers,
-                                view.rid_key,
-                                view.cache_namespace,
-                                Some(&has_larger_context),
-                                &tried,
-                            )
-                        })
-                        .is_some();
+                                rid_key: view.rid_key,
+                                cache_namespace: view.cache_namespace,
+                                candidate_filter: Some(&has_larger_context),
+                                tried: &tried,
+                            },
+                        )
+                    });
                     if !has_larger_worker {
                         return false;
                     }
@@ -3505,6 +3509,29 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(small_hits.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(large_hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn context_retry_preflight_does_not_advance_round_robin_rotation() {
+        const BODY: &str = r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#;
+        let (small_url, small_hits) =
+            fixed_status_upstream_with_body(StatusCode::BAD_REQUEST, BODY).await;
+        let (first_larger_url, first_larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::OK, r#"{"ok":true}"#).await;
+        let (second_larger_url, second_larger_hits) =
+            fixed_status_upstream_with_body(StatusCode::OK, r#"{"ok":true}"#).await;
+        let router = context_router(vec![
+            context_worker(&small_url, 16),
+            context_worker(&first_larger_url, 32),
+            context_worker(&second_larger_url, 64),
+        ]);
+
+        let response = context_request(&router, "beyond the first worker's window").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(small_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(first_larger_hits.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(second_larger_hits.load(AtomicOrdering::SeqCst), 1);
     }
 
     #[tokio::test]
