@@ -24,7 +24,7 @@ use tokio::sync::Notify;
 use super::worker::Worker;
 use super::worker::WorkerRoutingKeyLoad;
 
-/// Why the liveness tracker vetoes a worker (see [`super::liveness`]).
+/// Why the liveness tracker vetoes a worker (see the `liveness` module).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum StallReason {
@@ -66,7 +66,7 @@ pub struct RoutingState {
     pub processed: usize,
     /// Absolute overload veto, set by the load monitor at ingestion time.
     pub overloaded: bool,
-    /// Liveness veto: unreachable or wedged (see [`super::liveness`]).
+    /// Liveness veto: unreachable or wedged (see the `liveness` module).
     pub stalled: bool,
 }
 
@@ -118,6 +118,16 @@ pub struct WorkerRuntime {
     overloaded: AtomicBool,
     /// Liveness veto, a [`StallReason`] as `u8` (0 = none).
     stall: AtomicU8,
+    /// The `smg_worker_state` series last published for the worker (the
+    /// series table's index plus one; 0 = none yet), so the series the
+    /// worker leaves is set to zero when the next is set to one. Shared
+    /// with a same-URL replacement like the facts the series summarises.
+    published_state: AtomicU8,
+    /// Serializes the publishes of the `smg_worker_state` series, from the
+    /// read of the facts to the last gauge write: two publishes racing on
+    /// different codes would otherwise interleave their writes and leave two
+    /// series at 1, or a stale code over a fresh one.
+    publish_lock: Mutex<()>,
     /// Last successful contact and last token or completion, in
     /// [`super::liveness::now_ms`] milliseconds.
     last_contact_ms: AtomicU64,
@@ -179,7 +189,8 @@ const PREFILL_WINDOW_MS: u64 = 1_000;
 /// has been prefilling, and the rate window. One struct under one lock, so
 /// that a request's end racing another's start cannot lose the busy
 /// interval (a lost interval would leave the window open for good on a
-/// worker that never drains, and its rate stale).
+/// worker that never drains, and its rate stale). A handoff a decode side
+/// showed is evidence for the prefill side rule only.
 ///
 /// The rate is measured over busy time only: time with timed prompt tokens
 /// pending on the worker (overlapping prompts share one interval), banked
@@ -233,6 +244,11 @@ struct PrefillBook {
     /// Gateway clock of the latest first response (or one answer) to a
     /// prompt dispatched here; zero until one.
     last_answer_ms: u64,
+    /// Gateway clock of the latest handoff of a prompt dispatched here that
+    /// a decode side showed (see [`Worker::prefill_handed_off_ago`]); zero
+    /// until one. No answer: it releases no prompt, times nothing, answers
+    /// no run and shows no shape.
+    last_handoff_ms: u64,
     /// The prompts pending, prompt tokens to how many of that length, for
     /// the longest of them: the largest shape the engine is on.
     pending_prompts: BTreeMap<u64, u32>,
@@ -368,6 +384,19 @@ impl PrefillBook {
             .then(|| Duration::from_millis(now_ms.saturating_sub(self.last_answer_ms)))
     }
 
+    /// A decode side showed a handoff at `now_ms`; an older stamp never
+    /// moves the latest back.
+    fn handed_off(&mut self, now_ms: u64) {
+        self.last_handoff_ms = self.last_handoff_ms.max(now_ms);
+    }
+
+    /// How long before `now_ms` a decode side last showed a handoff; `None`
+    /// until one has.
+    fn handed_off_ago(&self, now_ms: u64) -> Option<Duration> {
+        (self.last_handoff_ms > 0)
+            .then(|| Duration::from_millis(now_ms.saturating_sub(self.last_handoff_ms)))
+    }
+
     /// How long, as of `now_ms`, the current run of pending prompts has
     /// waited for its first answer, plus what earlier runs since the latest
     /// answer held prompts unanswered: the worker's silence with the spells
@@ -480,6 +509,8 @@ impl WorkerRuntime {
             revision: AtomicU64::new(0),
             overloaded: AtomicBool::new(false),
             stall: AtomicU8::new(0),
+            published_state: AtomicU8::new(0),
+            publish_lock: Mutex::new(()),
             last_contact_ms: AtomicU64::new(super::liveness::now_ms()),
             last_token_ms: AtomicU64::new(super::liveness::now_ms()),
             last_waiting_reqs: AtomicI64::new(0),
@@ -559,6 +590,25 @@ impl WorkerRuntime {
     pub fn set_stall(&self, reason: Option<StallReason>) -> bool {
         let next = reason.map_or(0, |reason| reason as u8);
         self.stall.swap(next, Ordering::AcqRel) != next
+    }
+
+    /// The code of the `smg_worker_state` series published last (0 when
+    /// none was).
+    pub fn published_state(&self) -> u8 {
+        self.published_state.load(Ordering::Acquire)
+    }
+
+    /// Remember `code` as the published `smg_worker_state` series; the code
+    /// published before it comes back (0 when none was). Called under
+    /// [`Self::publish_lock`].
+    pub fn swap_published_state(&self, code: u8) -> u8 {
+        self.published_state.swap(code, Ordering::AcqRel)
+    }
+
+    /// The lock a publish of the `smg_worker_state` series holds from the
+    /// read of the facts to its last gauge write.
+    pub fn publish_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.publish_lock.lock()
     }
 
     pub fn note_contact(&self) {
@@ -673,6 +723,26 @@ impl WorkerRuntime {
     /// [`Self::prefill_answered_ago`] as of `now_ms` on the gateway clock.
     pub fn prefill_answered_ago_at(&self, now_ms: u64) -> Option<Duration> {
         self.prefill.lock().answered_ago(now_ms)
+    }
+
+    /// A decode side showed a handoff of this worker's (see
+    /// [`Worker::note_prefill_handoff`]): stamped apart from the answers.
+    pub fn note_prefill_handoff(&self) {
+        self.note_prefill_handoff_at(super::liveness::now_ms().max(1));
+    }
+
+    /// [`Self::note_prefill_handoff`] at `now_ms` on the gateway clock.
+    pub fn note_prefill_handoff_at(&self, now_ms: u64) {
+        self.prefill.lock().handed_off(now_ms);
+    }
+
+    pub fn prefill_handed_off_ago(&self) -> Option<Duration> {
+        self.prefill_handed_off_ago_at(super::liveness::now_ms().max(1))
+    }
+
+    /// [`Self::prefill_handed_off_ago`] as of `now_ms` on the gateway clock.
+    pub fn prefill_handed_off_ago_at(&self, now_ms: u64) -> Option<Duration> {
+        self.prefill.lock().handed_off_ago(now_ms)
     }
 
     pub fn prefill_cold_shape(&self, tokens: u64) -> bool {
@@ -898,7 +968,7 @@ impl WorkerRuntime {
     }
 
     /// Whether `place` may claim: no older place still waiting needs as few
-    /// rooms as it does, or fewer (see [`PdQueue::may_claim`]).
+    /// rooms as it does, or fewer (see `PdQueue::may_claim`).
     pub fn pd_may_claim(&self, place: u64) -> bool {
         self.pd_queue.lock().may_claim(place)
     }
@@ -1195,6 +1265,37 @@ mod tests {
             runtime.prefill_answered_ago_at(7_000),
             Some(Duration::from_millis(500)),
             "a non-streaming generation's one answer counts too"
+        );
+    }
+
+    #[test]
+    fn a_handoff_is_evidence_for_the_silence_rule_and_nothing_else() {
+        // A decode side's first output shows the prefill worker handed a
+        // prompt off. Stamped apart from the answers, it releases no prompt,
+        // times nothing, answers no run and shows no shape.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        runtime.note_prefill_started_at(4_096, true, 1_000);
+        runtime.note_prefill_handoff_at(3_000);
+        let second = Some(Duration::from_secs(1));
+        assert_eq!(runtime.prefill_handed_off_ago_at(4_000), second);
+        assert_eq!(runtime.prefill_answered_ago_at(4_000), None, "no answer");
+        assert_eq!(runtime.prefill_backlog(), Duration::from_millis(409));
+        assert_eq!(runtime.prefill_rate_tps(), 0, "nothing timed");
+        assert_eq!(
+            runtime.prefill_unanswered_run_at(4_000),
+            Some(Duration::from_secs(3)),
+            "the run still awaits its first answer"
+        );
+        assert!(!runtime.prefill_cold_shape(0), "no shape shown");
+        runtime.note_prefill_handoff_at(2_000);
+        assert_eq!(runtime.prefill_handed_off_ago_at(4_000), second, "not back");
+        runtime.note_prefill_ended_at(4_096, true, Some(0), 5_000);
+        assert_eq!(runtime.prefill_answered_ago_at(5_000), Some(Duration::ZERO));
+        assert_eq!(runtime.prefill_unanswered_run_at(5_000), None);
+        assert_eq!(
+            runtime.prefill_handed_off_ago_at(5_000),
+            Some(Duration::from_secs(2)),
+            "the answer leaves the handoff alone"
         );
     }
 

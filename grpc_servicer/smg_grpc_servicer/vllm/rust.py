@@ -53,6 +53,8 @@ from typing import Any
 # launcher's own documented values.
 from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_DRAIN_SECS,
+    DEFAULT_PREFILL_TOKENS_PER_SEC,
+    DEFAULT_SILENCE_TIMEOUT_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     IMPLS,
@@ -64,7 +66,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
 )
-from smg_grpc_servicer.vllm import MULTIPROC_METHOD_ENV
+from smg_grpc_servicer.vllm import METRICS_HOST_ENV, METRICS_PORT_ENV, MULTIPROC_METHOD_ENV
 from smg_grpc_servicer.vllm.config_view import (
     EngineConfigView,
     mm_processor_kwargs,
@@ -82,6 +84,7 @@ from smg_grpc_servicer.vllm.model_info import (
     model_facts,
     server_facts,
 )
+from smg_grpc_servicer.vllm.warmup import WARMUP_ENV, warmup_inputs_from_config, warmup_wire
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +93,8 @@ HANDSHAKE_PORT_ENV = "SMG_VLLM_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_VLLM_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS"
 STARTUP_CEILING_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_CEILING_SECS"
+SILENCE_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_SILENCE_TIMEOUT_SECS"
+PREFILL_TOKENS_PER_SEC_ENV = "SMG_VLLM_SERVICER_PREFILL_TOKENS_PER_SEC"
 # Set to 0/false/no/off to keep vLLM's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_VLLM_SERVICER_KV_EVENTS"
@@ -259,6 +264,8 @@ def smg_media_options(
         )
         or None,
         "max_item_bytes": settings.max_item_bytes,
+        "fetch_timeout_ms": settings.fetch_timeout_ms,
+        "video_fetch_timeout_ms": settings.video_fetch_timeout_ms,
         "video_frame_budget": video_frame_budget(model_config),
         "video_loader_rule": video_loader_rule(model_config),
         # A launcher that was not given the policy sends none, so the pipeline
@@ -516,13 +523,24 @@ class VllmLauncher(RustLauncher):
     drain_secs_env = DRAIN_SECS_ENV
     startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
+    silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV
+    prefill_tokens_per_sec_env = PREFILL_TOKENS_PER_SEC_ENV
     kv_events_env = KV_EVENTS_ENV
+    metrics_port_env = METRICS_PORT_ENV
+    metrics_host_env = METRICS_HOST_ENV
     without_tokenizer = "string stops will be refused"
+    warmup_env = WARMUP_ENV
 
     def __init__(self) -> None:
         self.vllm_config: Any = None
         self.media: Any = None
         self.encoder_budget: int = 0
+
+    def warmup_inputs(self, args: argparse.Namespace, facts: Mapping[str, Any]) -> Any:
+        return warmup_inputs_from_config(self.vllm_config)
+
+    def warmup_wire(self, target: str) -> Any:
+        return warmup_wire(target)
 
     def prepare(self, args: argparse.Namespace) -> None:
         configure_logging()

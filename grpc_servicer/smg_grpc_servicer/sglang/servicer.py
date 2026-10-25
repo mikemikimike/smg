@@ -46,9 +46,14 @@ from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
+from smg_grpc_servicer.engine_status import abort_for_constraint_failure
 from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
+from smg_grpc_servicer.sglang.hidden_states import (
+    refuse_hidden_states_above_server_mode,
+    refuse_hidden_states_on_this_servicer,
+)
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
 from smg_grpc_servicer.sglang.loads import (
     convert_loads_to_protobuf,
@@ -62,6 +67,7 @@ from smg_grpc_servicer.sglang.request_manager import (
 )
 from smg_grpc_servicer.sglang.utils import (
     abort_code_from_output,
+    grammar_abort,
     scheduler_abort,
     to_token_id_array,
 )
@@ -130,6 +136,13 @@ def _compute_aggregate_protobuf(
         avg_token_usage=round(sum(load.token_usage for load in loads) / n, 4),
         avg_throughput=round(sum(load.gen_throughput for load in loads) / n, 2),
         avg_utilization=round(sum(load.utilization for load in loads) / n, 4),
+    )
+
+
+def _scheduler_abort_detail(finish_reason: dict) -> str:
+    """The engine's own account of an abort, for the constraint-failure status."""
+    return (
+        f"the scheduler aborted the request: {finish_reason.get('message') or 'no reason reported'}"
     )
 
 
@@ -235,6 +248,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                 abort_code_from_output(batch_output),
                                 batch_output["error"],
                             )
+                        elif (grammar := grammar_abort(batch_output)) is not None:
+                            # The one abort the scheduler attributes to the
+                            # request's grammar (named before its status: a PD
+                            # decode side stamps a 500 on it too).
+                            await abort_for_constraint_failure(
+                                context, _scheduler_abort_detail(grammar)
+                            )
                         elif (aborted := scheduler_abort(batch_output)) is not None:
                             # The scheduler's own abort, with its status: the
                             # caller's error or the worker's, never a completion.
@@ -251,6 +271,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         await context.abort(
                             abort_code_from_output(output),
                             output["error"],
+                        )
+                    elif (grammar := grammar_abort(output)) is not None:
+                        # The one abort the scheduler itself attributes to the
+                        # request's grammar (the plugin's name on its finish):
+                        # the constraint-failure status every wire shares,
+                        # never a `Complete(finish_reason = "abort")` a client
+                        # reads as an empty success. Named before its status:
+                        # a PD decode side stamps a 500 on it too.
+                        await abort_for_constraint_failure(
+                            context, _scheduler_abort_detail(grammar)
                         )
                     elif (aborted := scheduler_abort(output)) is not None:
                         # The scheduler's own abort, with its status (a 400 for
@@ -949,6 +979,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Create request
         require_reasoning = bool(grpc_req.require_reasoning)
+        if grpc_req.return_hidden_states:
+            # The engine's launch-time cap first, in its own words; then this
+            # servicer's own answer: hidden states are served by the Rust one.
+            refuse_hidden_states_above_server_mode()
+            refuse_hidden_states_on_this_servicer()
 
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
@@ -1079,14 +1114,26 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         stop = list(grpc_params.stop) if grpc_params.stop else None
         stop_token_ids = list(grpc_params.stop_token_ids) if grpc_params.stop_token_ids else None
 
+        # proto3 cannot tell an unset scalar from its zero, and the zeros of
+        # these three are never meant: top_p 0.0 keeps the top token only,
+        # top_k 0 is an empty candidate set, and a repetition factor of 0.0
+        # sends a repeated token's positive logit to infinity (the scheduler's
+        # own checks refuse all three where they run). An unset one means the
+        # neutral value: the whole distribution, every token, no penalty.
+        top_p = grpc_params.top_p if grpc_params.top_p != 0.0 else 1.0
+        top_k = grpc_params.top_k if grpc_params.top_k != 0 else -1
+        repetition_penalty = (
+            grpc_params.repetition_penalty if grpc_params.repetition_penalty != 0.0 else 1.0
+        )
+
         return SGLSamplingParams(
             temperature=grpc_params.temperature,
-            top_p=grpc_params.top_p,
-            top_k=grpc_params.top_k,
+            top_p=top_p,
+            top_k=top_k,
             min_p=grpc_params.min_p,
             frequency_penalty=grpc_params.frequency_penalty,
             presence_penalty=grpc_params.presence_penalty,
-            repetition_penalty=grpc_params.repetition_penalty,
+            repetition_penalty=repetition_penalty,
             max_new_tokens=max_new_tokens,
             min_new_tokens=grpc_params.min_new_tokens,
             stop=stop,

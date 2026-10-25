@@ -6,8 +6,9 @@
 //!
 //! Every byte of the output lands in exactly one event: a terminal that moves the engine as
 //! `Dropped { Wrapper }`, the whitespace between a call and the terminal that closes it as
-//! `Dropped { Wrapper }` too, any other text there as `Malformed`, run by run so that where the
-//! chunks were cut changes nothing, the whitespace a content stay begins with as
+//! `Dropped { Wrapper }` too except between two runs of other text there, which is the model's and
+//! rides in the second run's `Malformed` event, any other text there as `Malformed`, run by run so
+//! that where the chunks were cut changes nothing, the whitespace a content stay begins with as
 //! `Dropped { Whitespace }` when no text follows it in the stay (the template's spacing after a
 //! thought's close, between two calls, or after a thought nothing follows, held until what
 //! follows says whose it is) unless the table keeps the state's text as written, and the rest as
@@ -18,7 +19,9 @@
 use std::{borrow::Cow, collections::VecDeque, ops::Range, sync::Arc};
 
 use crate::{
-    event::{runs_at, DropReason, Event, Events, FinishReason, MalformedReason, Text},
+    event::{
+        release_between, runs_at, DropReason, Event, Events, FinishReason, MalformedReason, Text,
+    },
     format::{CallId, CallSyntax, Emits, Format, Replay},
     gemma,
     ids::CallIds,
@@ -33,12 +36,14 @@ use crate::{
     Declared,
 };
 
-/// Why a call region closed: its closing terminal (or the next opener) arrived, or the stream
-/// stopped where the table says a stop closes it; or the stream ended.
+/// Why a call region closed: its closing terminal (or the next opener) arrived; the stream
+/// stopped, the model's own end of output (`EngineFinish::Stop`); or the stream was cut, by the
+/// token limit, an abort or a finish the crate does not read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Closed {
-    ByMarker,
-    ByEnd,
+    Marker,
+    Stop,
+    Cut,
 }
 
 /// A [`Format`] running as a [`Parser`]. One per generated choice.
@@ -109,10 +114,11 @@ struct Pending {
     call: shape::Assembler,
 }
 
-/// The stay in a state, from the row that entered it to the row that leaves it, as trimming and
-/// the held lead read it: whether text other than whitespace has arrived, and the run held. A
-/// trimmed stay holds the run after its last text that is not whitespace; a content stay holds
-/// the run before its first ([`Engine::lead`]).
+/// The stay in a state, from the row that entered it to the row that leaves it, as trimming, the
+/// held lead and the wrapping read it: whether text other than whitespace has arrived, and the
+/// run held. A trimmed stay holds the run after its last text that is not whitespace; a content
+/// stay holds the run before its first ([`Engine::lead`]); a wrapping stay (between a block's
+/// calls, after a call's object) holds the run after its last text ([`Engine::wrapping`]).
 #[derive(Debug, Default)]
 struct Stay {
     begun: bool,
@@ -120,7 +126,7 @@ struct Stay {
 }
 
 /// Bytes a stay holds, in the output's order: a trimmed stay's run after its last text that is not
-/// whitespace, or a content stay's lead before its first.
+/// whitespace, a content stay's lead before its first, or a wrapping stay's run after its last.
 #[derive(Debug)]
 enum Held {
     /// Whitespace: the state's text if more text follows in the stay, dropped if the stay ends.
@@ -214,9 +220,27 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// source); otherwise the engine drops them as the region's.
     fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool;
 
-    /// The stream ended inside the region: nothing is closed for the client, so arguments cut
+    /// The stream was cut inside the region: nothing is closed for the client, so arguments cut
     /// short never look complete.
     fn finish(self: Box<Self>, out: &mut Events);
+
+    /// The stream stopped inside the region: the model's own end of output, not a cut.
+    /// `as_marker` says that the table's stop row names the state ([`Format::closes_at_stop`]),
+    /// so the stop stands for the closing marker the stop decoder hides, and the call ends as
+    /// that marker would end it, with no bytes; without the row a syntax whose JSON is the
+    /// model's own (JSON, Python, Gemma's tokens, a call given as data) ends the call as a cut
+    /// ends it, since the model closed neither its call nor its value. The syntaxes that write
+    /// the arguments' JSON for values the model wrote as text between tags have their own
+    /// ending here ([`crate::tagged`]): the call ends as its closing marker would, a string
+    /// still open is closed first, since the model wrote nothing after its bytes, and one
+    /// `Malformed { OpenAtTheStop }` event says so.
+    fn stop(self: Box<Self>, as_marker: bool, out: &mut Events) {
+        if as_marker {
+            self.close("", out);
+        } else {
+            self.finish(out);
+        }
+    }
 }
 
 /// A call given as data ([`CallSyntax::Shaped`]) behind the trait. Its assembler types values by
@@ -420,26 +444,26 @@ impl Engine {
     /// scan stands where the old one cut the text with nothing held, from which on the two cut it
     /// alike; at the end of the stream everything is scanned to the end, and a header still
     /// undecided is decided once nothing more comes.
-    fn run(&mut self, scanned: &Scanned<'_>, at_end: bool, out: &mut Events) {
+    fn run(&mut self, scanned: &Scanned<'_>, end: Option<Closed>, out: &mut Events) {
         // The pieces are taken as scanned until a header decides; from then on, what the scan
         // that reads again gives and the pieces not reached yet stand in a queue, which nothing
         // is allocated for before.
         let mut pieces = scanned.pieces();
         let mut queue = VecDeque::new();
         while let Some(piece) = pieces.next() {
-            if let Some(again) = self.step(piece, at_end, out) {
+            if let Some(again) = self.step(piece, end, out) {
                 queue.extend(pieces.by_ref());
-                self.scan_again(again, &mut queue, at_end);
+                self.scan_again(again, &mut queue, end.is_some());
                 break;
             }
         }
         loop {
             while let Some(piece) = queue.pop_front() {
-                if let Some(again) = self.step(piece, at_end, out) {
-                    self.scan_again(again, &mut queue, at_end);
+                if let Some(again) = self.step(piece, end, out) {
+                    self.scan_again(again, &mut queue, end.is_some());
                 }
             }
-            if !at_end {
+            if end.is_none() {
                 return;
             }
             let Some(again) = self.decide_at_end(out) else {
@@ -449,15 +473,16 @@ impl Engine {
         }
     }
 
-    /// Takes one piece: a tag the end cut short is dropped, anything else is taken as the table
-    /// says ([`Self::take`]). What a header that decided hands back to read again.
-    fn step(&mut self, piece: Piece<'_>, at_end: bool, out: &mut Events) -> Option<String> {
-        match piece {
-            Piece::Text(text) if at_end && self.cut_tag(&text) => {
-                self.drop_cut_tag(text.into_owned(), out);
+    /// Takes one piece: at the end of the stream (`end` says how it ended) a tag the end cut
+    /// short is dropped, anything else is taken as the table says ([`Self::take`]). What a header
+    /// that decided hands back to read again.
+    fn step(&mut self, piece: Piece<'_>, end: Option<Closed>, out: &mut Events) -> Option<String> {
+        match (piece, end) {
+            (Piece::Text(text), Some(closed)) if self.cut_tag(&text) => {
+                self.drop_cut_tag(text.into_owned(), closed, out);
                 None
             }
-            piece => self.take(piece, out),
+            (piece, _) => self.take(piece, out),
         }
     }
 
@@ -780,11 +805,18 @@ impl Engine {
     }
 
     /// The stay ends: the run it held is the template's and is dropped, a trimmed stay's run
-    /// after its last text as much as a lead no text followed.
+    /// after its last text as much as a lead no text followed, and the run a wrapping stay held
+    /// after its last text, the template's spacing before the terminal that ended the stay.
     fn end_stay(&mut self, out: &mut Events) {
+        // A content or reasoning stay's run is whitespace the format treats as structural; a
+        // wrapping stay's is the template's wrapping, as it is before the stay's first text.
+        let spacing = match self.emits() {
+            Emits::Content | Emits::Reasoning => DropReason::Whitespace,
+            Emits::Arguments | Emits::Wrapper => DropReason::Wrapper,
+        };
         for held in std::mem::take(&mut self.stay.held) {
             let (text, why) = match held {
-                Held::Space(space) => (space, DropReason::Whitespace),
+                Held::Space(space) => (space, spacing),
                 Held::Ignored(terminal) => (terminal, DropReason::Wrapper),
             };
             out.push(Event::Dropped {
@@ -794,29 +826,78 @@ impl Engine {
         }
     }
 
-    /// Text where the template only wraps: after a call and before its closing terminal, or
-    /// between a block's calls. Each run of whitespace is the template's and is dropped, each run
-    /// of anything else is malformed with `why`. Classifying run by run keeps the result the same
-    /// wherever the chunks were cut.
+    /// Text where the template only wraps: after a call's object and before its closing terminal,
+    /// or between a block's calls. Whitespace before the stay's first other text is the template's
+    /// and is dropped as it arrives; each run of anything else is malformed with `why`, with the
+    /// whitespace held since the last such run in front of it, which is the model's, between two
+    /// pieces of its text ([`release_between`], the rule every reader of such text states); the
+    /// whitespace after a run is held, the next run's when one follows and the template's spacing
+    /// before the terminal that ends the stay otherwise, which [`Self::end_stay`] drops. One event
+    /// per run, so a reader that counts the reason counts as before, and classifying run by run
+    /// keeps the result the same wherever the chunks were cut.
     fn wrapping<'d>(&mut self, surplus: Cow<'d, str>, why: MalformedReason, out: &mut Events<'d>) {
         for (range, space) in runs_at(&surplus) {
-            let run = self.tokens.text(part(&surplus, range));
-            out.push(if space {
-                Event::Dropped {
-                    text: run,
-                    why: DropReason::Wrapper,
+            if space {
+                if self.stay.begun {
+                    self.hold(&surplus[range]);
+                } else {
+                    out.push(Event::Dropped {
+                        text: self.tokens.text(part(&surplus, range)),
+                        why: DropReason::Wrapper,
+                    });
                 }
-            } else {
-                Event::Malformed { text: run, why }
-            });
+                continue;
+            }
+            let mut before = self.held_before_text(why, out);
+            self.release_wrapping(&mut before, part(&surplus, range), why, out);
         }
+    }
+
+    /// The run a wrapping stay held, as text follows it: the whitespace is the text's and comes
+    /// back to stand in front of it; a terminal the table ignores among it is dropped in its
+    /// place, the whitespace before it released on its own, so every byte keeps its order.
+    fn held_before_text(&mut self, why: MalformedReason, out: &mut Events) -> String {
+        let mut before = String::new();
+        for held in std::mem::take(&mut self.stay.held) {
+            match held {
+                Held::Space(space) => before.push_str(&space),
+                Held::Ignored(terminal) => {
+                    self.release_wrapping(&mut before, Cow::Borrowed(""), why, out);
+                    out.push(Event::Dropped {
+                        text: self.tokens.text(terminal),
+                        why: DropReason::Wrapper,
+                    });
+                }
+            }
+        }
+        before
+    }
+
+    /// A piece of text where the template only wraps, released as the rule has it
+    /// ([`release_between`]) with `before`, the whitespace held in front of it, and counted;
+    /// text released begins the stay. The engine carries nothing before the stay's first text,
+    /// which it dropped as it arrived, so the piece keeps its borrow on the delta there.
+    fn release_wrapping<'d>(
+        &mut self,
+        before: &mut String,
+        text: Cow<'d, str>,
+        why: MalformedReason,
+        out: &mut Events<'d>,
+    ) {
+        let mut released = self.stay.begun;
+        let mut events = Events::new();
+        release_between(before, &mut released, text, why, &mut events);
+        for event in events.drain() {
+            out.push(self.tokens.relabel(event));
+        }
+        self.stay.begun = released;
     }
 
     /// A terminal arrived: move where the table says, or keep it as text where the model put it.
     /// A terminal the table ignores is dropped where it stands, and moves nothing: inside a call
     /// whose assembler holds bytes it is placed where it arrived once the bytes around it leave
-    /// ([`Region`]), and in a stay's held run (a trimmed stay's tail, a content stay's lead) it
-    /// keeps its place among them.
+    /// ([`Region`]), and in a stay's held run (a trimmed stay's tail, a content stay's lead, the
+    /// run a wrapping stay holds after its text) it keeps its place among them.
     fn terminal(&mut self, index: usize, out: &mut Events) {
         if self.format.ignored(index) {
             let text = self.format.terminal_text(index).to_string();
@@ -829,11 +910,6 @@ impl Engine {
                         self.region.carried.push((self.region.fed, text));
                         return;
                     }
-                    out.push(Event::Dropped {
-                        text: self.tokens.text(text),
-                        why: DropReason::Wrapper,
-                    });
-                    return;
                 }
             }
             // Inside a stay's held run, the terminal keeps its place among the bytes held.
@@ -896,7 +972,7 @@ impl Engine {
             self.end_stay(out);
         }
         let taken =
-            self.emits() == Emits::Arguments && self.close_call(Closed::ByMarker, &terminal, out);
+            self.emits() == Emits::Arguments && self.close_call(Closed::Marker, &terminal, out);
         let shown = !taken && self.format.shown(index);
         if !taken {
             let text = self.tokens.text(terminal);
@@ -967,8 +1043,9 @@ impl Engine {
 
     /// Ends the call region: the assembler closes what arrived, and the result says whether it took
     /// `terminal`, the bytes that closed the region, as the call's end. A region its terminal
-    /// closed reports leftover bytes as a block without a complete call; `UnterminatedRegion` is
-    /// kept for a region the end of the stream cut.
+    /// closed, or the stop closed where the table's stop row stands for the marker, reports
+    /// leftover bytes as a block without a complete call; `UnterminatedRegion` is kept for a
+    /// region the end of the stream cut.
     fn close_call(&mut self, closed: Closed, terminal: &str, out: &mut Events) -> bool {
         let Some(mut call) = self.call.take() else {
             return false;
@@ -984,9 +1061,18 @@ impl Engine {
             self.push_carried_out(dropped, out);
         }
         let mut finished = Events::new();
+        let mut as_marker = closed == Closed::Marker;
         let taken = match closed {
-            Closed::ByMarker => call.close(terminal, &mut finished),
-            Closed::ByEnd => {
+            Closed::Marker => call.close(terminal, &mut finished),
+            Closed::Stop => {
+                // The stop token that closes the call is hidden, so the call's end has no bytes. A
+                // shaped call of one JSON value or object needs its trailer to end where the
+                // stream does; tagged parameters close wherever it stands.
+                as_marker = self.format.stop_closes(self.state) && call.closes("");
+                call.stop(as_marker, &mut finished);
+                false
+            }
+            Closed::Cut => {
                 call.finish(&mut finished);
                 false
             }
@@ -995,7 +1081,7 @@ impl Engine {
             self.region.fed += terminal.len();
         }
         let mut finished = finished.drain();
-        if closed == Closed::ByMarker {
+        if as_marker {
             for event in &mut finished {
                 if let Event::Malformed { why, .. } = event {
                     if *why == MalformedReason::UnterminatedRegion {
@@ -1174,12 +1260,13 @@ impl Engine {
     }
 
     /// A tag the end cut short is dropped as the whole tag would have been. Inside a call the
-    /// assembler still holds the call's bytes, which came before the tail: the call ends first, so
-    /// every byte leaves in order.
-    fn drop_cut_tag(&mut self, text: String, out: &mut Events) {
+    /// assembler still holds the call's bytes, which came before the tail: the call ends first, as
+    /// the stream's end ends it (`closed`: the model's own stop, or a cut), so every byte leaves
+    /// in order.
+    fn drop_cut_tag(&mut self, text: String, closed: Closed, out: &mut Events) {
         self.end_stay(out);
         if self.emits() == Emits::Arguments {
-            self.close_call(Closed::ByEnd, "", out);
+            self.close_call(closed, "", out);
         }
         out.push(Event::Dropped {
             text: self.tokens.text(text),
@@ -1188,26 +1275,22 @@ impl Engine {
     }
 
     fn end(&mut self, finish: EngineFinish, out: &mut Events) {
+        // The model's own end of output is a call's third ending; any other finish is a cut. A
+        // call still open ends so, whether the tail cut a tag short or not.
+        let closed = if matches!(finish, EngineFinish::Stop) {
+            Closed::Stop
+        } else {
+            Closed::Cut
+        };
         // What the scanner held back as a possible terminal is text now that no more bytes come,
         // except a tag the end cut short.
         let scanned = self.scanner.finish();
-        self.run(&scanned, true, out);
+        self.run(&scanned, Some(closed), out);
         self.scanner.reclaim(scanned);
         self.end_stay(out);
         match self.emits() {
             Emits::Reasoning => out.push(Event::ReasoningEnd),
             Emits::Arguments => {
-                // The stop token that closes the call is hidden, so the call's end has no bytes. A
-                // shaped call of one JSON value or object needs its trailer to end where the stream
-                // does; tagged parameters close wherever it stands.
-                let closed = if matches!(finish, EngineFinish::Stop)
-                    && self.format.stop_closes(self.state)
-                    && self.call_closes("")
-                {
-                    Closed::ByMarker
-                } else {
-                    Closed::ByEnd
-                };
                 self.close_call(closed, "", out);
             }
             Emits::Content | Emits::Wrapper => {}
@@ -1278,7 +1361,7 @@ impl Parser for Engine {
                 // [`Self::place`] would take it, without the piece, like a delta read as text.
                 match scanned.whole_text() {
                     Some(whole) if self.pending.is_none() => self.place_text(whole, out),
-                    _ => self.run(&scanned, false, out),
+                    _ => self.run(&scanned, None, out),
                 }
                 self.scanner.reclaim(scanned);
                 Ok(())
@@ -1629,6 +1712,17 @@ mod tests {
         calls
     }
 
+    /// The malformed events as (text, reason), in order.
+    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn a_stop_closes_the_call_where_the_table_says_and_a_cut_stays_cut() {
         let closed = calls(&run(
@@ -1657,15 +1751,47 @@ mod tests {
     }
 
     #[test]
-    fn without_the_row_a_stop_leaves_the_call_cut() {
+    fn without_the_row_a_stop_ends_the_call_as_the_marker_would_and_says_so() {
+        // The model's own end of output inside a call under a table with no stop row: the
+        // template writes the closing marker the model skipped, so the call ends as that marker
+        // would end it, the object closed, and one `Malformed { OpenAtTheStop }` event of no
+        // bytes stands before the closing brace. A cut, by the token limit or an abort, leaves
+        // the call open as before and says `UnterminatedRegion`.
         let events = run(glm(), LAST_CALL, EngineFinish::Stop);
         assert_eq!(
             calls(&events),
             [(
-                r#"{"city": "Paris", "days": 3"#.to_string(),
+                r#"{"city": "Paris", "days": 3}"#.to_string(),
                 Some(String::new())
             )]
         );
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::OpenAtTheStop)]
+        );
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
+        assert!(
+            matches!(&events[at + 1], Event::ToolCallArguments { json, .. } if json == "}"),
+            "{events:?}"
+        );
+        assert_eq!(bytes(&events), LAST_CALL);
+        for finish in [EngineFinish::Length, EngineFinish::Abort] {
+            let events = run(glm(), LAST_CALL, finish);
+            assert_eq!(
+                calls(&events),
+                [(
+                    r#"{"city": "Paris", "days": 3"#.to_string(),
+                    Some(String::new())
+                )]
+            );
+            assert_eq!(
+                malformed(&events),
+                [(String::new(), MalformedReason::UnterminatedRegion)]
+            );
+        }
     }
 
     #[test]
@@ -1688,10 +1814,9 @@ mod tests {
 
     #[test]
     fn a_stop_closes_the_call_as_its_closing_marker_would_wherever_it_stands() {
-        // Inside a string, inside an integer, between two parameters and inside a key: the call
-        // ends as `</tool_call>` there would end it, with no bytes for the end.
+        // Inside an integer, between two parameters and inside a key: the call ends as
+        // `</tool_call>` there would end it, with no bytes for the end.
         for output in [
-            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
             "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
              <arg_key>days</arg_key><arg_value>2",
             "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>",
@@ -1719,15 +1844,34 @@ mod tests {
             );
             assert_eq!(bytes(&stopped), output);
         }
-        // Inside a string the stop closes nothing, as the marker would not: the call ends with
-        // the fragments it sent and the word that says they are no whole value.
+        // Inside a string the stop closes the string too: the model wrote nothing after the
+        // value's bytes, so they are the value whole, and the one word of no bytes before the
+        // closing quote says the stop closed it, under the row as without it; the marker closes
+        // it the same way, under its own word.
+        let output = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par";
+        for format in [glm().closes_at_stop("call"), glm()] {
+            let events = run(format, output, EngineFinish::Stop);
+            assert_eq!(
+                calls(&events),
+                [(r#"{"city": "Par"}"#.to_string(), Some(String::new()))]
+            );
+            assert_eq!(
+                malformed(&events),
+                [(String::new(), MalformedReason::OpenAtTheStop)]
+            );
+            assert_eq!(bytes(&events), output);
+        }
+        let marked = run(glm(), &format!("{output}</tool_call>"), EngineFinish::Stop);
         assert_eq!(
-            calls(&run(
-                glm().closes_at_stop("call"),
-                "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
-                EngineFinish::Stop,
-            )),
-            [(r#"{"city": "Par"#.to_string(), Some(String::new()))]
+            calls(&marked),
+            [(
+                r#"{"city": "Par"}"#.to_string(),
+                Some("</tool_call>".to_string())
+            )]
+        );
+        assert_eq!(
+            malformed(&marked),
+            [(String::new(), MalformedReason::OpenAtTheMarker)]
         );
     }
 
@@ -1851,6 +1995,145 @@ mod tests {
                 assert_eq!(bytes(&events), output);
             }
         }
+    }
+
+    /// Prose where the template only wraps, between a block's two calls: the words keep the
+    /// model's whitespace between them, one `Malformed { TextBetweenCalls }` event per word with
+    /// the whitespace before it; the whitespace right after the first call's close and the run
+    /// before the next call's opener are the template's, dropped; the same whole, at every cut
+    /// and one character at a time.
+    #[test]
+    fn prose_between_two_calls_keeps_the_models_whitespace_between_its_words() {
+        let format = Format::new("block")
+            .terminal("calls_open", "<calls>")
+            .terminal("calls_close", "</calls>")
+            .terminal("call_open", "<call>")
+            .terminal("call_close", "</call>")
+            .state("content", Emits::Content)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("content", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("calls", "calls_close", "content")
+            .calls(CallSyntax::Json);
+        let call = |city: &str| {
+            format!(
+                "<call>{{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"{city}\"}}}}</call>"
+            )
+        };
+        let output = format!(
+            "<calls>\n{}\n and also this one \n{}\n</calls>",
+            call("Paris"),
+            call("Rome")
+        );
+        let [content, _, dropped, malformed] = same_at_every_cut(&format, "", &output);
+        assert_eq!(
+            [content.as_str(), malformed.as_str()],
+            ["", "and also this one"]
+        );
+        assert_eq!(
+            dropped,
+            "<calls>\n<call></call>\n  \n<call></call>\n</calls>"
+        );
+        let events = run(format, &output, EngineFinish::Stop);
+        assert_eq!(
+            wrapping_words(&events, MalformedReason::TextBetweenCalls),
+            ["and", " also", " this", " one"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::ToolCallStart { .. }))
+                .count(),
+            2
+        );
+    }
+
+    /// Text after a call's object, before the call's closing marker: the words keep the model's
+    /// whitespace between them, one `Malformed { TextAfterTheArguments }` event per word with the
+    /// whitespace before it; the whitespace right after the object and the run before the marker
+    /// are the template's; a terminal the table ignores inside the held run keeps its place; the
+    /// same whole, at every cut and one character at a time. A stream that ends there drops the
+    /// held run as the template's and loses no word.
+    #[test]
+    fn text_after_a_calls_object_keeps_the_models_whitespace_between_its_words() {
+        let format = qwen3(CallSyntax::Json);
+        let object = "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}";
+        let output = format!("<tool_call>\n{object}\nplease note this and that\n</tool_call>");
+        let [content, _, dropped, malformed] = same_at_every_cut(&format, "", &output);
+        assert_eq!(
+            [content.as_str(), malformed.as_str()],
+            ["", "please note this and that"]
+        );
+        assert_eq!(dropped, "<tool_call>\n\n</tool_call>");
+        let events = run(format.clone(), &output, EngineFinish::Stop);
+        assert_eq!(
+            wrapping_words(&events, MalformedReason::TextAfterTheArguments),
+            ["please", " note", " this", " and", " that"]
+        );
+        // A terminal the table ignores inside the whitespace the stay holds keeps its place, the
+        // model's whitespace around it in events of its own, and the run before the marker is the
+        // template's with the terminal in it.
+        let separated = format.clone().ignores("sep", "|");
+        let output = format!("<tool_call>\n{object}\nplease | note |\n</tool_call>");
+        let [_, _, dropped, malformed] = same_at_every_cut(&separated, "", &output);
+        assert_eq!(
+            [dropped.as_str(), malformed.as_str()],
+            ["<tool_call>\n| |\n</tool_call>", "please  note"]
+        );
+        let events = run(separated, &output, EngineFinish::Stop);
+        let end = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .expect("the call's end");
+        let after_the_call: Vec<(bool, &str)> = events[end + 1..]
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped { text, .. } => Some((false, &*text.text)),
+                Event::Malformed { text, .. } => Some((true, &*text.text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            after_the_call,
+            [
+                (false, "\n"),
+                (true, "please"),
+                (true, " "),
+                (false, "|"),
+                (true, " note"),
+                (false, " "),
+                (false, "|"),
+                (false, "\n"),
+                (false, "</tool_call>"),
+            ]
+        );
+        // The stream ends after the prose: the held run is the template's, dropped.
+        let events = run(
+            format,
+            &format!("<tool_call>\n{object}\nplease note "),
+            EngineFinish::Length,
+        );
+        assert_eq!(
+            wrapping_words(&events, MalformedReason::TextAfterTheArguments),
+            ["please", " note"]
+        );
+        let [_, _, dropped, _] = kinds(&events);
+        assert_eq!(dropped, "<tool_call>\n ");
+    }
+
+    /// The `Malformed` events of `why`, each one's text: a word with the whitespace before it.
+    fn wrapping_words(events: &[Event], why: MalformedReason) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, why: reason } if *reason == why => {
+                    Some(text.text.to_string())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -2808,7 +3091,7 @@ mod tests {
     }
 
     #[test]
-    fn the_row_closes_a_call_of_another_syntax_the_same_way() {
+    fn a_stop_closes_a_call_of_another_syntax_the_same_way_with_or_without_the_row() {
         let tagged = || qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine));
         let output = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n";
         let closed = run(tagged().closes_at_stop("calls"), output, EngineFinish::Stop);
@@ -2816,12 +3099,27 @@ mod tests {
             calls(&closed),
             [(r#"{"city": "Paris"}"#.to_string(), Some(String::new()))]
         );
+        assert!(malformed(&closed).is_empty());
         assert_eq!(bytes(&closed), output);
-        let cut = run(tagged(), output, EngineFinish::Stop);
+        // Without the row the stop ends the call as the marker would too, and says so.
+        let stopped = run(tagged(), output, EngineFinish::Stop);
         assert_eq!(
-            calls(&cut),
-            [(r#"{"city": "Paris""#.to_string(), Some(String::new()))]
+            calls(&stopped),
+            [(r#"{"city": "Paris"}"#.to_string(), Some(String::new()))]
         );
+        assert_eq!(
+            malformed(&stopped),
+            [(String::new(), MalformedReason::OpenAtTheStop)]
+        );
+        assert_eq!(bytes(&stopped), output);
+        // A cut leaves it open, with the row or without.
+        for format in [tagged().closes_at_stop("calls"), tagged()] {
+            let cut = run(format, output, EngineFinish::Length);
+            assert_eq!(
+                calls(&cut),
+                [(r#"{"city": "Paris""#.to_string(), Some(String::new()))]
+            );
+        }
     }
 
     /// Two calls of Qwen3's syntax in one output.

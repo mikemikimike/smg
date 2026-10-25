@@ -19,8 +19,10 @@ use crate::{
             mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
             SUPPORTS_VISION_LABEL,
         },
-        regular::symphony::{check_names, labels_select_nothing, set_aside_by_the_registry},
-        utils::Names,
+        regular::symphony::{
+            check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
+        },
+        utils::{ModelNames, Names},
         zmq_client::zmq_handshake_address,
     },
     worker::{
@@ -134,19 +136,19 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // worker whose labels select no reader, whatever the gateway's flags
         // name (`regular::symphony::names::reads`): the model's first such worker
         // says so.
+        let flags = Names {
+            tool: app_context.router_config.tool_call_parser.clone(),
+            reasoning: app_context.router_config.reasoning_parser.clone(),
+        };
         if let Some(message) = registry_reads_over_the_flags(
             &model_card,
             &config.url,
             app_context.router_config.parser,
-            &Names {
-                tool: app_context.router_config.tool_call_parser.clone(),
-                reasoning: app_context.router_config.reasoning_parser.clone(),
-            },
+            &flags,
             &app_context.worker_registry,
         ) {
             warn!(model = %model_card.id, worker = %config.url, "{message}");
         }
-
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
             None => config.runtime_type,
@@ -253,6 +255,20 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         } else {
             vec![None] // single worker, no DP
         };
+
+        // Under Symphony the failure classes of the table that reads the model
+        // exist at zero from the registration of a worker the pipeline reads
+        // with, so a dashboard finds `failed` and `malformed` before the first
+        // such output. The table is resolved here, where the card and the
+        // names are, and published by the registration step once the worker
+        // is in the registry, so a registration refused there leaves no
+        // series behind.
+        context.data.symphony_table = symphony_table_of(
+            &model_card,
+            app_context.router_config.parser,
+            *connection_mode,
+            &flags,
+        );
 
         // The worker keeps the spec it was registered with, so every field
         // the API accepted rides along: provider, kv_block_size, the
@@ -539,6 +555,31 @@ pub(super) fn validate_parser_overrides(
             card.id
         )
     })
+}
+
+/// Under `--parser symphony`, the table whose failure classes the registration step publishes at
+/// zero for a gRPC or ZMQ worker of `card`'s model, as this worker's labels and the gateway's flags
+/// select it, so `failed`, `malformed` and the rest exist before the first such output
+/// (`regular::symphony::telemetry::init_table_series`, called once the worker is in the registry).
+/// Every worker of a model resolves one (a later worker whose labels select another table brings
+/// that table's series; publishing a table again sets nothing). An HTTP worker resolves none: only
+/// the gRPC and ZMQ pipeline reads with Symphony. The legacy parser choice and a model the legacy
+/// parsers read resolve none either (the fallback series of such a model, under `none`, exist from
+/// start-up).
+pub(super) fn symphony_table_of(
+    card: &ModelCard,
+    parser: ParserChoice,
+    connection_mode: ConnectionMode,
+    flags: &Names,
+) -> Option<&'static str> {
+    if parser != ParserChoice::Symphony || connection_mode == ConnectionMode::Http {
+        return None;
+    }
+    let labels = Names {
+        tool: card.tool_parser.clone(),
+        reasoning: card.reasoning_parser.clone(),
+    };
+    table_label_read(&ModelNames { labels, flags }, &card.id)
 }
 
 /// Under `--parser symphony`, the registry's table reads a model it knows for every worker whose
@@ -951,7 +992,7 @@ fn validate_zmq_worker_type(
 /// window), which becomes the rank's share, so the PD admission gate and the
 /// capacity sum bound each rank worker by what its rank runs instead of the
 /// whole engine's window `size` times over. Engines whose figure is per rank
-/// already (`max_num_seqs`) carry no such label and keep theirs; an
+/// already (e.g. vLLM's `max_num_seqs`) carry no such label and keep theirs; an
 /// unexpanded worker stands for the whole engine and keeps the whole window.
 /// A window the operator set by hand on the worker (`set_by_hand`, the
 /// spec's own labels, which win the merge) is the operator's statement
@@ -1097,6 +1138,122 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under `--parser symphony`, a gRPC worker's registration resolves the table whose failure
+    /// classes are published at zero: the registry's table for an unlabeled worker of a model it
+    /// knows, and another table for a worker whose labels name one. The legacy parser choice and
+    /// an HTTP worker (the pipeline that reads with Symphony never serves it) resolve none.
+    #[test]
+    fn a_workers_registration_resolves_the_table_whose_failure_classes_are_published() {
+        let known = ModelCard::new("Qwen/Qwen3-8B");
+        let table = |card: &ModelCard, parser, connection_mode| {
+            symphony_table_of(card, parser, connection_mode, &Names::default())
+        };
+        assert_eq!(
+            table(&known, ParserChoice::Legacy, ConnectionMode::Grpc),
+            None,
+            "the legacy parsers publish no table"
+        );
+        assert_eq!(
+            table(&known, ParserChoice::Symphony, ConnectionMode::Http),
+            None,
+            "an HTTP worker publishes no table"
+        );
+        assert_eq!(
+            table(&known, ParserChoice::Symphony, ConnectionMode::Grpc),
+            Some("qwen3")
+        );
+        // A later worker of the model whose labels name another table brings
+        // that table's series: requests count under it from then on.
+        let mut labeled = known.clone();
+        labeled.tool_parser = Some("kimi_k2".to_string());
+        assert_eq!(
+            table(&labeled, ParserChoice::Symphony, ConnectionMode::Zmq),
+            Some("kimi_k2")
+        );
+    }
+
+    /// The table a worker's registration resolves is published by the registration step, once the
+    /// worker is in the registry: under `--parser symphony` a gRPC worker of a model the registry
+    /// knows resolves the registry's table in the create step, a registration the registration
+    /// step refuses leaves no series behind, and an accepted one leaves the table's failure classes
+    /// at zero.
+    #[tokio::test]
+    async fn a_refused_registration_publishes_no_table_and_an_accepted_one_its_failure_classes() {
+        use crate::workflow::steps::RegisterWorkersStep;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let symphony = || {
+            app_context_with(
+                crate::config::RouterConfig::builder()
+                    .worker_startup_timeout_secs(1)
+                    .parser(ParserChoice::Symphony)
+                    .build_unchecked(),
+            )
+        };
+
+        // The replacement of a worker the registry no longer holds is refused.
+        let refused = WorkerRegistrationMode::ReplaceById {
+            worker_id: "worker-gone".to_string(),
+            expected_revision: 0,
+        };
+        let mut ctx = grpc_worker_context("Qwen/Qwen3-8B", refused, symphony());
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
+        assert!(RegisterWorkersStep.execute(&mut ctx).await.is_err());
+        assert!(
+            !handle.render().contains("smg_symphony_"),
+            "{}",
+            handle.render()
+        );
+
+        let mut ctx =
+            grpc_worker_context("Qwen/Qwen3-8B", WorkerRegistrationMode::Upsert, symphony());
+        assert_eq!(
+            CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(ctx.data.symphony_table, Some("qwen3"));
+        assert_eq!(
+            RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        let scrape = handle.render();
+        assert!(
+            scrape.lines().any(|line| {
+                line.starts_with("smg_symphony_outputs_total")
+                    && line.contains("table=\"qwen3\"")
+                    && line.contains("outcome=\"failed\"")
+                    && line.ends_with(" 0")
+            }),
+            "{scrape}"
+        );
+    }
+
+    /// A registration context for a gRPC worker of `model` at a loopback URL
+    /// under `app_context`'s configuration.
+    fn grpc_worker_context(
+        model: &str,
+        registration_mode: WorkerRegistrationMode,
+        app_context: Arc<crate::app_context::AppContext>,
+    ) -> WorkflowContext<WorkerWorkflowData> {
+        use openai_protocol::worker::WorkerModels;
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::create_worker_workflow_data;
+
+        let mut spec = WorkerSpec::new("grpc://127.0.0.1:18001");
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new(model)));
+        let mut data = create_worker_workflow_data(spec, registration_mode, app_context);
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Grpc);
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
 
     /// Under `--parser symphony`, the registration of a model's first worker whose labels select
     /// no reader (none, or a reasoning name no table answers to) says that the registry's table
@@ -2379,8 +2536,62 @@ mod tests {
 mod rank_window_tests {
     use std::collections::HashMap;
 
-    use super::labels_for_rank;
-    use crate::worker::worker::merge_labels;
+    use smg_grpc_client::tokenspeed_proto;
+
+    use super::{dp_rank_expansion, labels_for_rank};
+    use crate::{
+        routers::grpc::client::ServerInfo,
+        worker::{worker::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
+        workflow::steps::local::discover_dp::dp_info_from_labels,
+    };
+
+    #[test]
+    fn tokenspeed_discovery_bounds_each_rank_by_its_local_window() {
+        for (size, total, expected) in [(1, 1024, 1024), (16, 1024, 64), (16, 1031, 64)] {
+            for window_key in ["max_num_seqs", "max_running_requests"] {
+                let info =
+                    ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+                        server_args: Some(prost_types::Struct {
+                            fields: [("dp_size", size), (window_key, total)]
+                                .into_iter()
+                                .map(|(key, value)| {
+                                    (
+                                        key.to_string(),
+                                        prost_types::Value {
+                                            kind: Some(prost_types::value::Kind::NumberValue(
+                                                value as f64,
+                                            )),
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        }),
+                        ..Default::default()
+                    }));
+                let engine = info.to_labels();
+                let dp = dp_info_from_labels(&engine).unwrap();
+                let ranks =
+                    dp_rank_expansion(Some(&dp), ConnectionMode::Grpc, "grpc://w:30000").unwrap();
+                assert_eq!(ranks.len(), size as usize);
+                for rank in ranks {
+                    let worker = BasicWorkerBuilder::new("grpc://w:30000")
+                        .labels(discovered(&engine, rank))
+                        .build();
+                    assert_eq!(worker.max_running_requests(), Some(expected));
+                    let window = usize::from(worker.max_running_requests().unwrap());
+                    assert!(worker.try_admit_pd(window, window));
+                    assert!(!worker.try_admit_pd(1, window));
+
+                    let override_labels = labels(&[("max_running_requests", "32")]);
+                    let merged = merge_labels(&engine, &override_labels);
+                    let overridden = BasicWorkerBuilder::new("grpc://w:30000")
+                        .labels(labels_for_rank(&merged, rank, &override_labels))
+                        .build();
+                    assert_eq!(overridden.max_running_requests(), Some(32));
+                }
+            }
+        }
+    }
 
     fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

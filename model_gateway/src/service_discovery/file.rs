@@ -46,7 +46,7 @@ use tokio::{sync::mpsc, task, time};
 use tracing::{info, warn};
 
 use super::{
-    provider::{DiscoveredWorker, DiscoveryKind},
+    provider::{DiscoveredWorker, DiscoveryKind, Roles},
     reconciler::DesiredState,
     snapshot::{LastGood, SnapshotError},
 };
@@ -84,56 +84,6 @@ impl FileProviderConfig {
             check_interval,
             roles,
         })
-    }
-}
-
-/// The worker types a routing mode accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Roles {
-    Regular,
-    PrefillDecode,
-    EncodePrefillDecode,
-}
-
-impl Roles {
-    fn of(mode: &RoutingMode) -> Option<Self> {
-        match mode {
-            RoutingMode::Regular { .. } => Some(Self::Regular),
-            RoutingMode::PrefillDecode { .. } => Some(Self::PrefillDecode),
-            RoutingMode::EncodePrefillDecode { .. } => Some(Self::EncodePrefillDecode),
-            RoutingMode::OpenAI { .. }
-            | RoutingMode::Anthropic { .. }
-            | RoutingMode::Gemini { .. } => None,
-        }
-    }
-
-    fn allows(self, worker_type: WorkerType) -> bool {
-        matches!(
-            (self, worker_type),
-            (Self::Regular, WorkerType::Regular)
-                | (
-                    Self::PrefillDecode,
-                    WorkerType::Prefill | WorkerType::Decode
-                )
-                | (
-                    Self::EncodePrefillDecode,
-                    WorkerType::Encode | WorkerType::Prefill | WorkerType::Decode
-                )
-        )
-    }
-
-    /// The type of a record that names none. Regular routing has only one; a
-    /// disaggregated record must say which pool it joins.
-    fn default_type(self) -> Option<WorkerType> {
-        (self == Self::Regular).then_some(WorkerType::Regular)
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Regular => "regular",
-            Self::PrefillDecode => "prefill-decode",
-            Self::EncodePrefillDecode => "encode-prefill-decode",
-        }
     }
 }
 
@@ -187,6 +137,11 @@ impl ManifestWorker {
                 .ok_or_else(|| format!("worker_type is required in {} routing", roles.name()))?,
         };
 
+        // Port 0 is no port, as static configuration and Kubernetes
+        // annotations already refuse it.
+        if self.bootstrap_port == Some(0) {
+            return Err("bootstrap_port must be between 1 and 65535".to_string());
+        }
         if self.bootstrap_port.is_some()
             && !matches!(worker_type, WorkerType::Encode | WorkerType::Prefill)
         {
@@ -679,7 +634,7 @@ mod tests {
     /// the problem.
     #[test]
     fn malformed_manifests_are_rejected_with_the_reason() {
-        let cases: [(&str, String, Roles, &str); 15] = [
+        let cases: [(&str, String, Roles, &str); 16] = [
             ("bad JSON", "{".to_string(), Roles::Regular, "EOF"),
             (
                 "missing version",
@@ -728,6 +683,14 @@ mod tests {
                 manifest(r#"{"url": "10.0.0.11:8000"}"#),
                 Roles::PrefillDecode,
                 "worker_type is required in prefill-decode routing",
+            ),
+            (
+                "bootstrap port 0",
+                manifest(
+                    r#"{"url": "10.0.0.11:8000", "worker_type": "prefill", "bootstrap_port": 0}"#,
+                ),
+                Roles::PrefillDecode,
+                "bootstrap_port must be between 1 and 65535",
             ),
             (
                 "bootstrap port on a decode worker",

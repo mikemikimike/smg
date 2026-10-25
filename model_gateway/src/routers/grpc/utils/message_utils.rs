@@ -3,14 +3,13 @@
 //!
 //! Parallel to `chat_utils.rs` but works with `CreateMessageRequest` / `InputMessage`
 //! instead of `ChatCompletionRequest` / `ChatMessage`.
-#![allow(dead_code)] // wired in follow-up PR (pipeline factory)
 
 use std::{borrow::Cow, collections::HashMap, fmt::Display, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
-    chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
+    chat_template::{ChatTemplateContentFormat, ChatTemplateParams, PreparedTools},
     traits::{MediaHandling, PromptEncoding, RendererCapabilities, Tokenizer},
 };
 use openai_protocol::{
@@ -23,15 +22,18 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use tracing::error;
 
-use super::chat_utils;
-use crate::routers::{
-    error,
-    grpc::{
-        context::SharedComponents,
-        multimodal::{
-            self, anchor_rendered_markers, MediaPlan, MultimodalComponents, PlaceholderTokens,
+use super::{chat_utils, prepared_tools::prepare_tools};
+use crate::{
+    observability::metrics::Metrics,
+    routers::{
+        error,
+        grpc::{
+            context::SharedComponents,
+            multimodal::{
+                self, anchor_rendered_markers, MediaPlan, MultimodalComponents, PlaceholderTokens,
+            },
+            ProcessedMessages,
         },
-        ProcessedMessages,
     },
 };
 
@@ -127,7 +129,7 @@ pub(crate) fn process_messages_prompt(
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
-    let content_format = tokenizer.chat_template_content_format();
+    let content_format = tokenizer.chat_template_content_format_for_request(chat_tools.is_some());
 
     // Step 1: Convert InputMessages to chat template JSON values
     let mut transformed_messages = process_message_content_format(
@@ -166,19 +168,13 @@ pub(crate) fn process_messages_prompt(
     // Step 3: Process tool call arguments in assistant messages (reuse from
     // chat_utils), unless the renderer parses them itself as written.
     if !capabilities.raw_tool_call_arguments {
-        chat_utils::process_tool_call_arguments(&mut transformed_messages)?;
+        chat_utils::process_tool_call_arguments(&mut transformed_messages);
     }
 
-    // Step 4: Serialize tools to JSON values for template processing
-    let tools_json: Option<Vec<Value>> = chat_tools
-        .map(|tools| {
-            tools
-                .iter()
-                .map(serde_json::to_value)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()
-        .map_err(|e| format!("Failed to serialize tools: {e}"))?;
+    // Step 4: the tools as the template reads them, prepared once per
+    // distinct tool set and shared by every request that carries the same
+    // tools.
+    let prepared_tools = chat_tools.map(prepare_tools).transpose()?;
 
     // Step 5: the thinking preference the request states, or its provider
     // profile reads from the effort, as for Chat.
@@ -227,7 +223,8 @@ pub(crate) fn process_messages_prompt(
     let params = ChatTemplateParams {
         add_generation_prompt: !native_continuation,
         continue_final_message: native_continuation,
-        tools: tools_json.as_deref(),
+        tools: prepared_tools.as_deref().map(PreparedTools::tools),
+        prepared_tools: prepared_tools.as_deref(),
         template_kwargs: template_kwargs.as_ref(),
         thinking,
         ..Default::default()
@@ -322,6 +319,7 @@ pub(crate) async fn resolve_messages_media(
     model_id: &str,
     tokenizer: &dyn Tokenizer,
     messages: &[InputMessage],
+    record_media: bool,
 ) -> Result<ResolvedMedia, Response> {
     resolve_media(
         components,
@@ -329,6 +327,7 @@ pub(crate) async fn resolve_messages_media(
         tokenizer,
         "resolve_messages_media",
         || multimodal::media_plan_messages(messages),
+        record_media,
     )
     .await
 }
@@ -337,7 +336,8 @@ pub(crate) async fn resolve_messages_media(
 /// renders: the model's media-part order and, for a request with media, the
 /// plan `plan` builds from the request and the placeholder tokens (the
 /// engine's own limits applied). A renderer that writes media as template
-/// text has no plan and keeps the authored order. The chat and Messages
+/// text has no plan and keeps the authored order, its request's media
+/// recorded all the same. The chat and Messages
 /// preparation stages and count_tokens resolve through here, so the three
 /// refuse a request alike; `stage` names the caller in the log lines, as
 /// each caller's own lines named it before.
@@ -347,8 +347,28 @@ pub(crate) async fn resolve_media(
     tokenizer: &dyn Tokenizer,
     stage: &'static str,
     plan: impl FnOnce() -> MediaPlan,
+    record_media: bool,
 ) -> Result<ResolvedMedia, Response> {
+    // What a generation request carries, counted once and before any
+    // refusal or limit (a refused request's media included); a token count
+    // resolves the same plan and is not a request here.
+    let record = |plan: &MediaPlan| {
+        for &modality in plan.modalities() {
+            Metrics::record_mm_request_media(
+                model_id,
+                modality,
+                plan.count(modality),
+                &plan.source_counts(modality),
+            );
+        }
+    };
     if tokenizer.renderer_capabilities().media_handling == MediaHandling::TemplateText {
+        // A template that writes media as text takes no plan; a request
+        // that is recorded builds one for the count alone, a token count
+        // builds none.
+        if record_media {
+            record(&plan());
+        }
         return Ok(ResolvedMedia {
             media_order: MediaPartOrder::Authored,
             media: None,
@@ -375,6 +395,9 @@ pub(crate) async fn resolve_media(
     };
 
     let plan = plan();
+    if record_media {
+        record(&plan);
+    }
     // No images or video to a pool whose every worker is language model only (the engine admits
     // such a request and never schedules it), and no modality to a pool whose engines take none of
     // it (the capability matrix): both are refused here, for the chat and the Messages paths alike,
@@ -519,7 +542,7 @@ pub(crate) fn process_message_content_format(
                     )?;
                 }
                 messages::Role::Assistant => {
-                    result.push(convert_assistant_message(&message.content));
+                    result.push(convert_assistant_message(&message.content, content_format));
                 }
                 // A `system`-role message in `messages[]` (e.g. from Claude Code) is
                 // forwarded in place, preserving its position in the conversation so
@@ -740,7 +763,10 @@ fn extract_tool_result_text(tool_result: &messages::ToolResultBlock) -> String {
 ///
 /// Extracts text content, tool calls, and reasoning/thinking into the
 /// appropriate JSON fields that the chat template expects.
-fn convert_assistant_message(content: &InputContent) -> Value {
+fn convert_assistant_message(
+    content: &InputContent,
+    content_format: ChatTemplateContentFormat,
+) -> Value {
     match content {
         InputContent::String(text) => json!({"role": "assistant", "content": text}),
         InputContent::Blocks(blocks) => {
@@ -772,11 +798,12 @@ fn convert_assistant_message(content: &InputContent) -> Value {
             let mut obj = serde_json::Map::new();
             obj.insert("role".into(), Value::String("assistant".into()));
 
-            // With no text blocks (e.g. tool-calls-only), render content as
-            // `null` — the OpenAI-faithful representation the chat template
-            // expects — rather than an empty text frame.
+            // With no text blocks (a tool-use-only turn) the content is the
+            // empty content the engine's chat utils hand a template in its
+            // format (`""` or `[]`), never null, which a template that tests
+            // or concatenates every assistant message's content cannot take.
             let content = if text_parts.is_empty() {
-                Value::Null
+                chat_utils::empty_content(content_format)
             } else {
                 Value::String(text_parts.join(""))
             };
@@ -1027,8 +1054,13 @@ mod tests {
         assert_eq!(tool_calls[0]["function"]["name"], "calculator");
     }
 
+    /// An assistant turn without a text block (a tool-use-only turn) is
+    /// handed to the template as the empty content the engine's chat utils
+    /// hand it: `""` under the string format, `[]` under the OpenAI format,
+    /// never null, which a template that tests or concatenates the content
+    /// cannot take.
     #[test]
-    fn test_absent_assistant_content_renders_null() {
+    fn an_assistant_turn_without_text_is_the_engines_empty_content_in_the_templates_format() {
         let messages = vec![InputMessage {
             role: Role::Assistant,
             content: InputContent::Blocks(vec![InputContentBlock::ToolUse(
@@ -1041,14 +1073,72 @@ mod tests {
             )]),
         }];
 
-        let result = process_message_content_format(
-            &messages,
-            ChatTemplateContentFormat::String,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
+        for (format, empty) in [
+            (ChatTemplateContentFormat::String, json!("")),
+            (ChatTemplateContentFormat::OpenAI, json!([])),
+        ] {
+            let result =
+                process_message_content_format(&messages, format, None, MediaPartOrder::MediaFirst)
+                    .unwrap();
+            assert_eq!(result[0]["content"], empty, "{format:?}");
+            assert_eq!(
+                result[0]["tool_calls"][0]["function"]["name"],
+                json!("calc")
+            );
+        }
+    }
+
+    /// A tool-use-only assistant turn in the history renders through a
+    /// template that tests, splits and prints every assistant message's
+    /// content (a reasoning model's template strips the thought this way):
+    /// the check is false on the empty content and nothing is printed for
+    /// the turn, as the engine's own server renders it.
+    #[test]
+    fn a_tool_use_only_assistant_turn_renders_through_a_content_testing_template() {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(
+                "{%- for message in messages -%}\
+                 {%- if message.role == 'assistant' and '</think>' in message.content -%}\
+                 {%- set content = message.content.split('</think>')[-1].lstrip() -%}\
+                 {%- else -%}{%- set content = message.content -%}{%- endif -%}\
+                 <|{{ message.role }}|>{{ content }}\
+                 {%- if message.tool_calls -%}{%- for call in message.tool_calls -%}\
+                 <call:{{ call.function.name }}>{%- endfor -%}{%- endif -%}\
+                 <|end|>{%- endfor -%}\
+                 {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
+                    .to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            tokenizer.chat_template_content_format(),
+            ChatTemplateContentFormat::String
+        );
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "What is the weather in Paris?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "Paris"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "18 celsius"}
+                ]}
+            ]
+        }))
         .unwrap();
-        assert!(result[0]["content"].is_null());
+        let rendered =
+            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
+                .unwrap()
+                .0
+                .text;
+        assert_eq!(
+            rendered,
+            "<|user|>What is the weather in Paris?<|end|><|assistant|><call:get_weather><|end|>\
+             <|tool|>18 celsius<|end|><|assistant|>"
+        );
     }
 
     #[test]
@@ -1674,7 +1764,7 @@ mod tests {
         );
     }
 
-    /// The K3 stand-in vocabulary of the kit test (`tests/kimi_k3_tool_choice_none.rs`):
+    /// The K3 stand-in vocabulary of the kit test (`tests/grpc/kimi_k3_tool_choice_none.rs`):
     /// byte-level ranks plus the K3 control tokens, under the config that
     /// selects the renderer, so the rendering reads back as text.
     fn k3_stand_in_dir() -> tempfile::TempDir {

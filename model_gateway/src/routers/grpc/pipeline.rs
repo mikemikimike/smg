@@ -11,6 +11,8 @@
 //! response).
 
 use std::{
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -69,7 +71,7 @@ use super::{
     },
     spec::ResponseSpec,
     utils,
-    utils::error_type_for_response,
+    utils::{error_reason_for_response, error_type_for_response},
 };
 use crate::{
     config::types::RetryConfig,
@@ -119,8 +121,8 @@ pub(crate) struct PipelineDeps {
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
-    /// `None` when tenant rate limiting is disabled; read only by the
-    /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
+    /// `None` when tenant rate limiting is disabled; read by the
+    /// `RateLimitReserveStage` of every endpoint.
     rate_limit_manager: Option<Arc<RateLimitManager>>,
     /// `--queue-timeout-secs`: a request still ahead of worker selection this
     /// long after the gateway accepted it is refused instead of dispatched.
@@ -200,7 +202,8 @@ impl PipelineDeps {
             self.tool_parser_factory.clone(),
             self.reasoning_parser_factory.clone(),
             parser_resolver.clone(),
-        );
+        )
+        .with_backend(backend);
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             self.tool_parser_factory.clone(),
             self.reasoning_parser_factory.clone(),
@@ -222,7 +225,8 @@ impl PipelineDeps {
             ToolParserFactory::default(),
             ReasoningParserFactory::default(),
             utils::ParserResolver::disabled(),
-        );
+        )
+        .with_backend(backend);
         let streaming_processor = Arc::new(streaming::StreamingProcessor::new(
             ToolParserFactory::default(),
             ReasoningParserFactory::default(),
@@ -254,9 +258,9 @@ impl PipelineDeps {
 /// process stage on the request-free [`DispatchContext`].
 struct PipelineStages {
     preparation: Box<dyn PipelineStage>,
-    /// `None` for endpoints that haven't opted into tenant rate limiting
-    /// (embeddings/classify).
-    rate_limit: Option<RateLimitReserveStage>,
+    /// The tenant's reservation, taken once per logical request by every
+    /// endpoint (a no-op while tenant rate limiting is off).
+    rate_limit: RateLimitReserveStage,
     worker_selection: WorkerSelectionStage,
     /// EPD-only encode planning/staging.
     encode: Option<EncodeStage>,
@@ -288,6 +292,10 @@ enum RunOutcome {
     Final(Box<DispatchContext>, Instant),
 }
 
+/// One full pipeline run: the one box of a run, allocated where the request
+/// context moves in (see [`RequestPipeline::run`]).
+type RunFuture<'a> = Pin<Box<dyn Future<Output = Result<RunOutcome, Response>> + Send + 'a>>;
+
 impl RequestPipeline {
     /// Build the pipeline for `endpoint` in the given disaggregation `mode`,
     /// mapping `mode` to the per-stage worker-selection, execution-plan, and
@@ -311,7 +319,7 @@ impl RequestPipeline {
         let plan_kind = mode.plan_kind();
         let inject_pd_metadata = mode.inject_pd_metadata();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
-        let rate_limit = || RateLimitReserveStage::new(deps.rate_limit_manager.clone());
+        let rate_limit = RateLimitReserveStage::new(deps.rate_limit_manager.clone());
 
         let stages = match endpoint {
             Endpoint::Decisions => {
@@ -320,7 +328,7 @@ impl RequestPipeline {
                 }
                 PipelineStages {
                     preparation: Box::new(DecisionsPreparationStage),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     request_building: Box::new(DecisionsRequestBuildingStage),
@@ -333,7 +341,7 @@ impl RequestPipeline {
                     preparation: Box::new(ChatGeneratePreparationStage::new(
                         mode.multimodal_wire_pools(),
                     )),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode,
                     request_building: Box::new(ChatGenerateRequestBuildingStage::new(
@@ -352,7 +360,7 @@ impl RequestPipeline {
                     preparation: Box::new(MessagePreparationStage::new(
                         mode.multimodal_wire_pools(),
                     )),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode,
                     request_building: Box::new(MessageRequestBuildingStage::new(
@@ -370,7 +378,7 @@ impl RequestPipeline {
                 let (processor, streaming_processor) = PipelineDeps::default_processors(backend);
                 PipelineStages {
                     preparation: Box::new(CompletionPreparationStage),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode,
                     request_building: Box::new(CompletionRequestBuildingStage::new(
@@ -390,7 +398,7 @@ impl RequestPipeline {
                 }
                 PipelineStages {
                     preparation: Box::new(harmony::stages::HarmonyPreparationStage::new()),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     request_building: Box::new(harmony::stages::HarmonyRequestBuildingStage::new(
@@ -409,7 +417,7 @@ impl RequestPipeline {
                 }
                 PipelineStages {
                     preparation: Box::new(EmbeddingPreparationStage::new()),
-                    rate_limit: None,
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     request_building: Box::new(EmbeddingRequestBuildingStage::new()),
@@ -423,7 +431,7 @@ impl RequestPipeline {
                 }
                 PipelineStages {
                     preparation: Box::new(EmbeddingPreparationStage::new()),
-                    rate_limit: None,
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     request_building: Box::new(EmbeddingRequestBuildingStage::new()),
@@ -439,9 +447,7 @@ impl RequestPipeline {
                 let (processor, _streaming) = PipelineDeps::default_processors(backend);
                 PipelineStages {
                     preparation: Box::new(TranscriptionPreparationStage),
-                    // Whole-file transcription was never tenant rate-limited on
-                    // the old wrapping path; keep that.
-                    rate_limit: None,
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     // Regular-only: no PD metadata, single-plan (see the stage).
@@ -498,9 +504,10 @@ impl RequestPipeline {
             stages.preparation.name(),
             stages.preparation.execute(ctx).await
         )?;
-        if let Some(rate_limit) = &stages.rate_limit {
-            step!(rate_limit.name(), rate_limit.execute(ctx).await)?;
-        }
+        step!(
+            stages.rate_limit.name(),
+            stages.rate_limit.execute(ctx).await
+        )?;
         step!(
             stages.worker_selection.name(),
             stages.worker_selection.execute(ctx).await
@@ -613,179 +620,192 @@ impl RequestPipeline {
     /// Full two-phase run. `metrics_endpoint` enables per-attempt
     /// router-request/error/duration recording (the responses-internal entry
     /// points pass `None`, matching their historical behavior); `retry_config`
-    /// enables the dispatch-phase retry loop. Callers `Box::pin` this future:
-    /// it holds ingress + per-attempt state across awaits.
-    async fn run(
-        &self,
+    /// enables the dispatch-phase retry loop.
+    ///
+    /// The run is boxed once, here, and the context moves straight into that
+    /// box: it holds ingress + per-attempt state across awaits, and an
+    /// `async fn` hop in between would keep its own copy of the 2.6 KiB
+    /// context in every caller's state machine (an argument lives in the
+    /// future as the upvar and as the rebound local).
+    fn run<'a>(
+        &'a self,
         ctx: RequestContext,
         metrics_endpoint: Option<&'static str>,
-        retry_config: Option<&RetryConfig>,
-    ) -> Result<RunOutcome, Response> {
+        retry_config: Option<&'a RetryConfig>,
+    ) -> RunFuture<'a> {
         let requested = cache_trace::requested(ctx.input.headers.as_ref());
         if !cache_trace::enabled() && !requested {
-            return self.run_inner(ctx, metrics_endpoint, retry_config).await;
+            return Box::pin(self.run_inner(ctx, metrics_endpoint, retry_config));
         }
         let root_id = helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref())
             .map(str::to_owned);
-        Box::pin(cache_trace::scope(requested, async {
+        Box::pin(cache_trace::scope(requested, async move {
             let result = self.run_inner(ctx, metrics_endpoint, retry_config).await;
             if let Err(response) = &result {
                 cache_trace::failure(root_id.as_deref(), response.status().as_u16());
             }
             result
         }))
-        .await
     }
 
-    async fn run_inner(
-        &self,
+    /// The run itself, as the future [`Self::run`] boxes: an `async move`
+    /// block over the context it was handed, so the context has one place in
+    /// that future (an `async fn` would rebind the argument into a second).
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "an async fn keeps a by-value argument twice in its state machine (the captured argument and the rebound local); the async move block holds the 2.6 KiB context once"
+    )]
+    fn run_inner<'a>(
+        &'a self,
         mut ctx: RequestContext,
         metrics_endpoint: Option<&'static str>,
-        retry_config: Option<&RetryConfig>,
-    ) -> Result<RunOutcome, Response> {
-        let mut attempt_start = Instant::now();
-        if let Some(endpoint) = metrics_endpoint {
-            self.record_request(endpoint, &ctx.input.model_id, ctx.is_streaming());
-        }
-
-        let build = match self.run_ingress(&mut ctx).await {
-            Ok(build) => build,
-            Err(response) => {
-                self.record_error(metrics_endpoint, &ctx.input.model_id, &response);
-                return Err(response);
-            }
-        };
-        let BuildOutput { plan, spec, stamp } = build;
-
-        // Build boundary: the parsed request drops inside into_dispatch —
-        // the dispatch phase has no field that could carry it. The built
-        // plan's wire size stands in for the released buffers.
-        let model_id = ctx.input.model_id.clone();
-        let mut dctx = match ctx.into_dispatch() {
-            Ok(dctx) => Box::new(dctx),
-            Err(response) => {
-                self.record_error(metrics_endpoint, &model_id, &response);
-                return Err(response);
-            }
-        };
-        Metrics::record_request_buffers_released_early(plan.wire_len());
-
-        let max_attempts = retry_config.map_or(1, |config| config.max_retries.max(1));
-        let mut plan = Some(plan);
-        let mut spec = Some(spec);
-        let mut attempt: u32 = 0;
-        loop {
-            if attempt > 0 {
-                attempt_start = Instant::now();
-                if let Some(endpoint) = metrics_endpoint {
-                    self.record_request(endpoint, &dctx.model_id, dctx.streaming);
-                }
-            }
-
-            let last_attempt = attempt + 1 >= max_attempts;
-            let mut failure = match self
-                .run_attempt(
-                    &mut dctx,
-                    &mut plan,
-                    &mut spec,
-                    &stamp,
-                    attempt,
-                    last_attempt,
-                )
-                .await
-            {
-                Ok(Some(response)) => {
-                    if let Some(endpoint) = metrics_endpoint {
-                        self.record_duration(endpoint, &dctx.model_id, attempt_start);
-                    }
-                    return Ok(RunOutcome::Early(Self::routed_response(&dctx, response)));
-                }
-                Ok(None) => return Ok(RunOutcome::Final(dctx, attempt_start)),
-                Err(response) => response,
-            };
-
-            self.record_error(metrics_endpoint, &dctx.model_id, &failure);
-            if failure.extensions().get::<ReportedRefusal>().is_some() {
-                // The re-selection wrote this refusal's line (rate-limited,
-                // with the pool's state), as for the first selection.
-                debug!(
-                    attempt,
-                    status = %failure.status(),
-                    "pipeline attempt refused"
-                );
-            } else {
-                error!(
-                    attempt,
-                    status = %failure.status(),
-                    "pipeline attempt failed"
-                );
-            }
-            // The failed attempt's worker load must not stay elevated through
-            // the backoff window (a fresh context dropped them here before).
-            // This releases its PD admission claim too, so the retry is not
-            // queued behind its own predecessor's bootstrap rooms.
-            dctx.load_guards = None;
-            dctx.pd_prefill_guard = None;
-            // A worker's definitive answer closes the retry window on that
-            // worker: the next attempt goes to another available worker, or
-            // the answer stands as the client's response.
-            if let Some(workers) = dctx.workers.as_ref() {
-                // The alternative is sought where the retry would re-select,
-                // among the workers that decide the constraint alike too.
-                let pools = self.retry_pools(&dctx.model_id, dctx.wire);
-                let decided_on = dctx.constraint_decided_on;
-                dctx.ledger.settle(
-                    &mut failure,
-                    workers.workers(),
-                    pools
-                        .iter()
-                        .flat_map(|pool| pool.as_slice().iter())
-                        .filter(|worker| {
-                            decided_on
-                                .is_none_or(|decoding| decoding.decides_alike(worker.as_ref()))
-                                && dctx
-                                    .routing
-                                    .context_requirements
-                                    .admits(worker.as_ref(), &dctx.model_id)
-                        }),
-                );
-            }
-
-            let Some(config) = retry_config else {
-                return Err(failure);
-            };
-            if !is_retryable_response(&failure) {
-                return Err(failure);
-            }
-            if last_attempt {
-                if let Some(endpoint) = metrics_endpoint {
-                    self.record_retries_exhausted(endpoint);
-                }
-                return Err(failure);
-            }
-
-            // The retry re-selects away from the engines this attempt used,
-            // while another available worker is left to take the request.
-            let engines: Vec<String> = dctx
-                .workers
-                .iter()
-                .flat_map(WorkerSelection::engines)
-                .map(str::to_string)
-                .collect();
-            for engine in engines {
-                if !dctx.tried.contains(&engine) {
-                    dctx.tried.push(engine);
-                }
-            }
-
-            let next_attempt = attempt + 1;
-            let delay = BackoffCalculator::calculate_delay(config, attempt);
+        retry_config: Option<&'a RetryConfig>,
+    ) -> impl Future<Output = Result<RunOutcome, Response>> + Send + 'a {
+        async move {
+            let mut attempt_start = Instant::now();
             if let Some(endpoint) = metrics_endpoint {
-                self.record_retry(endpoint);
-                Metrics::record_worker_retry_backoff(next_attempt, delay);
+                self.record_request(endpoint, &ctx.input.model_id, ctx.is_streaming());
             }
-            tokio::time::sleep(delay).await;
-            attempt = next_attempt;
+
+            let build = match self.run_ingress(&mut ctx).await {
+                Ok(build) => build,
+                Err(response) => {
+                    self.record_error(metrics_endpoint, &ctx.input.model_id, &response);
+                    return Err(response);
+                }
+            };
+            let BuildOutput { plan, spec, stamp } = build;
+
+            // Build boundary: the parsed request drops inside into_dispatch —
+            // the dispatch phase has no field that could carry it. The built
+            // plan's wire size stands in for the released buffers.
+            let model_id = ctx.input.model_id.clone();
+            let mut dctx = match ctx.into_dispatch() {
+                Ok(dctx) => Box::new(dctx),
+                Err(response) => {
+                    self.record_error(metrics_endpoint, &model_id, &response);
+                    return Err(response);
+                }
+            };
+            Metrics::record_request_buffers_released_early(plan.wire_len());
+
+            let max_attempts = retry_config.map_or(1, |config| config.max_retries.max(1));
+            let mut plan = Some(plan);
+            let mut spec = Some(spec);
+            let mut attempt: u32 = 0;
+            loop {
+                if attempt > 0 {
+                    attempt_start = Instant::now();
+                    if let Some(endpoint) = metrics_endpoint {
+                        self.record_request(endpoint, &dctx.model_id, dctx.streaming);
+                    }
+                }
+
+                let last_attempt = attempt + 1 >= max_attempts;
+                let mut failure = match self
+                    .run_attempt(
+                        &mut dctx,
+                        &mut plan,
+                        &mut spec,
+                        &stamp,
+                        attempt,
+                        last_attempt,
+                    )
+                    .await
+                {
+                    Ok(Some(response)) => {
+                        if let Some(endpoint) = metrics_endpoint {
+                            self.record_duration(endpoint, &dctx.model_id, attempt_start);
+                        }
+                        return Ok(RunOutcome::Early(Self::routed_response(&dctx, response)));
+                    }
+                    Ok(None) => return Ok(RunOutcome::Final(dctx, attempt_start)),
+                    Err(response) => response,
+                };
+
+                self.record_error(metrics_endpoint, &dctx.model_id, &failure);
+                if failure.extensions().get::<ReportedRefusal>().is_some() {
+                    // The re-selection wrote this refusal's line (rate-limited,
+                    // with the pool's state), as for the first selection.
+                    debug!(
+                        attempt,
+                        status = %failure.status(),
+                        "pipeline attempt refused"
+                    );
+                } else {
+                    error!(
+                        attempt,
+                        status = %failure.status(),
+                        "pipeline attempt failed"
+                    );
+                }
+                // The failed attempt's worker load must not stay elevated through
+                // the backoff window (a fresh context dropped them here before).
+                // This releases its PD admission claim too, so the retry is not
+                // queued behind its own predecessor's bootstrap rooms.
+                dctx.load_guards = None;
+                dctx.pd_prefill_guard = None;
+                // A worker's definitive answer closes the retry window on that
+                // worker: the next attempt goes to another available worker, or
+                // the answer stands as the client's response.
+                if let Some(workers) = dctx.workers.as_ref() {
+                    // The alternative is sought where the retry would re-select,
+                    // among the workers that decide the constraint alike too.
+                    let pools = self.retry_pools(&dctx.model_id, dctx.wire);
+                    let decided_on = dctx.constraint_decided_on;
+                    dctx.ledger.settle(
+                        &mut failure,
+                        workers.workers(),
+                        pools
+                            .iter()
+                            .flat_map(|pool| pool.as_slice().iter())
+                            .filter(|worker| {
+                                decided_on
+                                    .is_none_or(|decoding| decoding.decides_alike(worker.as_ref()))
+                                    && dctx
+                                        .routing
+                                        .context_requirements
+                                        .admits(worker.as_ref(), &dctx.model_id)
+                            }),
+                    );
+                }
+
+                let Some(config) = retry_config else {
+                    return Err(failure);
+                };
+                if !is_retryable_response(&failure) {
+                    return Err(failure);
+                }
+                if last_attempt {
+                    if let Some(endpoint) = metrics_endpoint {
+                        self.record_retries_exhausted(endpoint);
+                    }
+                    return Err(failure);
+                }
+
+                // The retry re-selects away from the engines this attempt used,
+                // while another available worker is left to take the request.
+                let engines: Vec<String> = dctx
+                    .workers
+                    .iter()
+                    .flat_map(WorkerSelection::engines)
+                    .map(str::to_string)
+                    .collect();
+                for engine in engines {
+                    if !dctx.tried.contains(&engine) {
+                        dctx.tried.push(engine);
+                    }
+                }
+
+                let next_attempt = attempt + 1;
+                let delay = BackoffCalculator::calculate_delay(config, attempt);
+                if let Some(endpoint) = metrics_endpoint {
+                    self.record_retry(endpoint);
+                    Metrics::record_worker_retry_backoff(next_attempt, delay);
+                }
+                tokio::time::sleep(delay).await;
+                attempt = next_attempt;
+            }
         }
     }
 
@@ -845,8 +865,9 @@ impl RequestPipeline {
         );
     }
 
-    /// A refused request under this pipeline's labels, by its class: one of
-    /// the gateway's own refusals, or the response's status.
+    /// A refused request under this pipeline's labels, by its class (one of
+    /// the gateway's own refusals, or the response's status) and the cause
+    /// behind it (the worker's status, the refusal's code).
     pub(crate) fn record_error(
         &self,
         endpoint: Option<&'static str>,
@@ -861,6 +882,7 @@ impl RequestPipeline {
                 self.worker_registry.metric_model_label(model),
                 endpoint,
                 error_type_for_response(response),
+                error_reason_for_response(response),
             );
         }
     }
@@ -924,6 +946,7 @@ impl RequestPipeline {
             self.worker_registry.metric_model_label(model),
             endpoint,
             metrics_labels::ERROR_INTERNAL,
+            metrics_labels::REASON_INTERNAL,
         );
         error::internal_error("wrong_response_type", "Internal error: wrong response type")
     }
@@ -942,6 +965,7 @@ impl RequestPipeline {
             self.worker_registry.metric_model_label(model),
             endpoint,
             metrics_labels::ERROR_INTERNAL,
+            metrics_labels::REASON_INTERNAL,
         );
         error::internal_error("no_response_produced", "No response produced")
     }
@@ -998,25 +1022,15 @@ impl RequestPipeline {
     pub(in crate::routers::grpc) fn generate_settlement(
         responses: &[GenerateResponse],
     ) -> UsageSettlement {
+        TokenCounts::of_generated(responses).settlement()
+    }
+
+    /// The settlement of an embeddings or classification answer: the prompt
+    /// tokens the engine counted, no completion.
+    pub(in crate::routers::grpc) fn prompt_only_settlement(prompt_tokens: u32) -> UsageSettlement {
         UsageSettlement {
-            actual_input_tokens: responses
-                .iter()
-                .map(|r| r.meta_info.prompt_tokens)
-                .max()
-                .unwrap_or(0),
-            completion_tokens: responses
-                .iter()
-                .map(|r| r.meta_info.completion_tokens)
-                .sum(),
-            cached_input_tokens: responses
-                .iter()
-                .map(|r| r.meta_info.cached_tokens)
-                .max()
-                .unwrap_or(0),
-            reasoning_tokens: responses
-                .iter()
-                .map(|r| r.meta_info.reasoning_tokens.unwrap_or(0))
-                .sum(),
+            actual_input_tokens: prompt_tokens,
+            ..UsageSettlement::default()
         }
     }
 
@@ -1037,30 +1051,33 @@ impl RequestPipeline {
     /// whether the backend request started. A run that fails before then
     /// hands its response to the barrier; the caller gets a placeholder the
     /// Responses stream never forwards.
-    async fn run_signalling(
-        &self,
+    fn run_signalling<'a>(
+        &'a self,
         ctx: RequestContext,
         metrics_endpoint: Option<&'static str>,
-        retry_config: Option<&RetryConfig>,
+        retry_config: Option<&'a RetryConfig>,
         stream_start: Option<StreamStartupSender>,
-    ) -> Result<RunOutcome, Response> {
-        let outcome = Box::pin(self.run(ctx, metrics_endpoint, retry_config)).await;
-        let Some(startup) = stream_start else {
-            return outcome;
-        };
-        // A dropped receiver means the client left; nothing waits for either
-        // message.
-        match outcome {
-            Ok(outcome) => {
-                let _ = startup.send(Ok(()));
-                Ok(outcome)
-            }
-            Err(failure) => {
-                let _ = startup.send(Err(failure));
-                Err(error::internal_error(
-                    "responses_stream_startup_failed",
-                    "Streaming response failed before backend request startup",
-                ))
+    ) -> impl Future<Output = Result<RunOutcome, Response>> + Send + 'a {
+        let run = self.run(ctx, metrics_endpoint, retry_config);
+        async move {
+            let outcome = run.await;
+            let Some(startup) = stream_start else {
+                return outcome;
+            };
+            // A dropped receiver means the client left; nothing waits for
+            // either message.
+            match outcome {
+                Ok(outcome) => {
+                    let _ = startup.send(Ok(()));
+                    Ok(outcome)
+                }
+                Err(failure) => {
+                    let _ = startup.send(Err(failure));
+                    Err(error::internal_error(
+                        "responses_stream_startup_failed",
+                        "Streaming response failed before backend request startup",
+                    ))
+                }
             }
         }
     }
@@ -1078,15 +1095,14 @@ impl RequestPipeline {
         retry_config: Option<&RetryConfig>,
         stream_start: Option<StreamStartupSender>,
     ) -> Response {
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-        ctx.input.rate_limit_cell = rate_limit_cell;
-
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CHAT;
-        match self
-            .run_signalling(ctx, Some(ENDPOINT), retry_config, stream_start)
-            .await
-        {
+        let run = {
+            let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run_signalling(ctx, Some(ENDPOINT), retry_config, stream_start)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Chat(response)) => {
@@ -1141,12 +1157,14 @@ impl RequestPipeline {
             .as_ref()
             .and_then(|sp| sp.n)
             .unwrap_or(1);
-        let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-        ctx.input.rate_limit_cell = rate_limit_cell;
-
         const ENDPOINT: &str = metrics_labels::ENDPOINT_GENERATE;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+        let run = {
+            let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), retry_config)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Generate(response)) => {
@@ -1184,12 +1202,14 @@ impl RequestPipeline {
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
     ) -> Response {
-        let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-        ctx.input.rate_limit_cell = rate_limit_cell;
-
         const ENDPOINT: &str = metrics_labels::ENDPOINT_COMPLETIONS;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+        let run = {
+            let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), retry_config)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Completion(response)) => {
@@ -1226,12 +1246,14 @@ impl RequestPipeline {
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
     ) -> Response {
-        let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-        ctx.input.rate_limit_cell = rate_limit_cell;
-
         const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+        let run = {
+            let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), retry_config)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Messages(response)) => {
@@ -1274,11 +1296,14 @@ impl RequestPipeline {
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
     ) -> Response {
-        let mut ctx = RequestContext::for_decisions(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-        ctx.input.rate_limit_cell = rate_limit_cell;
         const ENDPOINT: &str = metrics_labels::ENDPOINT_DECISIONS;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), retry_config)).await {
+        let run = {
+            let mut ctx = RequestContext::for_decisions(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), retry_config)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Decisions(response)) => {
@@ -1311,15 +1336,26 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
-        let mut ctx = RequestContext::for_embedding(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
         const ENDPOINT: &str = metrics_labels::ENDPOINT_EMBEDDINGS;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), None)).await {
+        let run = {
+            let mut ctx = RequestContext::for_embedding(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), None)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Embedding(response)) => {
+                    // The prompt tokens the engine counted; an embedding has
+                    // no completion.
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::prompt_only_settlement(response.usage.prompt_tokens),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1337,6 +1373,10 @@ impl RequestPipeline {
     }
 
     /// Execute the complete pipeline for an audio transcription request.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the rate-limited endpoint entry contract"
+    )]
     pub async fn execute_transcription(
         &self,
         request: Arc<openai_protocol::transcription::TranscriptionRequest>,
@@ -1345,18 +1385,29 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
-        let mut ctx =
-            RequestContext::for_transcription(request, audio, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
         // Same label the HTTP layer records for /v1/audio/transcriptions, so
         // the endpoint's metrics don't split across backends.
         const ENDPOINT: &str = metrics_labels::ENDPOINT_AUDIO_TRANSCRIPTIONS;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), None)).await {
+        let run = {
+            let mut ctx =
+                RequestContext::for_transcription(request, audio, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), None)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Transcription { text, format }) => {
+                    // The engine's counts of the transcript's generation, as
+                    // the response stage recorded them.
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::recorded_settlement(&dctx.response),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(
                         &dctx,
@@ -1386,15 +1437,26 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
-        let mut ctx = RequestContext::for_classify(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CLASSIFY;
-        match Box::pin(self.run(ctx, Some(ENDPOINT), None)).await {
+        let run = {
+            let mut ctx = RequestContext::for_classify(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
+            self.run(ctx, Some(ENDPOINT), None)
+        };
+        match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Classify(response)) => {
+                    // The prompt tokens the engine counted; a classification
+                    // has no completion.
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::prompt_only_settlement(response.usage.prompt_tokens),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1425,10 +1487,12 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<ChatCompletionResponse, Response> {
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
-        match Box::pin(self.run(ctx, None, None)).await {
+        let run = {
+            let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            self.run(ctx, None, None)
+        };
+        match run.await {
             Ok(RunOutcome::Early(_)) => {
                 // Streaming not supported for responses sync mode
                 error!(
@@ -1478,15 +1542,17 @@ impl RequestPipeline {
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
-        let mut ctx = RequestContext::for_responses(
-            Arc::new(request.clone()),
-            None,                  // No headers needed for internal pipeline execution
-            request.model.clone(), // Model ID from request
-            harmony_ctx.components.clone(),
-        );
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
-        let mut dctx = match Box::pin(self.run(ctx, None, None)).await {
+        let run = {
+            let mut ctx = RequestContext::for_responses(
+                Arc::new(request.clone()),
+                None,                  // No headers needed for internal pipeline execution
+                request.model.clone(), // Model ID from request
+                harmony_ctx.components.clone(),
+            );
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            self.run(ctx, None, None)
+        };
+        let mut dctx = match run.await {
             Ok(RunOutcome::Early(response)) => {
                 error!(
                     function = "execute_harmony_responses",
@@ -1525,15 +1591,17 @@ impl RequestPipeline {
         tenant_request_meta: Option<TenantRequestMeta>,
         stream_start: Option<StreamStartupSender>,
     ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
-        let mut ctx = RequestContext::for_responses(
-            Arc::new(request.clone()),
-            None,
-            request.model.clone(),
-            harmony_ctx.components.clone(),
-        );
-        ctx.input.tenant_request_meta = tenant_request_meta;
-
-        let mut dctx = match self.run_signalling(ctx, None, None, stream_start).await {
+        let run = {
+            let mut ctx = RequestContext::for_responses(
+                Arc::new(request.clone()),
+                None,
+                request.model.clone(),
+                harmony_ctx.components.clone(),
+            );
+            ctx.input.tenant_request_meta = tenant_request_meta;
+            self.run_signalling(ctx, None, None, stream_start)
+        };
+        let mut dctx = match run.await {
             Ok(RunOutcome::Early(response)) => {
                 error!(
                     function = "execute_harmony_responses_streaming",
@@ -1679,9 +1747,8 @@ impl RequestPipeline {
     /// per-mode args and optional stages need freezing.
     fn signature(&self) -> String {
         format!(
-            "{}|rate_limit={}|encode={}|{}",
+            "{}|encode={}|{}",
             self.stages.worker_selection.signature(),
-            self.stages.rate_limit.is_some(),
             self.stages.encode.is_some(),
             self.stages.request_building.signature(),
         )
@@ -1729,16 +1796,10 @@ mod build_parity_tests {
             Endpoint::Transcription => "TranscriptionRequestBuildingStage".to_string(),
             Endpoint::Decisions => "DecisionsRequestBuildingStage".to_string(),
         };
-        let rate_limit = !matches!(
-            endpoint,
-            Endpoint::Embeddings | Endpoint::Classify | Endpoint::Transcription
-        );
         // Harmony never carries the encode stage.
         let encode = encode && !matches!(endpoint, Endpoint::Harmony);
         (
-            format!(
-                "WorkerSelectionStage({selection})|rate_limit={rate_limit}|encode={encode}|{build}"
-            ),
+            format!("WorkerSelectionStage({selection})|encode={encode}|{build}"),
             backend,
         )
     }
@@ -1926,14 +1987,17 @@ mod request_release_tests {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use futures::Stream;
     use llm_tokenizer::{
-        traits::Tokenizer, HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
+        traits::{Decoder, Tokenizer},
+        HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
     };
     use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::{
         completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
     };
     use portpicker::pick_unused_port;
-    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts, vllm_proto};
+    use smg_grpc_client::{
+        common_proto as common, constraint_failed_status, tokenspeed_proto as ts, vllm_proto,
+    };
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -1999,7 +2063,10 @@ mod request_release_tests {
     /// `fail_always` fails every call, `fail_internal` answers every call with
     /// INTERNAL (an engine that took the request and failed on it),
     /// `fail_mid_stream` ends the stream with the engine's own error after
-    /// its first frame, and
+    /// its first frame, `fail_constraint` admits the request and ends the
+    /// stream with the engine's report that it could not continue the
+    /// request under its constraint, `fail_engine_report` admits it and ends
+    /// the stream with the engine's own report before any frame, and
     /// `answer_after` stalls the generate RPC, standing in for an engine that
     /// answers only at its own deadline; `frame_gap` paces the response frames,
     /// for a stream that outlasts its dispatch. Every call's input token ids,
@@ -2014,6 +2081,8 @@ mod request_release_tests {
         fail_always: bool,
         fail_internal: bool,
         fail_mid_stream: bool,
+        fail_constraint: bool,
+        fail_engine_report: bool,
         answer_after: Option<Duration>,
         frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
@@ -2123,6 +2192,23 @@ mod request_release_tests {
             }
             if self.fail_internal {
                 return Err(Status::internal("release-test induced engine failure"));
+            }
+            if self.fail_constraint {
+                // The engine admitted the request and could not continue it
+                // under its constraint: the call succeeds and the stream ends
+                // with the report before any frame, as the wires end it.
+                let items: Vec<Result<ts::GenerateResponse, Status>> = vec![Err(
+                    constraint_failed_status("release-test induced grammar failure"),
+                )];
+                return Ok(TonicResponse::new(Box::pin(futures::stream::iter(items))));
+            }
+            if self.fail_engine_report {
+                // The engine failed the request and named no cause: the
+                // report the ZMQ wires end their streams with for an `error`
+                // finish, before any frame.
+                let items: Vec<Result<ts::GenerateResponse, Status>> =
+                    vec![Err(Status::internal(ENGINE_ERROR_MESSAGE))];
+                return Ok(TonicResponse::new(Box::pin(futures::stream::iter(items))));
             }
             if let Some(delay) = self.answer_after {
                 tokio::time::sleep(delay).await;
@@ -3063,8 +3149,7 @@ mod request_release_tests {
         fn export(
             &self,
             batch: Vec<opentelemetry_sdk::trace::SpanData>,
-        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
-        {
+        ) -> impl Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
             self.0
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -3656,9 +3741,18 @@ mod request_release_tests {
         components: Arc<SharedComponents>,
         retry: &RetryConfig,
     ) -> Response {
+        run_completion_of(pipeline, components, retry, completion_request(false)).await
+    }
+
+    async fn run_completion_of(
+        pipeline: RequestPipeline,
+        components: Arc<SharedComponents>,
+        retry: &RetryConfig,
+        request: Arc<CompletionRequest>,
+    ) -> Response {
         pipeline
             .execute_completion(
-                completion_request(false),
+                request,
                 None,
                 MODEL.to_string(),
                 components,
@@ -3667,6 +3761,19 @@ mod request_release_tests {
                 Some(retry),
             )
             .await
+    }
+
+    /// The completion with a constraint on its output (a JSON schema).
+    fn constrained_completion_request() -> Arc<CompletionRequest> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "prompt": "Hello world",
+                "stream": false,
+                "json_schema": "{\"type\":\"object\"}",
+            }))
+            .expect("constrained completion request"),
+        )
     }
 
     fn calls_seen(ids: &Mutex<Vec<String>>) -> usize {
@@ -3734,6 +3841,93 @@ mod request_release_tests {
         );
         assert!(!is_retryable_response(&response));
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// A worker's report that the engine could not continue the request under
+    /// its constraint is the request's answer, a 422 `constraint_failed`: one
+    /// call on the worker and none elsewhere (the same tokens fail the same
+    /// way on a replay, each replay a prefill), terminal for the retry layer,
+    /// and no breaker sample against a worker that is healthy.
+    #[tokio::test]
+    async fn a_constraint_failure_is_answered_once_and_never_replayed() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_constraint: true,
+            seen_request_ids: Arc::clone(&seen),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker_with_breaker(&worker_registry, port, 1);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+        assert_eq!(response.status(), http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "constraint_failed"
+        );
+        assert_eq!(calls_seen(&seen), 1, "the answer is final for this request");
+        assert!(!is_retryable_response(&response));
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Closed,
+            "a healthy worker takes no sample"
+        );
+    }
+
+    /// The engine's own report on a constrained request (an `error` finish
+    /// that names no cause: a failed KV handoff or a pause as often as a
+    /// grammar rejection) is answered exactly as on a request without a
+    /// constraint: the same status and code (the engine's error, a 500, never
+    /// the constraint's 422, which only a worker's own attribution produces),
+    /// the same calls on the worker (the retry layer replaying it as before)
+    /// and the same breaker state.
+    #[tokio::test]
+    async fn an_engines_unattributed_report_on_a_constrained_request_keeps_its_shape() {
+        let mut outcomes = Vec::new();
+        for request in [completion_request(false), constrained_completion_request()] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let port = spawn_stub(GatedScheduler {
+                fail_engine_report: true,
+                seen_request_ids: Arc::clone(&seen),
+                ..Default::default()
+            })
+            .await;
+
+            let worker_registry = Arc::new(WorkerRegistry::new());
+            let worker = register_worker_with_breaker(&worker_registry, port, 1);
+            let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+            let components = components(worker_registry).await;
+
+            let response =
+                run_completion_of(pipeline, components, &fast_retry_config(2), request).await;
+            outcomes.push((
+                response.status(),
+                error::extract_error_code_from_response(&response).to_string(),
+                calls_seen(&seen),
+                worker.circuit_breaker_state(),
+            ));
+        }
+
+        let (plain, constrained) = (&outcomes[0], &outcomes[1]);
+        assert_eq!(plain.0, http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(
+            constrained.1, "constraint_failed",
+            "no attribution, no constraint failure"
+        );
+        assert!(
+            plain.2 >= 2,
+            "the engine's error is replayed as before ({} calls)",
+            plain.2
+        );
+        assert_eq!(
+            constrained, plain,
+            "a constraint changes nothing about the engine's own report"
+        );
     }
 
     /// A smaller engine is not an alternative to the engine that returned a
@@ -4386,7 +4580,7 @@ mod request_release_tests {
             serde_json::json!({
                 "model": MODEL,
                 "messages": [{"role": "user", "content": "Hi"}],
-                "reasoning_effort": "medium",
+                "reasoning_effort": "turbo",
                 "max_tokens": 1,
             }),
             false,
@@ -4396,6 +4590,50 @@ mod request_release_tests {
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("Invalid reasoning effort"), "{body}");
         assert!(ids.is_empty(), "nothing must reach the worker");
+    }
+
+    /// `medium` is a level of the checkpoint's own chat template (budget
+    /// 62): the top-level field and the template kwarg both render it
+    /// instead of refusing the request.
+    #[tokio::test]
+    async fn deepseek_v41_medium_effort_renders_the_checkpoints_budget() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let tokenizer = HuggingFaceTokenizer::from_file(
+            dir.join("tokenizer.json")
+                .to_str()
+                .expect("utf-8 tokenizer path"),
+        )
+        .expect("load the DeepSeek-V4.1 tokenizer");
+        for request in [
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "reasoning_effort": "medium",
+                "max_tokens": 1,
+            }),
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "chat_template_kwargs": {"reasoning_effort": "medium"},
+                "max_tokens": 1,
+            }),
+        ] {
+            let (status, body, ids, _) = v41_run_chat(&dir, request.clone(), false).await;
+            assert_eq!(
+                status,
+                http::StatusCode::OK,
+                "{request}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let prompt = tokenizer.decode(&ids[0], false).expect("decode the prompt");
+            assert!(
+                prompt.contains("Reasoning Effort: 62 (range"),
+                "{request}: {prompt}"
+            );
+        }
     }
 
     /// One image expands to exactly the reference span: `<｜deepseek_image｜>`
@@ -4484,7 +4722,57 @@ mod request_release_tests {
             })
             .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"rate_limit_error\""), "{line}");
+        assert!(line.contains("reason=\"overloaded\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// Two dispatch failures of one class with different causes are two
+    /// series of the error family, one per `reason`, that sum to the count
+    /// the family had before the label existed; the gateway's own refusal
+    /// carries the reason its code names.
+    #[test]
+    fn a_router_error_carries_the_reason_behind_its_class() {
+        use crate::{observability::metrics::test_support::render_with_recorder, routers::error};
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, 1, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let failed =
+            |status: Status| status.to_http_error("start_generation_failed", "failed".to_string());
+        let rendered = render_with_recorder(|| {
+            for failure in [
+                failed(Status::unavailable("draining")),
+                failed(Status::cancelled("stream reset")),
+                failed(Status::cancelled("connection closed")),
+                error::service_unavailable(
+                    placement::NO_AVAILABLE_WORKERS_CODE,
+                    "every worker is down",
+                ),
+            ] {
+                pipeline.record_error(Some(metrics_labels::ENDPOINT_COMPLETIONS), MODEL, &failure);
+            }
+        });
+        let samples: Vec<&str> = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains(&format!("model=\"{MODEL}\""))
+            })
+            .collect();
+        let value = |error_type: &str, reason: &str| -> u64 {
+            let line = samples
+                .iter()
+                .find(|line| {
+                    line.contains(&format!("error_type=\"{error_type}\""))
+                        && line.contains(&format!("reason=\"{reason}\""))
+                })
+                .unwrap_or_else(|| panic!("a {error_type}/{reason} series:\n{rendered}"));
+            line.rsplit(' ').next().unwrap().parse().unwrap()
+        };
+        assert_eq!(samples.len(), 3, "{rendered}");
+        assert_eq!(value("backend_error", "engine_unavailable"), 1);
+        assert_eq!(value("backend_error", "transport_disconnect"), 2);
+        assert_eq!(value("unavailable", "no_available_workers"), 1);
     }
 
     /// The same image to the same model served by a worker without a vision
@@ -4777,10 +5065,13 @@ mod request_release_tests {
 
 #[cfg(test)]
 mod rate_limit_reserve_tests {
+    use bytes::Bytes;
+    use llm_multimodal::registry::transcription::FAMILIES;
     use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
     use openai_protocol::{
         decisions::{DecisionInputTokensDetails, DecisionOutputTokensDetails},
         generate::{GenerateFinishReason, GenerateFinishType, GenerateMetaInfo, GenerateRequest},
+        transcription::{AudioFile, TranscriptionRequest},
     };
     use serde_json::json;
 
@@ -4788,7 +5079,10 @@ mod rate_limit_reserve_tests {
     use crate::{
         config::types::RouterConfig,
         rate_limit::{RateLimitManager, Reservation, ReserveRequest},
-        routers::grpc::regular::symphony::template::Templates,
+        routers::grpc::{
+            regular::symphony::template::Templates, spec::TranscriptionResponseFormat,
+            ProcessedMessages,
+        },
         tenant::TenantKey,
     };
 
@@ -4911,7 +5205,7 @@ mod rate_limit_reserve_tests {
 
     #[tokio::test]
     async fn endpoint_without_a_cell_is_a_no_op() {
-        // Responses/embeddings/classify don't set rate_limit_cell today.
+        // The Responses iterations set no rate_limit_cell.
         let manager = manager_with_tokens_per_minute(6);
         let components = test_components().await;
         let mut ctx = ctx_with_tokens(components, 5);
@@ -5108,6 +5402,154 @@ mod rate_limit_reserve_tests {
         assert_eq!(
             RequestPipeline::decisions_settlement(&beyond).actual_input_tokens,
             u32::MAX
+        );
+    }
+
+    fn with_tenant_and_cell(mut ctx: RequestContext) -> RequestContext {
+        ctx.input.tenant_request_meta = Some(TenantRequestMeta::new(TenantKey::new("test-tenant")));
+        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
+        ctx
+    }
+
+    /// An embeddings request after its preparation: `num_tokens` input tokens.
+    fn embedding_ctx(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
+        let request: EmbeddingRequest =
+            serde_json::from_value(json!({"model": MODEL, "input": "Hello"})).unwrap();
+        let mut ctx =
+            RequestContext::for_embedding(Arc::new(request), None, MODEL.to_string(), components);
+        ctx.state.preparation = Some(PreparationOutput::Embedding {
+            original_text: "Hello".to_string(),
+            token_ids: vec![0; num_tokens],
+        });
+        with_tenant_and_cell(ctx)
+    }
+
+    /// A classification request after its preparation, which it shares with
+    /// embeddings: `num_tokens` input tokens.
+    fn classify_ctx(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
+        let request: ClassifyRequest =
+            serde_json::from_value(json!({"model": MODEL, "input": "Hello"})).unwrap();
+        let mut ctx =
+            RequestContext::for_classify(Arc::new(request), None, MODEL.to_string(), components);
+        ctx.state.preparation = Some(PreparationOutput::Embedding {
+            original_text: "Hello".to_string(),
+            token_ids: vec![0; num_tokens],
+        });
+        with_tenant_and_cell(ctx)
+    }
+
+    /// A transcription request after its preparation: the chat-shaped
+    /// request the family's convention made, rendered to `num_tokens` tokens.
+    fn transcription_ctx(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
+        let request = TranscriptionRequest {
+            model: MODEL.to_string(),
+            ..Default::default()
+        };
+        let audio = AudioFile {
+            bytes: Bytes::from_static(b"not audio"),
+            file_name: "clip.wav".to_string(),
+            content_type: None,
+        };
+        let chat_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .unwrap();
+        let mut ctx = RequestContext::for_transcription(
+            Arc::new(request),
+            Arc::new(audio),
+            None,
+            MODEL.to_string(),
+            components,
+        );
+        ctx.state.preparation = Some(PreparationOutput::Transcription {
+            token_ids: vec![0; num_tokens],
+            processed_messages: ProcessedMessages {
+                text: String::new(),
+                unbilled_prompt_tokens: 0,
+                continued_final_message: false,
+            },
+            chat_request: Arc::new(chat_request),
+            format: TranscriptionResponseFormat::Json,
+            family: FAMILIES[0],
+        });
+        with_tenant_and_cell(ctx)
+    }
+
+    /// The reservation of `endpoint`, as the chat endpoint takes it: the
+    /// estimate is the preparation's input token count; a budget that cannot
+    /// hold it refuses with the chat endpoint's 429, a budget that holds it
+    /// once admits the first request and refuses the second.
+    async fn assert_reserves_like_chat(
+        endpoint: &str,
+        make: fn(Arc<SharedComponents>, usize) -> RequestContext,
+    ) {
+        let components = test_components().await;
+
+        // Too small for one 5-token reservation.
+        let stage = RateLimitReserveStage::new(Some(manager_with_tokens_per_minute(3)));
+        let mut ctx = make(components.clone(), 5);
+        let response = stage.execute(&mut ctx).await.expect_err(endpoint);
+        assert_eq!(
+            response.status(),
+            http::StatusCode::TOO_MANY_REQUESTS,
+            "{endpoint}"
+        );
+        assert!(
+            matches!(
+                ctx.input.rate_limit_cell.as_ref().unwrap().peek(),
+                Some(RateLimitOutcome::Denied)
+            ),
+            "{endpoint}: the denial is cached on the cell"
+        );
+
+        // Room for one 5-token reservation, not two (5 + 5 > 6).
+        let stage = RateLimitReserveStage::new(Some(manager_with_tokens_per_minute(6)));
+        let mut first = make(components.clone(), 5);
+        assert!(stage.execute(&mut first).await.is_ok(), "{endpoint}");
+        assert!(
+            matches!(
+                first.input.rate_limit_cell.as_ref().unwrap().peek(),
+                Some(RateLimitOutcome::Admitted(_))
+            ),
+            "{endpoint}: the admission is cached on the cell"
+        );
+        let mut second = make(components, 5);
+        let response = stage.execute(&mut second).await.expect_err(endpoint);
+        assert_eq!(
+            response.status(),
+            http::StatusCode::TOO_MANY_REQUESTS,
+            "{endpoint}: the first request's tokens are debited"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_embeddings_request_reserves_its_input_tokens_like_a_chat_request() {
+        assert_reserves_like_chat("embeddings", embedding_ctx).await;
+    }
+
+    #[tokio::test]
+    async fn a_classify_request_reserves_its_input_tokens_like_a_chat_request() {
+        assert_reserves_like_chat("classify", classify_ctx).await;
+    }
+
+    #[tokio::test]
+    async fn a_transcription_request_reserves_its_prompt_tokens_like_a_chat_request() {
+        assert_reserves_like_chat("transcription", transcription_ctx).await;
+    }
+
+    /// Embeddings and classification settle the prompt tokens the engine
+    /// counted and nothing else.
+    #[test]
+    fn prompt_only_settlement_charges_the_prompt_alone() {
+        assert_eq!(
+            RequestPipeline::prompt_only_settlement(7),
+            UsageSettlement {
+                actual_input_tokens: 7,
+                completion_tokens: 0,
+                cached_input_tokens: 0,
+                reasoning_tokens: 0,
+            }
         );
     }
 }

@@ -52,8 +52,9 @@ mod tests {
 
     use super::*;
     use crate::{
+        adapt,
         engine::Engine,
-        event::{Event, Events, FinishReason},
+        event::{DropReason, Event, Events, FinishReason},
         input::{EngineFinish, Input},
         parser::Parser,
         testing::{
@@ -180,6 +181,51 @@ mod tests {
         assert_eq!(bytes(&cut), call);
         assert_eq!(arguments_of(&cut, 0), arguments_of(&whole, 0));
         assert!(malformed(&cut).is_empty());
+    }
+
+    /// A value the tool types whole (`tags`, an array) in a CDATA section with a word after the
+    /// closer, before the closing tag: the value is the section's text, written at the word,
+    /// which is refused (counted by a `Malformed` event of no bytes, its bytes `Dropped {
+    /// MalformedCall }`, never a chat client's content); the next parameter and the call's end
+    /// follow as if the word were not there; the same whole, at every cut and one character at a
+    /// time. (The word used to drop the held value with the carried bytes, and the closing tag
+    /// then read past them.)
+    #[test]
+    fn a_whole_value_in_a_cdata_section_followed_by_a_word_is_the_sections_text() {
+        let call = concat!(
+            "<function name=\"spotify_play\"><param name=\"tags\"><![CDATA[['pop', 'live']]]>tail",
+            "</param><param name=\"duration\">15</param></function>"
+        );
+        let said = the_same_at_every_cut(|pieces| run(PROMPT, pieces), call);
+        assert_eq!(
+            said.calls,
+            vec![(
+                "spotify_play".to_string(),
+                r#"{"tags": ["pop", "live"], "duration": 15}"#.to_string()
+            )]
+        );
+        let events = run(PROMPT, &[call]);
+        assert_eq!(bytes(&events), call);
+        assert_eq!(malformed(&events), vec![""]);
+        let refused: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refused, ["tail"]);
+        assert_eq!(
+            adapt::chat::message(0, &events)
+                .message
+                .content
+                .as_deref()
+                .unwrap_or(""),
+            ""
+        );
     }
 
     #[test]

@@ -108,12 +108,24 @@ is a later step).
 
 ## What a table read from a response template adds
 
-- A table can say that the stream's stop closes the call in a state (`Format::closes_at_stop`),
-  for a family whose last call ends with a stop token the stop decoder hides: a stream that stops
-  there ends the call as its closing terminal would, with no bytes. One cut for length, aborted,
-  or ended with any finish but `Stop` is cut as before; a driver hands a stop sequence of the
-  request's that matched inside the call over as such a finish, so that it never completes the
-  call (the stop row in `format`).
+- The stream's stop (`EngineFinish::Stop`, the model's own end of output) is a call's third
+  ending, beside its closing terminal and a cut. A table can say that the stop closes the call in
+  a state (`Format::closes_at_stop`), for a family whose last call ends with a stop token the stop
+  decoder hides: a stream that stops there ends the call as its closing terminal would, with no
+  bytes. Without the row a syntax whose JSON is the model's own (JSON, Python, Gemma's tokens, a
+  call given as data) ends a call the stop found open as a cut ends it, since the model closed
+  neither; the tagged syntaxes, whose JSON the assembler writes for values the model wrote as
+  text between tags, end it as the marker would and close a string still open, with one
+  `Malformed { OpenAtTheStop }` event of no bytes before the closing fragment (`assemblers.md`,
+  the third ending); a tag the end cut short before the stop (a partial structural terminal at
+  the end of the output) ends the call the same way. A call's closing terminal inside a streamed
+  string of a tagged syntax closes the string too, under `Malformed { OpenAtTheMarker }`: the
+  marker is the model's own end of the call (the recorded shape writes `</tool_call>` after the
+  open value, then its stop token), so the value's bytes are complete there as at the stop, and
+  the two words tell the two ends apart. One cut for length, aborted, or ended with
+  any finish but `Stop` is cut as before; a driver hands a stop sequence of the request's that
+  matched inside the call over as such a finish, so that it never completes the call (the stop
+  row in `format`).
 - A table can say that the template discards the text of a state (`Format::framing`): Hugging
   Face's null sink, the space around a response template's fields. Every byte of text there, a
   terminal with no row from the state and what the scanner held at the end included, is
@@ -135,6 +147,16 @@ is a later step).
   which releases it as the state's text, or a row ends the stay or the stream ends, which drops
   it. Held bytes have not reached the ledger, so the tokens are counted in the output's order
   whatever the run turns out to be.
+- Text where the template only wraps (a wrapper state between a block's calls, the bytes after a
+  call's object before its closing marker) is classified run by run: whitespace before the stay's
+  first other text is `Dropped { Wrapper }` as it arrives; every other run is `Malformed`
+  (`TextBetweenCalls`, `TextAfterTheArguments`), one event per run, with the whitespace held
+  since the last run in front of it, since between two pieces of the model's text the whitespace
+  is the model's (`event::release_between`, the rule every reader of such text states); the run
+  after the last is held, a terminal the table ignores inside it in its place, and dropped as
+  the template's spacing when a row ends the stay or the stream does. So a client reads prose
+  between two calls, or after a call's object, as the model wrote it, byte for byte, whole and
+  streamed alike.
 - A call given as data (`CallSyntax::Shaped`) opens only when the header after its terminal
   matches: the engine holds the terminal and every byte after it, and takes no row, until the
   header decides. A header that cannot match gives the terminal back: its first character is the

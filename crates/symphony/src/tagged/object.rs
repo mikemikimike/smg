@@ -22,7 +22,7 @@ use crate::{
 pub(super) enum Mode {
     /// A declared string, pushed piece by piece once its opening fragment is out.
     Streaming { opened: bool },
-    /// Written at the close with [`json`](super::json).
+    /// Written at the close with [`json`](super::value::json).
     Whole,
     /// A string that may be null: held until its text rules the null words out.
     Undecided,
@@ -33,6 +33,9 @@ pub(super) enum Mode {
 pub(super) struct Object {
     pub(super) index: u32,
     /// Bytes no event has accounted for yet, in order; the next event takes them as its source.
+    /// An assembler that holds a name or a value by its position in here (a whole value, up to
+    /// its close) writes or reports it before any other event takes the bytes: no position
+    /// outlives the bytes it points into.
     pub(super) carried: String,
     /// Members written so far.
     written: u32,
@@ -72,25 +75,15 @@ impl Object {
         self.push_fragment(json, source, out);
     }
 
-    /// The carried bytes as `Malformed` with `why`, whitespace included; nothing when none.
-    pub(super) fn report(&mut self, why: MalformedReason, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Malformed {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why,
-        });
-    }
-
     /// The carried bytes refused ([`refuse`](super::refuse)): a `Malformed` event of no bytes
     /// with `why`, then the bytes as `Dropped { MalformedCall }`; nothing when none.
     pub(super) fn refuse(&mut self, why: MalformedReason, out: &mut Events) {
         super::refuse(std::mem::take(&mut self.carried), why, out);
     }
 
-    /// Whitespace carried before text that is reported: the template's, dropped so the report
-    /// holds only the text; nothing when none.
+    /// Whitespace carried before text that is reported: the template's, after a tag the syntax
+    /// read, dropped so the report holds only the text (after text released already an assembler
+    /// keeps it with the report instead); nothing when none.
     pub(super) fn drop_carried(&mut self, out: &mut Events) {
         if self.carried.is_empty() {
             return;
@@ -249,21 +242,23 @@ mod tests {
     }
 
     #[test]
-    fn carried_bytes_are_reported_or_dropped_once_and_nothing_is_pushed_for_none() {
+    fn carried_bytes_are_refused_or_dropped_once_and_nothing_is_pushed_for_none() {
         let mut object = Object::new(0);
         let mut out = Events::new();
-        object.report(MalformedReason::TextBetweenTags, &mut out);
+        object.refuse(MalformedReason::TextBetweenTags, &mut out);
         object.drop_carried(&mut out);
         assert!(out.is_empty());
         object.carried.push_str("  ");
         object.drop_carried(&mut out);
         object.carried.push('x');
-        object.report(MalformedReason::TextBetweenTags, &mut out);
+        object.refuse(MalformedReason::TextBetweenTags, &mut out);
+        // Refused: the counted event of no bytes, then the bytes as the model's failed call.
         assert_eq!(
             fragments(&out),
             vec![
                 ("dropped".to_string(), "  ".to_string()),
-                ("malformed".to_string(), "x".to_string()),
+                ("malformed".to_string(), String::new()),
+                ("dropped".to_string(), "x".to_string()),
             ]
         );
         assert!(object.carried.is_empty());

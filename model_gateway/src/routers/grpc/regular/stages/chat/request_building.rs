@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
@@ -10,10 +9,7 @@ use crate::routers::{
     error,
     grpc::{
         client::GenerateRequestBuildOptions,
-        common::stages::{
-            helpers::{self, TagForStart},
-            BuildStage,
-        },
+        common::stages::helpers::{self, TagForStart},
         context::{
             stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
             ExecutionPlanKind, PreparationOutput, RequestContext,
@@ -78,6 +74,7 @@ pub(crate) async fn build_chat_backed_plan(
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
     table_tag: Option<Arc<dyn TagForStart>>,
+    first_token_tag: bool,
     id_prefix: &'static str,
     inject_pd_metadata: bool,
     plan_kind: ExecutionPlanKind,
@@ -112,7 +109,7 @@ pub(crate) async fn build_chat_backed_plan(
         .parser_resolver
         .tool_parser(&chat_request.model);
     let unshaped_tool_constraints = tool_constraints.clone();
-    let tool_constraints = utils::tool_constraints_for_worker(
+    let (tool_constraints, led_for_first_token) = utils::tool_constraints_for_worker(
         &ctx.components.tool_parser_factory,
         tool_parser.as_deref(),
         tool_constraints,
@@ -136,6 +133,7 @@ pub(crate) async fn build_chat_backed_plan(
                 multimodal_inputs: multimodal_data,
                 tool_constraints,
                 require_reasoning,
+                first_token_grammar: first_token_tag || led_for_first_token,
             },
         )
         .map_err(|e| {
@@ -164,6 +162,7 @@ pub(crate) async fn build_chat_backed_plan(
         None => helpers::ToolConstraintStamp::capture(
             unshaped_tool_constraints,
             tool_parser.as_deref(),
+            first_token_tag,
             &proto_request,
         ),
     };
@@ -180,9 +179,14 @@ pub(crate) async fn build_chat_backed_plan(
     ))
 }
 
-#[async_trait]
-impl BuildStage for ChatRequestBuildingStage {
-    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
+impl ChatRequestBuildingStage {
+    /// The stage's work. The chat+generate dispatcher calls this directly, so
+    /// the stage's future lives inline in the dispatcher's: one box per stage
+    /// call, not a second one for a boxed trait method.
+    pub(crate) async fn build_plan(
+        &self,
+        ctx: &mut RequestContext,
+    ) -> Result<BuildOutput, Response> {
         // Take preparation state (last consumer — worker_selection already ran)
         let prep = stage_output(
             ctx.state.preparation.take(),
@@ -215,6 +219,7 @@ impl BuildStage for ChatRequestBuildingStage {
             table_tag,
             tool_constraints,
             whole_turn,
+            first_token,
             assignment,
         } = reading::decide(
             ctx,
@@ -267,6 +272,7 @@ impl BuildStage for ChatRequestBuildingStage {
             token_ids,
             tool_constraints,
             table_tag,
+            first_token,
             "chatcmpl-",
             self.inject_pd_metadata,
             self.plan_kind,
@@ -286,12 +292,11 @@ impl BuildStage for ChatRequestBuildingStage {
         })
     }
 
-    fn name(&self) -> &'static str {
-        "ChatRequestBuilding"
-    }
-
+    /// Stable descriptor of the stage plus its mode-bearing args, compared
+    /// against golden literals in the pipeline parity test (through the
+    /// chat+generate dispatcher's own `signature`).
     #[cfg(test)]
-    fn signature(&self) -> String {
+    pub(crate) fn signature(&self) -> String {
         format!(
             "ChatRequestBuildingStage(inject_pd_metadata={}, {:?})",
             self.inject_pd_metadata, self.plan_kind

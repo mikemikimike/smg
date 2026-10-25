@@ -112,7 +112,11 @@ impl KvEventMonitor {
         let clears = batch.events.iter().any(|event| {
             matches!(&event.data, Some(kv_cache_event::Data::Cleared(cleared)) if cleared.ownership.is_none())
         });
-        let admission = state.ranks.entry(rank).or_default().admit(seq, clears);
+        let cursor = state.ranks.entry(rank).or_default();
+        // Read before `admit` can drop a pending replay: a restart the gateway
+        // notices here loses the replay's batches as a refused resume does.
+        let pending = cursor.pending_gap();
+        let admission = cursor.admit(seq, clears);
         let mut degraded_changed = false;
         match admission {
             Admission::Apply => {}
@@ -128,7 +132,12 @@ impl KvEventMonitor {
                     received = seq,
                     "KV event publisher restarted; clearing the worker's index state"
                 );
-                Self::clear_worker(worker_id, indexer, state, rank);
+                let dropped = Self::clear_worker(worker_id, indexer, state, rank);
+                // A replay that was pending went with the old publisher, on
+                // this rank or on another whose cursor the clear reset: its
+                // batches count as missed here, once, as they do when the
+                // relay reports the restart as `DATA_LOSS` (`reset_worker`).
+                Metrics::record_kv_event_missed_batches(worker_url, pending + dropped);
                 Metrics::record_kv_event_resync(
                     worker_url,
                     ResyncReason::PublisherRestart.as_str(),
@@ -136,7 +145,13 @@ impl KvEventMonitor {
                 degraded_changed = true;
             }
             Admission::Replay { expected } => {
-                Metrics::record_kv_event_gap(worker_url, "replay_requested", seq - expected);
+                // A sighting, not a loss: the replay may bring every batch of
+                // the gap, so nothing is counted missed at the request. The
+                // loss is counted once where it is known: on the unrecovered
+                // outcome, or where a pending replay is dropped (`reset_worker`
+                // when the resume is refused, `clear_worker` when a publisher
+                // starts over or a gap is cleared, on this rank or another).
+                Metrics::record_kv_event_gap(worker_url, "replay_requested", 0);
                 return BatchOutcome::Gap {
                     expected,
                     received: seq,
@@ -151,7 +166,11 @@ impl KvEventMonitor {
                     "KV event gap could not be replayed; continuing from the live stream"
                 );
                 if cleared {
-                    Self::clear_worker(worker_id, indexer, state, rank);
+                    // The other ranks' cursors start over with the index: a
+                    // replay pending on one of them counts as missed here,
+                    // beside this rank's own unrecovered gap below.
+                    let dropped = Self::clear_worker(worker_id, indexer, state, rank);
+                    Metrics::record_kv_event_missed_batches(worker_url, dropped);
                     Metrics::record_kv_event_resync(worker_url, ResyncReason::GapCleared.as_str());
                 }
                 Metrics::record_kv_event_gap(
@@ -182,7 +201,7 @@ impl KvEventMonitor {
             Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
         Metrics::record_kv_event_apply(worker_url, started.elapsed().as_secs_f64());
-        Self::record_parentless(worker_url, &state.index.counters, &counters_before);
+        Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
         if stored_blocks > 0 {
             Metrics::record_kv_event_blocks(worker_url, "stored", stored_blocks);
         }
@@ -269,7 +288,7 @@ impl KvEventMonitor {
             }
             Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
-        Self::record_parentless(worker_url, &state.index.counters, &counters_before);
+        Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
         if snapshot_blocks > 0 {
             Metrics::record_kv_event_blocks(worker_url, "snapshot", snapshot_blocks);
         }
@@ -296,18 +315,29 @@ impl KvEventMonitor {
     /// One rank's publisher lost its history (a restart, or an unreplayable
     /// gap too large to keep): the worker's pooled index state goes with it,
     /// and the other ranks' cursors start over so their next batch is taken
-    /// as a first one instead of clearing the index a second time.
-    fn clear_worker(worker_id: u32, indexer: &KvIndex, state: &mut WorkerStreamState, rank: i32) {
+    /// as a first one instead of clearing the index a second time. A replay
+    /// pending on one of those ranks goes with its cursor; the batches it was
+    /// asked for are returned for the caller to count as missed.
+    fn clear_worker(
+        worker_id: u32,
+        indexer: &KvIndex,
+        state: &mut WorkerStreamState,
+        rank: i32,
+    ) -> u64 {
         Self::apply_cleared(worker_id, indexer, &mut state.index);
+        let mut dropped = 0;
         for (other, cursor) in &mut state.ranks {
             if *other != rank {
+                dropped += cursor.pending_gap();
                 cursor.reset();
             }
         }
+        dropped
     }
 
-    /// Publish the parent-less stores a batch produced, if any.
-    fn record_parentless(
+    /// Publish the stores a batch placed without their parent and the
+    /// sub-block stores it left out of the index, if any.
+    fn record_not_indexed(
         worker_url: &str,
         after: &WorkerIndexCounters,
         before: &WorkerIndexCounters,
@@ -316,10 +346,16 @@ impl KvEventMonitor {
         if stores > 0 {
             Metrics::record_kv_event_parentless(worker_url, stores, blocks);
         }
+        let (stores, blocks) = after.sub_block_since(before);
+        if stores > 0 {
+            Metrics::record_kv_event_sub_block(worker_url, stores, blocks);
+        }
     }
 
     /// The server declared its history gone: drop the worker's index state
     /// and every cursor, so the next stream is taken from wherever it starts.
+    /// A replay that was pending is lost with them: the batches it was asked
+    /// for count as missed, once, beside the resync.
     pub(super) fn reset_worker(
         indexer: &KvIndex,
         worker_id: u32,
@@ -328,10 +364,12 @@ impl KvEventMonitor {
         reason: ResyncReason,
     ) {
         Self::apply_cleared(worker_id, indexer, &mut state.index);
+        let pending: u64 = state.ranks.values().map(RankState::pending_gap).sum();
         for cursor in state.ranks.values_mut() {
             cursor.reset();
         }
         state.snapshot = None;
+        Metrics::record_kv_event_missed_batches(worker_url, pending);
         Metrics::record_kv_event_resync(worker_url, reason.as_str());
         Metrics::set_kv_event_degraded_ranks(worker_url, 0);
         Metrics::set_kv_index_blocks(worker_url, indexer.worker_block_count(worker_id));
@@ -366,7 +404,7 @@ mod tests {
     };
 
     use super::{super::apply::convert_kv_block, *};
-    use crate::worker::kv_event_recovery::{Cursor, RESTART_WINDOW};
+    use crate::worker::kv_event_recovery::{Cursor, GAP_CLEAR_THRESHOLD, RESTART_WINDOW};
 
     /// Token ids for engine block `id`: distinct content per id.
     fn tokens_for(id: i64) -> Vec<u32> {
@@ -407,6 +445,23 @@ mod tests {
         KvCacheEvent {
             event_id: 0,
             data: Some(kv_cache_event::Data::Cleared(KvCacheCleared::default())),
+        }
+    }
+
+    /// One stored block of `width` tokens under `parent`, its tokens unique to `id`.
+    fn stored_width(parent: Option<i64>, id: i64, width: i32) -> KvCacheEvent {
+        KvCacheEvent {
+            event_id: 0,
+            data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                blocks: vec![KvBlock {
+                    block_hash: id,
+                    token_ids: (0..width as u32).map(|i| (id as u32) * 64 + i).collect(),
+                    block_size: width,
+                    ..Default::default()
+                }],
+                parent_block_hash: parent,
+                ..Default::default()
+            })),
         }
     }
 
@@ -558,6 +613,8 @@ mod tests {
         worker: u32,
         state: WorkerStreamState,
         reference: ReferenceIndexer,
+        /// The reference's block of record: the widest block stored so far.
+        block_of_record: i32,
     }
 
     impl Sim {
@@ -569,6 +626,7 @@ mod tests {
                 worker,
                 state: WorkerStreamState::default(),
                 reference: ReferenceIndexer::new(),
+                block_of_record: 0,
             }
         }
 
@@ -585,12 +643,19 @@ mod tests {
         }
 
         /// Apply a batch to the reference with the subscriber's semantics
-        /// (a store whose parent is unknown starts a new chain).
+        /// (a store whose parent is unknown starts a new chain; a store
+        /// narrower than the block of record is left out).
         fn reference_apply(&mut self, b: &KvEventBatch) {
             let seed = namespace_seed(None, None);
             for event in &b.events {
                 match event.data.as_ref().unwrap() {
                     kv_cache_event::Data::Stored(st) => {
+                        let width = st.blocks.first().map_or(0, |block| block.block_size);
+                        if width > self.block_of_record {
+                            self.block_of_record = width;
+                        } else if width > 0 && width < self.block_of_record {
+                            continue;
+                        }
                         let blocks: Vec<StoredBlock> = st
                             .blocks
                             .iter()
@@ -615,7 +680,7 @@ mod tests {
                             .collect();
                         self.reference.apply_removed(self.worker, &hashes);
                     }
-                    kv_cache_event::Data::Cleared(_) => self.reference.apply_cleared(self.worker),
+                    kv_cache_event::Data::Cleared(_) => self.reference_clear(),
                 }
             }
         }
@@ -624,6 +689,13 @@ mod tests {
         fn deliver(&mut self, b: &KvEventBatch) -> BatchOutcome {
             self.reference_apply(b);
             self.feed(b)
+        }
+
+        /// A clear of the reference: its index and its block of record go
+        /// together, as production's do on a clear.
+        fn reference_clear(&mut self) {
+            self.reference.apply_cleared(self.worker);
+            self.block_of_record = 0;
         }
 
         fn assert_matches_reference(&self) {
@@ -774,6 +846,365 @@ mod tests {
         );
     }
 
+    /// The value of one series of a local recorder: the line that starts
+    /// with `name{` and carries every label (the render's label order is
+    /// not part of the contract).
+    fn series_value(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+        name: &str,
+        labels: &[&str],
+    ) -> Option<f64> {
+        handle
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("{name}{{"))
+                    && labels.iter().all(|label| line.contains(label))
+            })
+            .and_then(|line| line.rsplit(' ').next())
+            .and_then(|value| value.parse().ok())
+    }
+
+    /// A gap the publisher replays in full loses no batch: the sighting is
+    /// counted under `outcome="replay_requested"` and
+    /// `smg_kv_event_missed_batches_total` stays at zero.
+    #[test]
+    fn a_replayed_gap_counts_no_missed_batches() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = "worker=\"grpc://w1:9000\"";
+        let gaps = |outcome: &str| {
+            series_value(
+                &handle,
+                "smg_kv_event_gaps_total",
+                &[worker, &format!("outcome=\"{outcome}\"")],
+            )
+        };
+        let missed = || series_value(&handle, "smg_kv_event_missed_batches_total", &[worker]);
+        metrics::with_local_recorder(&recorder, || {
+            // The subscription start creates the worker's series at zero.
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+            // Batch 3 is lost on the wire; 4 arrives: one replay is asked for.
+            let b3 = batch(3, None, vec![removed(&[3])]);
+            let b4 = batch(4, None, vec![stored(Some(2), &[7])]);
+            assert_eq!(
+                sim.feed(&b4),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 4
+                }
+            );
+            let at_request = missed();
+            // Resuming after 2, the server replays 3 and continues live.
+            assert_eq!(sim.deliver(&b3), BatchOutcome::Applied);
+            assert_eq!(sim.deliver(&b4), BatchOutcome::Applied);
+            assert_eq!(
+                sim.deliver(&batch(5, None, vec![stored(Some(7), &[8])])),
+                BatchOutcome::Applied
+            );
+            assert_eq!(gaps("replay_requested"), Some(1.0), "the sighting");
+            assert_eq!(gaps("unrecovered_kept"), Some(0.0));
+            assert_eq!(gaps("unrecovered_cleared"), Some(0.0));
+            assert_eq!(
+                [at_request, missed()],
+                [Some(0.0), Some(0.0)],
+                "missed batches at the request and after the replay"
+            );
+            sim.assert_matches_reference();
+        });
+    }
+
+    /// A gap the publisher cannot replay counts its lost batches once, on
+    /// the unrecovered outcome: neither the request before it nor a later
+    /// gap's request adds to `smg_kv_event_missed_batches_total`.
+    #[test]
+    fn an_unrecovered_gap_counts_its_missed_batches_once() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = "worker=\"grpc://w1:9000\"";
+        let gaps = |outcome: &str| {
+            series_value(
+                &handle,
+                "smg_kv_event_gaps_total",
+                &[worker, &format!("outcome=\"{outcome}\"")],
+            )
+        };
+        let missed = || series_value(&handle, "smg_kv_event_missed_batches_total", &[worker]);
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+            // Batches 3 and 4 are lost; the server has no history: after the
+            // replay request it streams 5 again.
+            let b5 = batch(5, None, vec![stored(Some(3), &[9])]);
+            assert_eq!(
+                sim.feed(&b5),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 5
+                }
+            );
+            let at_request = missed();
+            assert_eq!(sim.deliver(&b5), BatchOutcome::Applied);
+            let after_the_skip = missed();
+            assert_eq!(gaps("replay_requested"), Some(1.0));
+            assert_eq!(gaps("unrecovered_kept"), Some(1.0));
+            assert_eq!(gaps("unrecovered_cleared"), Some(0.0));
+            // A later gap is a sighting again: a fresh replay request, no loss yet.
+            assert_eq!(
+                sim.feed(&batch(7, None, vec![])),
+                BatchOutcome::Gap {
+                    expected: 6,
+                    received: 7
+                }
+            );
+            assert_eq!(gaps("replay_requested"), Some(2.0));
+            assert_eq!(
+                [at_request, after_the_skip, missed()],
+                [Some(0.0), Some(2.0), Some(2.0)],
+                "missed batches at the request, once the stream skipped ahead, after a later request"
+            );
+        });
+    }
+
+    /// A replay the server refuses (`OUT_OF_RANGE` on the resume, or
+    /// `DATA_LOSS` on the stream) never reaches an unrecovered outcome: the
+    /// subscriber drops the worker's state, and the batches the pending
+    /// replay was asked for count as missed there, once, beside the resync.
+    #[test]
+    fn a_refused_replay_counts_its_pending_gap_as_missed_once() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = "worker=\"grpc://w1:9000\"";
+        let missed = || series_value(&handle, "smg_kv_event_missed_batches_total", &[worker]);
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+            // Batches 3 to 5 are lost; 6 arrives and a replay from 3 is asked for.
+            assert_eq!(
+                sim.feed(&batch(6, None, vec![stored(Some(3), &[9])])),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 6
+                }
+            );
+            assert_eq!(missed(), Some(0.0), "nothing is known lost at the request");
+            // The server no longer holds 3 and refuses the resume: the
+            // subscriber drops the worker's state, the pending replay with it.
+            KvEventMonitor::reset_worker(
+                &sim.indexer,
+                sim.worker,
+                &mut sim.state,
+                "grpc://w1:9000",
+                ResyncReason::OutOfRange,
+            );
+            assert_eq!(sim.state.ranks[&0].replay_pending(), None);
+            assert_eq!(
+                series_value(
+                    &handle,
+                    "smg_kv_event_resyncs_total",
+                    &[worker, "reason=\"out_of_range\""]
+                ),
+                Some(1.0)
+            );
+            assert_eq!(
+                missed(),
+                Some(3.0),
+                "the three batches the refused replay would have brought, once"
+            );
+        });
+    }
+
+    /// A publisher restart the gateway notices itself (a sequence below the
+    /// cursor on a fresh connection) drops a pending replay as a refused
+    /// resume does: the batches it was asked for count as missed there, once,
+    /// beside the restart.
+    #[test]
+    fn a_restart_the_gateway_notices_counts_the_pending_gap_as_missed_once() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = "worker=\"grpc://w1:9000\"";
+        let missed = || series_value(&handle, "smg_kv_event_missed_batches_total", &[worker]);
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
+            // Batches 3 to 5 are lost; 6 arrives and a replay from 3 is asked for.
+            assert_eq!(
+                sim.feed(&batch(6, None, vec![stored(Some(3), &[9])])),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 6
+                }
+            );
+            assert_eq!(missed(), Some(0.0), "nothing is known lost at the request");
+            // The worker came back before any replay: the stream reconnected
+            // and the new publisher counts from 1 with an empty cache.
+            sim.state.ranks.get_mut(&0).unwrap().reconnected();
+            let fresh = batch(1, None, vec![stored(None, &[7])]);
+            sim.reference_clear();
+            sim.reference_apply(&fresh);
+            assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
+            assert_eq!(sim.state.ranks[&0].replay_pending(), None);
+            assert_eq!(
+                series_value(
+                    &handle,
+                    "smg_kv_event_resyncs_total",
+                    &[worker, "reason=\"publisher_restart\""]
+                ),
+                Some(1.0)
+            );
+            assert_eq!(
+                missed(),
+                Some(3.0),
+                "the three batches the dropped replay would have brought, once"
+            );
+            sim.assert_matches_reference();
+        });
+    }
+
+    /// A restart one rank's stream shows (a sequence below its cursor on a
+    /// fresh connection) starts the other ranks' cursors over with the index;
+    /// a replay pending on one of them goes with its cursor, and the batches
+    /// it was asked for count as missed there, once, as the restarting rank's
+    /// own would.
+    #[test]
+    fn a_restart_another_rank_notices_counts_a_pending_gap_as_missed_once() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = "worker=\"grpc://w1:9000\"";
+        let missed = || series_value(&handle, "smg_kv_event_missed_batches_total", &[worker]);
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            let mut sim = Sim::new();
+            // Two publishers, each numbering from 1, interleaved on one stream.
+            sim.deliver(&batch(1, Some(0), vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(2, Some(0), vec![stored(Some(2), &[3])]));
+            sim.deliver(&batch(1, Some(1), vec![stored(None, &[101, 102])]));
+            sim.deliver(&batch(2, Some(1), vec![stored(Some(102), &[103])]));
+            // Rank 1's batches 3 to 5 are lost; 6 arrives and a replay from 3
+            // is asked for.
+            assert_eq!(
+                sim.feed(&batch(6, Some(1), vec![stored(Some(103), &[109])])),
+                BatchOutcome::Gap {
+                    expected: 3,
+                    received: 6
+                }
+            );
+            assert_eq!(missed(), Some(0.0), "nothing is known lost at the request");
+            // The engine came back before any replay: the stream reconnected
+            // and rank 0's new publisher counts from 1 with an empty cache.
+            sim.state.reconnected();
+            let fresh = batch(1, Some(0), vec![stored(None, &[7])]);
+            sim.reference_clear();
+            sim.reference_apply(&fresh);
+            assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
+            assert_eq!(
+                sim.state.ranks[&1].replay_pending(),
+                None,
+                "rank 1's cursor started over with the index"
+            );
+            assert_eq!(
+                series_value(
+                    &handle,
+                    "smg_kv_event_resyncs_total",
+                    &[worker, "reason=\"publisher_restart\""]
+                ),
+                Some(1.0)
+            );
+            assert_eq!(
+                missed(),
+                Some(3.0),
+                "the three batches rank 1's dropped replay would have brought, once"
+            );
+            sim.assert_matches_reference();
+        });
+    }
+
+    /// A gap one rank cannot replay and too large to keep (`Unrecovered {
+    /// cleared: true }`) clears the worker and starts the other ranks'
+    /// cursors over with the index; a replay pending on one of them goes with
+    /// its cursor, and the batches it was asked for count as missed beside
+    /// the clearing rank's own gap, once.
+    #[test]
+    fn a_cleared_gap_on_another_rank_counts_a_pending_gap_as_missed_once() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let worker = "worker=\"grpc://w1:9000\"";
+        let missed = || series_value(&handle, "smg_kv_event_missed_batches_total", &[worker]);
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::init_kv_event_series("grpc://w1:9000");
+            let mut sim = Sim::new();
+            sim.deliver(&batch(1, Some(0), vec![stored(None, &[1, 2])]));
+            sim.deliver(&batch(1, Some(1), vec![stored(None, &[101, 102])]));
+            // Rank 1's batches 2 to 4 are lost; 5 arrives and a replay from 2
+            // is asked for.
+            assert_eq!(
+                sim.feed(&batch(5, Some(1), vec![stored(Some(102), &[105])])),
+                BatchOutcome::Gap {
+                    expected: 2,
+                    received: 5
+                }
+            );
+            // Rank 0's batches 2 and 3 are lost too; 4 arrives and a replay
+            // from 2 is asked for.
+            assert_eq!(
+                sim.feed(&batch(4, Some(0), vec![stored(Some(2), &[4])])),
+                BatchOutcome::Gap {
+                    expected: 2,
+                    received: 4
+                }
+            );
+            assert_eq!(missed(), Some(0.0), "nothing is known lost at the requests");
+            // The server skips far ahead on rank 0 instead of replaying: a gap
+            // too large to keep, the worker is cleared, every rank's cursor
+            // starts over with the index.
+            let far = 2 + GAP_CLEAR_THRESHOLD + 1;
+            let skip = batch(far, Some(0), vec![stored(None, &[7])]);
+            sim.reference_clear();
+            sim.reference_apply(&skip);
+            assert_eq!(sim.feed(&skip), BatchOutcome::Applied);
+            assert_eq!(
+                sim.state.ranks[&1].replay_pending(),
+                None,
+                "rank 1's cursor started over with the index"
+            );
+            assert_eq!(
+                series_value(
+                    &handle,
+                    "smg_kv_event_resyncs_total",
+                    &[worker, "reason=\"gap_cleared\""]
+                ),
+                Some(1.0)
+            );
+            assert_eq!(
+                missed(),
+                Some((far - 2) as f64 + 3.0),
+                "rank 0's own gap and the three batches rank 1's dropped replay would have brought, once"
+            );
+            sim.assert_matches_reference();
+        });
+    }
+
     #[test]
     fn recovery_duplicates_and_out_of_order_batches_are_skipped() {
         let mut sim = Sim::new();
@@ -802,13 +1233,49 @@ mod tests {
         }
         // The engine restarts: its cache is empty and it counts from 0 again.
         let fresh = batch(0, None, vec![stored(None, &[21, 22])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         assert_eq!(
             sim.deliver(&batch(1, None, vec![stored(Some(22), &[23])])),
             BatchOutcome::Applied
         );
+        assert!(!sim.state.ranks[&0].is_degraded());
+        sim.assert_matches_reference();
+    }
+
+    /// The engine restarts with a narrower block than it stored before: the
+    /// clear takes the block of record with the blocks, so the fresh stores
+    /// are indexed as they come (none counted as a sub-block store) and
+    /// production matches the reference, whose record resets the same way.
+    #[test]
+    fn recovery_publisher_restart_with_a_narrower_block_matches_reference() {
+        let mut sim = Sim::new();
+        sim.deliver(&batch(
+            1,
+            None,
+            vec![stored_width(None, 1, 32), stored_width(Some(1), 2, 32)],
+        ));
+        for seq in 2..=(RESTART_WINDOW + 5) {
+            sim.deliver(&batch(seq, None, vec![]));
+        }
+        assert_eq!(sim.state.index.counters.sub_block_stores, 0);
+        // The engine restarts at a 4-token block: its cache is empty and it
+        // counts from 0 again.
+        let fresh = batch(
+            0,
+            None,
+            vec![stored_width(None, 11, 4), stored_width(Some(11), 12, 4)],
+        );
+        sim.reference_clear();
+        sim.reference_apply(&fresh);
+        assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
+        assert_eq!(
+            sim.indexer.worker_block_count(sim.worker),
+            2,
+            "the narrower blocks are indexed"
+        );
+        assert_eq!(sim.state.index.counters.sub_block_stores, 0);
         assert!(!sim.state.ranks[&0].is_degraded());
         sim.assert_matches_reference();
     }
@@ -823,7 +1290,7 @@ mod tests {
         // engine stream live; neither can replay).
         sim.state.ranks.get_mut(&0).unwrap().reconnected();
         let fresh = batch(1, None, vec![stored(None, &[7])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         sim.assert_matches_reference();
@@ -838,7 +1305,7 @@ mod tests {
         // SGLang's first batch after a restart carries AllBlocksCleared and
         // its counter starts over, with the servicer's stream still up.
         let first = batch(0, None, vec![cleared(), stored(None, &[9])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&first);
         assert_eq!(sim.feed(&first), BatchOutcome::Applied);
         sim.assert_matches_reference();
@@ -896,7 +1363,7 @@ mod tests {
         // as a first one rather than clearing the index again.
         sim.state.reconnected();
         let fresh = batch(1, Some(1), vec![stored(None, &[111])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         assert_eq!(
@@ -921,7 +1388,7 @@ mod tests {
         sim.deliver(&batch(2, None, vec![on_host]));
         sim.state.reconnected();
         let fresh = batch(1, None, vec![stored(None, &[1, 2])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         assert_eq!(
@@ -1214,5 +1681,140 @@ mod tests {
             );
             sim.assert_matches_reference();
         });
+    }
+
+    /// A store narrower than the block of record (a hybrid engine's prefix
+    /// entry at its hash granularity, under a parent it never publishes) is
+    /// counted under its own metric and never as parent-less, and the index
+    /// holds what the full blocks made it.
+    #[test]
+    fn sub_block_stores_are_counted_and_not_indexed() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn counter(handle: &PrometheusHandle, name: &str) -> Option<f64> {
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}{{worker=\"grpc://w1:9000\"}}")))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut sim = Sim::new();
+            // Two full blocks, then the tail entry under a parent never
+            // published, in the one batch the engine sends them in.
+            sim.deliver(&batch(
+                1,
+                None,
+                vec![
+                    stored_width(None, 1, 32),
+                    stored_width(Some(1), 2, 32),
+                    stored_width(Some(999), 3, 4),
+                ],
+            ));
+            assert_eq!(sim.indexer.worker_block_count(sim.worker), 2);
+            assert_eq!(
+                counter(&handle, "smg_kv_event_sub_block_stores_total"),
+                Some(1.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_sub_block_blocks_total"),
+                Some(1.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_stores_total"),
+                None
+            );
+            assert_eq!(sim.state.index.counters.sub_block_stores, 1);
+            assert_eq!(sim.state.index.counters.parentless_stores, 0);
+            // The chain continues from the full block.
+            sim.deliver(&batch(2, None, vec![stored_width(Some(2), 4, 32)]));
+            assert_eq!(sim.indexer.worker_block_count(sim.worker), 3);
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_stores_total"),
+                None
+            );
+            sim.assert_matches_reference();
+        });
+    }
+
+    /// A hybrid engine whose hash granularity is narrower than its block
+    /// registers a prompt's tail entry at that granularity once the request's
+    /// computed tokens reach the next block boundary: in the step that stores
+    /// the full block, a one-hash store of a fraction of the block under an
+    /// intermediate hash the engine never publishes. Its eviction later lists
+    /// the entry beside the full hash. The index keeps the full blocks only:
+    /// no parent-less store, no root chain of one entry.
+    #[test]
+    fn a_tail_entry_beside_a_full_block_under_a_wider_record_is_not_parent_less() {
+        fn run(parent: Option<i64>, ids: &[i64], width: u32) -> KvCacheEvent {
+            KvCacheEvent {
+                event_id: 0,
+                data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                    blocks: ids
+                        .iter()
+                        .map(|&id| KvBlock {
+                            block_hash: id,
+                            token_ids: (0..width).map(|i| (id as u32) * 1000 + i).collect(),
+                            block_size: width as i32,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    parent_block_hash: parent,
+                    ..Default::default()
+                })),
+            }
+        }
+        let mut sim = Sim::new();
+        // The prefix: thirteen full blocks in one store.
+        let prefix: Vec<i64> = (1..=13).collect();
+        sim.deliver(&batch(1, None, vec![run(None, &prefix, 256)]));
+        assert_eq!(sim.indexer.worker_block_count(sim.worker), 13);
+        // A turn's decode crosses the next block boundary: the full block,
+        // then the prompt's eight-token tail entry under the intermediate
+        // hash one hash-block before it.
+        sim.deliver(&batch(
+            2,
+            None,
+            vec![run(Some(13), &[14], 256), run(Some(9001), &[901], 8)],
+        ));
+        // The next turn: the same full block again (a second copy) and its
+        // own tail entry.
+        sim.deliver(&batch(
+            3,
+            None,
+            vec![run(Some(13), &[14], 256), run(Some(9002), &[902], 8)],
+        ));
+        assert_eq!(
+            sim.state.index.counters.parentless_stores, 0,
+            "a tail entry is not a parent-less store"
+        );
+        assert_eq!(sim.state.index.counters.parentless_blocks, 0);
+        assert_eq!(
+            (
+                sim.state.index.counters.sub_block_stores,
+                sim.state.index.counters.sub_block_blocks
+            ),
+            (2, 2),
+            "the two entries are counted as sub-block stores"
+        );
+        assert_eq!(
+            sim.indexer.worker_block_count(sim.worker),
+            14,
+            "the full blocks only"
+        );
+        // The eviction of each block lists the entry beside the full hash.
+        sim.deliver(&batch(4, None, vec![removed(&[14, 901])]));
+        assert_eq!(
+            sim.indexer.worker_block_count(sim.worker),
+            14,
+            "the second copy of the full block stands"
+        );
+        sim.deliver(&batch(5, None, vec![removed(&[14, 902])]));
+        assert_eq!(sim.indexer.worker_block_count(sim.worker), 13);
+        sim.assert_matches_reference();
     }
 }

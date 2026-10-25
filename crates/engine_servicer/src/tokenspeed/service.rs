@@ -1,7 +1,9 @@
 //! `tokenspeed.grpc.scheduler.TokenSpeedScheduler` over the shared state:
-//! each RPC delegates to its handler module. The msgpack wire carries
-//! generate and abort only, so the scheduler's control RPCs (`FlushCache`,
-//! profiling) answer UNIMPLEMENTED here.
+//! each RPC delegates to its handler module. The scheduler's control RPCs
+//! (`FlushCache`, profiling) ride the wire's control call when the
+//! scheduler's handshake declared its control reply (the control-wire
+//! revision), and answer UNIMPLEMENTED naming the gap on a scheduler whose
+//! wire carries generate and abort only.
 
 use std::sync::Arc;
 
@@ -13,10 +15,6 @@ use tonic::{Request, Response, Status};
 
 use super::{generate, info, State};
 use crate::{kv_events, tokenizer_bundle, BoxStream};
-
-/// What the msgpack wire has no message for.
-const NO_CONTROL_WIRE: &str = "is not available through the Rust TokenSpeed servicer: the \
-                               scheduler's msgpack wire carries generate and abort only";
 
 #[derive(Clone)]
 pub(super) struct TokenSpeedService {
@@ -35,6 +33,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
     ) -> Result<Response<Self::GenerateStream>, Status> {
         generate::generate(&self.state, request.into_inner())
             .await
+            .inspect_err(|status| self.state.shared.metrics.request_not_started(status))
             .map(Response::new)
     }
 
@@ -53,6 +52,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         // The choices of an `n > 1` request live under the one registration,
         // so aborting the parent id ends every choice.
         self.state
+            .shared
             .registry
             .abort(std::slice::from_ref(&request.request_id))?;
         Ok(Response::new(ts::AbortResponse {
@@ -84,36 +84,36 @@ impl TokenSpeedScheduler for TokenSpeedService {
 
     async fn flush_cache(
         &self,
-        _request: Request<common::FlushCacheRequest>,
+        request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
-        Err(Status::unimplemented(format!(
-            "FlushCache {NO_CONTROL_WIRE}"
-        )))
+        crate::admin::flush_cache(&self.state.shared, request)
+            .await
+            .map(Response::new)
     }
 
     async fn start_profile(
         &self,
-        _request: Request<common::StartProfileRequest>,
+        request: Request<common::StartProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        Err(Status::unimplemented(format!(
-            "StartProfile {NO_CONTROL_WIRE}"
-        )))
+        crate::admin::start_profile(&self.state.shared, request.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn stop_profile(
         &self,
         _request: Request<common::StopProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        Err(Status::unimplemented(format!(
-            "StopProfile {NO_CONTROL_WIRE}"
-        )))
+        crate::admin::stop_profile(&self.state.shared)
+            .await
+            .map(Response::new)
     }
 
     async fn get_tokenizer(
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        tokenizer_bundle::get_tokenizer(self.state.tokenizer_dir.clone())
+        tokenizer_bundle::get_tokenizer(self.state.shared.tokenizer_dir.clone())
             .await
             .map(Response::new)
     }
@@ -122,7 +122,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        let Some(relay) = &self.state.kv_relay else {
+        let Some(relay) = &self.state.shared.kv_relay else {
             return Err(Status::unimplemented(
                 kv_events::TOKENSPEED_DISABLED_MESSAGE,
             ));

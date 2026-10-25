@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent import futures
+from typing import Any
 
 import grpc
 from grpc_health.v1 import health_pb2_grpc
@@ -32,6 +33,7 @@ from smg_grpc_servicer.rust_lifecycle import (
     EXIT_GRACE_SECS,
     ServicerConfigError,
     announce_kv_events_default,
+    check_metrics_port_needs_rust,
     configuration_exit,
     guarded_exit,
 )
@@ -40,6 +42,7 @@ from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
 from smg_grpc_servicer.sglang.rust import (
     KV_EVENTS_ENV,
+    METRICS_PORT_ENV,
     SERVICER_IMPL_ENV,
     default_kv_events_config,
     serve_rust,
@@ -52,6 +55,8 @@ from smg_grpc_servicer.sglang.scheduler_launcher import (
 )
 from smg_grpc_servicer.sglang.scheduler_watchdog import wait_for_scheduler_shutdown
 from smg_grpc_servicer.sglang.servicer import SGLangSchedulerServicer
+from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
+from smg_grpc_servicer.warmup import parse_setting, plan_for, run_warmup
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +144,8 @@ async def serve_grpc(
                     SERVICER_IMPL_ENV,
                 )
             raise SystemExit(await serve_rust(server_args))
+        # A metrics port under the Python servicer is a port nobody serves.
+        check_metrics_port_needs_rust(impl, server_args, METRICS_PORT_ENV)
         # The Python servicer gets the Rust path's KV-events default too:
         # server args without --kv-events-config have SGLang's ZMQ publisher
         # on, at a port found free on this host, before the schedulers and the
@@ -565,6 +572,12 @@ def _execute_grpc_server_warmup(server_args: ServerArgs):
                 channel.close()
                 kill_process_tree(os.getpid())
                 return False
+            # The first request reached the scheduler; the planned warm-up
+            # (every running-batch size and prefill token count the engine's
+            # configuration admits, :mod:`smg_grpc_servicer.warmup`) runs over
+            # the same channel before the health flips, under its budget.
+            if success:
+                planned_warmup(server_args, response, channel)
         else:
             # For embedding models
             warmup_request = sglang_scheduler_pb2.EmbedRequest(
@@ -603,6 +616,48 @@ def _execute_grpc_server_warmup(server_args: ServerArgs):
             pass
         kill_process_tree(os.getpid())
         return False
+
+
+def planned_warmup(server_args: ServerArgs, model_info: Any, channel: Any) -> Any:
+    """The planned warm-up over ``channel`` (the servicer's own port):
+    the plan from the server arguments and the advertised model facts, the
+    level and budget from :data:`WARMUP_ENV`. The pass is an optimisation: a
+    failed request is a logged line, and a failure of the pass itself (a
+    thread the host refuses, an argument an engine release lacks) is one
+    ERROR line, never the end of the process (the first request's success
+    already proved the path, and the caller's own guard would exit on a
+    raise). Returns the report, or ``None`` when nothing ran or the pass
+    failed."""
+    try:
+        return _planned_warmup(server_args, model_info, channel)
+    except Exception:  # noqa: BLE001 -- the pass is an optimisation; the server serves without it
+        logger.exception("The planned warm-up failed; the server serves without it")
+        return None
+
+
+def _planned_warmup(server_args: ServerArgs, model_info: Any, channel: Any) -> Any:
+    try:
+        setting = parse_setting(os.environ.get(WARMUP_ENV), name=WARMUP_ENV)
+    except ValueError as error:
+        logger.warning("%s; the planned warm-up is skipped", error)
+        return None
+    if server_args.disaggregation_mode != DisaggregationMode.NULL.value:
+        # This servicer's own warm-up request above carried the stand-in
+        # bootstrap already; the planned pass on a prefill or decode leg is
+        # the Rust launcher's (this servicer's start-up is kept as it is).
+        logger.info("Planned warm-up: none on a disaggregation role on this servicer")
+        return None
+    facts = {
+        "is_generation": bool(getattr(model_info, "is_generation", True)),
+        "max_context_length": getattr(model_info, "max_context_length", 0),
+        "vocab_size": getattr(model_info, "vocab_size", 0),
+    }
+    # This servicer's generate path forwards no rank pin, so the plan is one
+    # rank's (the engine's own load balancing places its requests).
+    plan = plan_for(setting, warmup_inputs(server_args, facts, pins_ranks=False), knob=WARMUP_ENV)
+    if plan is None:
+        return None
+    return run_warmup(plan, warmup_wire("", channel=channel), budget_secs=setting.budget_secs)
 
 
 def _wait_and_warmup_grpc(

@@ -426,6 +426,7 @@ def _config(**overrides):
 
 
 def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
+    """Propagate engine settings and default media download budgets to Rust."""
     from smg_grpc_servicer.vllm import mm_processor
     from smg_grpc_servicer.vllm.mm_processor import MmSettings
 
@@ -450,6 +451,8 @@ def test_smg_media_options_follow_the_engine_config(tmp_path, monkeypatch):
         "engine_item_limits": None,
         "engine_encoder_budget": None,
         "max_item_bytes": 10,
+        "fetch_timeout_ms": 10000,
+        "video_fetch_timeout_ms": 30000,
         "video_frame_budget": None,
         "video_loader_rule": None,
         "turbojpeg": None,
@@ -620,6 +623,8 @@ def test_smg_media_options_carry_the_processor_kwargs_from_where_the_engine_keep
         "engine_item_limits": None,
         "engine_encoder_budget": None,
         "max_item_bytes": 10,
+        "fetch_timeout_ms": 10000,
+        "video_fetch_timeout_ms": 30000,
         "video_frame_budget": None,
         "video_loader_rule": None,
         "turbojpeg": None,
@@ -778,6 +783,68 @@ def test_model_info_carries_the_pooler_config():
     config = _config(pooler_config=SimpleNamespace(use_activation=None, dimensions=None))
     info = rust.model_info_from_config(config)
     assert info["pooler_use_activation"] is None and info["pooler_dimensions"] is None
+
+
+def test_model_info_names_the_mooncake_mover_the_rust_servicer_withholds_the_notice_on():
+    """The Rust servicer withholds a PD decode side's rejection notice on the
+    Mooncake connector by the name the launcher hands it, so a wrapper whose
+    mover is Mooncake is handed ``MooncakeConnector`` too (the mover's engine
+    id with it), as ``GetServerInfo`` reports the pair."""
+    config = _config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_consumer",
+        engine_id="eng-d",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"},
+                {"kv_connector": "SharedStorageConnector"},
+            ]
+        },
+    )
+    info = rust.model_info_from_config(config)
+    assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == (
+        "MooncakeConnector",
+        "kv_consumer",
+        "decode-engine",
+    )
+
+
+def test_model_info_projects_a_multi_connector_onto_the_child_that_moves_the_kv():
+    """The Rust servicer reports the connector the launcher hands it, so the
+    launcher hands it the wrapper's mover: the one P2P child whatever rides
+    along, else the one store child; the child's engine id when it names one,
+    the parent's otherwise."""
+    config = _config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_producer",
+        engine_id="eng-a",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "MooncakeStoreConnector"},
+                {"kv_connector": "NixlConnector", "engine_id": "child-engine"},
+            ]
+        },
+    )
+    info = rust.model_info_from_config(config)
+    assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == (
+        "NixlConnector",
+        "kv_producer",
+        "child-engine",
+    )
+    config.kv_transfer_config.kv_connector_extra_config = {
+        "connectors": [
+            {"kv_connector": "OffloadingConnector"},
+            {"kv_connector": "MooncakeStoreConnector"},
+        ]
+    }
+    info = rust.model_info_from_config(config)
+    assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == (
+        "MooncakeStoreConnector",
+        "kv_producer",
+        "eng-a",
+    )
 
 
 def test_model_info_reports_the_pd_identity_and_pairing_facts():
@@ -1277,6 +1344,51 @@ def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkey
     signature.bind(**kwargs)
 
 
+def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_path):
+    """With a warm-up planned (the default knob, a generation model whose
+    resolved config carries a running window and an admission step), the
+    server's readiness is held before the engine cores start through the
+    health-only setter (admission stays open for the pass's own requests; the
+    drain switch is never touched) and the supervisor is handed the pass,
+    which flips SERVING when it ran; with the knob off, neither happens."""
+    config = _config()
+    config.scheduler_config = SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=512)
+    engine_args = SimpleNamespace(
+        create_engine_config=lambda usage_context: config, disable_log_stats=False
+    )
+    _stub_frontend_args(monkeypatch)
+    _stub_engine_exceptions(monkeypatch)
+    _install(
+        monkeypatch,
+        "vllm.engine.arg_utils",
+        AsyncEngineArgs=SimpleNamespace(from_cli_args=lambda args: engine_args),
+    )
+    _install(monkeypatch, "vllm.usage.usage_lib", UsageContext=SimpleNamespace(OPENAI_API_SERVER=1))
+    _install_fake_servicer(monkeypatch, FakeServer)
+    monkeypatch.setattr(rust, "launch_engine_cores", lambda ns: FakeEngine())
+    monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    recorded: dict = {}
+
+    async def fake_supervise(server, engine, *, drain_secs, **kwargs):
+        recorded["server"], recorded["supervise_kwargs"] = server, kwargs
+        return 0
+
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
+    args = argparse.Namespace(
+        model_tag="org/m", model="org/m", grpc=True, host=None, port=50051, max_model_len=4096
+    )
+    assert asyncio.run(rust.serve_rust(args)) == 0
+    assert recorded["server"].events == ["ready:False"]
+    assert callable(recorded["supervise_kwargs"]["warmup"])
+
+    monkeypatch.setenv(rust.WARMUP_ENV, "off")
+    assert asyncio.run(rust.serve_rust(args)) == 0
+    assert recorded["server"].events == []
+    assert recorded["supervise_kwargs"] == {}
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
@@ -1297,6 +1409,9 @@ class FakeServer:
 
     def set_serving(self, serving: bool) -> None:
         self.events.append(f"serving:{serving}")
+
+    def set_ready(self, ready: bool) -> None:
+        self.events.append(f"ready:{ready}")
 
     def stop(self, timeout: float) -> None:
         self.events.append(f"stop:{timeout}")
@@ -1640,6 +1755,8 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
     assert kwargs["tokenizer_dir"] == str(tmp_path)
     assert kwargs["engine_startup_timeout_secs"] == rust_lifecycle.DEFAULT_STARTUP_TIMEOUT_SECS
     assert kwargs["engine_startup_ceiling_secs"] == rust_lifecycle.DEFAULT_STARTUP_CEILING_SECS
+    assert kwargs["engine_silence_timeout_secs"] == rust_lifecycle.DEFAULT_SILENCE_TIMEOUT_SECS
+    assert kwargs["engine_prefill_tokens_per_sec"] == rust_lifecycle.DEFAULT_PREFILL_TOKENS_PER_SEC
     assert kwargs["served_model_name"] == "served-a"
     assert kwargs["eos_token_ids"] == [151645, 151643, 7]
     assert kwargs["kv_connector"] == ""
@@ -1900,3 +2017,23 @@ def test_the_switch_turns_the_kv_event_publisher_on_for_the_python_servicer_too(
     with pytest.raises(SystemExit):
         asyncio.run(switched(args))
     assert handed == [None] and served[-1] is not args
+
+
+@pytest.mark.parametrize("source", ["flag", "env"])
+def test_smg_media_options_forward_download_timeouts(source, monkeypatch):
+    """Pass each resolved timeout through the actual launcher-to-Rust options."""
+    from smg_grpc_servicer.vllm import mm_processor
+
+    monkeypatch.setattr(mm_processor, "vllm_default_video_frames", lambda: None)
+    parser = argparse.ArgumentParser()
+    mm_processor.add_mm_arguments(parser)
+    flags = ["--mm-fetch-timeout-ms", "60000", "--mm-video-fetch-timeout-ms", "120000"]
+    env = {"SMG_VLLM_MM_FETCH_TIMEOUT_MS": "60000", "SMG_VLLM_MM_VIDEO_FETCH_TIMEOUT_MS": "120000"}
+    settings = mm_processor.MmSettings.from_args(
+        parser.parse_args(flags if source == "flag" else [])
+    ).resolve(env=env)
+    options = rust.smg_media_options(
+        _config(is_multimodal_model=True), settings, None, encoder_budget=0
+    )
+    assert options["fetch_timeout_ms"] == 60000
+    assert options["video_fetch_timeout_ms"] == 120000

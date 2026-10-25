@@ -936,13 +936,14 @@ pub(crate) struct ResponseState {
     /// Final processed response
     pub final_response: Option<FinalResponse>,
 
-    /// The engine's counters of a non-streamed chat or messages answer, as
-    /// the response stage recorded them for the settlement: the
-    /// client-facing usage drops the rendered prompt tokens the provider
-    /// does not bill and may carry the gateway parser's reasoning split
-    /// instead of the engine's count, and the Messages shape reports no
-    /// cache hits at all. `None` for the shapes whose response carries the
-    /// engine's counters unchanged (completion, generate, decisions).
+    /// The engine's counters of a non-streamed chat, messages or
+    /// transcription answer, as the response stage recorded them for the
+    /// settlement: the client-facing usage drops the rendered prompt tokens
+    /// the provider does not bill and may carry the gateway parser's
+    /// reasoning split instead of the engine's count, the Messages shape
+    /// reports no cache hits at all, and a transcript carries no usage.
+    /// `None` for the shapes whose response carries the engine's counters
+    /// unchanged (completion, generate, decisions, embeddings, classify).
     pub engine_counts: Option<TokenCounts>,
 
     /// Responses API iteration result (Harmony only, for tool loop orchestration)
@@ -1316,13 +1317,7 @@ impl RequestContext {
     }
 }
 
-/// Some methods are kept for API completeness even if currently unused.
-#[expect(dead_code)]
 impl WorkerSelection {
-    pub fn is_disaggregated(&self) -> bool {
-        matches!(self, Self::Disaggregated { .. })
-    }
-
     pub fn single(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Single { worker } => Some(worker),
@@ -1408,6 +1403,9 @@ impl WorkerSelection {
         }
     }
 
+    /// The prefill and decode workers of a disaggregated selection, for the
+    /// tests that pin which side a dispatch addressed.
+    #[cfg(test)]
     #[expect(clippy::type_complexity)]
     pub fn disaggregated_pair(&self) -> Option<(&Arc<dyn Worker>, &Arc<dyn Worker>)> {
         match self {
@@ -1450,8 +1448,6 @@ impl WorkerSelection {
     }
 }
 
-/// Some methods are kept for API completeness even if currently unused.
-#[expect(dead_code)]
 impl ClientSelection {
     /// The client that builds the request: the single engine's, or the
     /// prefill's when disaggregated.
@@ -1515,20 +1511,6 @@ impl ClientSelection {
                 "Expected disaggregated clients but got single",
             )
         })
-    }
-
-    pub fn prefill_client(&self) -> Option<&BackendClient> {
-        match self {
-            Self::Disaggregated { prefill, .. } => Some(prefill),
-            Self::Single { .. } => None,
-        }
-    }
-
-    pub fn decode_client(&self) -> Option<&BackendClient> {
-        match self {
-            Self::Disaggregated { decode, .. } => Some(decode),
-            Self::Single { .. } => None,
-        }
     }
 }
 

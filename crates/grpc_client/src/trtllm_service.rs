@@ -96,6 +96,25 @@ impl TrtllmServiceClient {
         multimodal_input: Option<proto::MultimodalInput>,
         tool_call_constraint: Option<(String, String)>, // (constraint_type, constraint_value)
     ) -> Result<proto::GenerateRequest, String> {
+        Self::build_generate_request_from_chat_parts(
+            request_id,
+            body,
+            processed_text,
+            token_ids,
+            multimodal_input,
+            tool_call_constraint,
+        )
+    }
+
+    /// [`Self::build_generate_request_from_chat`] without a receiver.
+    pub fn build_generate_request_from_chat_parts(
+        request_id: String,
+        body: &ChatCompletionRequest,
+        processed_text: String,
+        token_ids: Vec<u32>,
+        multimodal_input: Option<proto::MultimodalInput>,
+        tool_call_constraint: Option<(String, String)>,
+    ) -> Result<proto::GenerateRequest, String> {
         // Build sampling config
         let sampling_config = Self::build_sampling_config_from_chat(body);
 
@@ -125,7 +144,7 @@ impl TrtllmServiceClient {
             ignore_eos: body.ignore_eos,
             guided_decoding,
             multimodal_input,
-            include_stop_token_in_output: false,
+            include_stop_token_in_output: body.no_stop_trim,
             ..Default::default()
         };
 

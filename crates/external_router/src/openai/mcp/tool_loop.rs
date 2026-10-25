@@ -158,8 +158,9 @@ fn build_message_from_openai_response(openai_response: Value) -> Option<Value> {
 /// Returns false if client disconnected during execution
 #[expect(
     clippy::too_many_arguments,
-    reason = "Streaming tool dispatch threads channel + state + per-request inputs \
-              (tools, user) directly to the loop without an intermediate context struct."
+    reason = "The entry point keeps its flat signature for the streaming handler; the \
+              per-request inputs are bundled into a `StreamingDispatch` once per batch \
+              for the per-call step."
 )]
 pub(crate) async fn execute_streaming_tool_calls(
     pending_calls: Vec<FunctionCallInProgress>,
@@ -172,6 +173,14 @@ pub(crate) async fn execute_streaming_tool_calls(
     request_tools: &[ResponseTool],
     request_user: Option<&str>,
 ) -> bool {
+    let dispatch = StreamingDispatch {
+        session,
+        format_registry,
+        tx,
+        model_id,
+        request_tools,
+        request_user,
+    };
     for call in pending_calls {
         if call.name.is_empty() {
             warn!(
@@ -180,120 +189,184 @@ pub(crate) async fn execute_streaming_tool_calls(
             );
             continue;
         }
-
-        info!(
-            "Executing tool call during streaming: {} ({})",
-            call.name, call.call_id
-        );
-
-        let args_str = if call.arguments_buffer.is_empty() {
-            "{}"
-        } else {
-            &call.arguments_buffer
-        };
-
-        let response_format =
-            openai_bridge::lookup_tool_format(session, format_registry, &call.name);
-        let server_label = session.resolve_tool_server_label(&call.name);
-
-        let arguments =
-            match prepared_arguments(args_str, response_format, request_tools, request_user) {
-                Ok(v) => v,
-                Err(e) => {
-                    let err_str = format!("Failed to parse tool arguments: {e}");
-                    warn!("{}", err_str);
-                    let error_output = json!({ "error": &err_str });
-                    let mut mcp_call_item = build_transformed_mcp_call_item(
-                        &error_output,
-                        response_format,
-                        &call.call_id,
-                        &server_label,
-                        &call.name,
-                        &call.arguments_buffer,
-                    );
-                    if let Some(obj) = mcp_call_item.as_object_mut() {
-                        obj.insert(
-                            "id".to_string(),
-                            Value::String(stable_streaming_tool_item_id(&call, response_format)),
-                        );
-                    }
-                    if !send_tool_call_completion_events(
-                        tx,
-                        &call,
-                        &mcp_call_item,
-                        response_format,
-                        sequence_number,
-                    )
-                    .await
-                    {
-                        return false;
-                    }
-                    state.record_call(
-                        session.is_builtin_tool(&call.name),
-                        call.call_id,
-                        call.name,
-                        call.arguments_buffer,
-                        error_output.to_string(),
-                        mcp_call_item,
-                    );
-                    continue;
-                }
-            };
-
-        if !send_tool_call_intermediate_event(tx, &call, response_format, sequence_number).await {
+        if !dispatch_streaming_call(call, &dispatch, state, sequence_number).await {
             return false;
         }
+    }
+    true
+}
 
-        // Log the effective (post-merge) args so the log reflects what the
-        // MCP server actually receives, not the pre-merge string from the model.
-        debug!("Calling MCP tool '{}' with args: {}", call.name, arguments);
-        let tool_output = session
-            .execute_tool(ToolExecutionInput {
-                call_id: call.call_id.clone(),
-                tool_name: call.name.clone(),
-                arguments,
-            })
+/// What every call of a streamed batch is dispatched against: the session
+/// and the format registry that resolve the tool, the channel the call's
+/// events go down, and the request's model, declared tools and user, which
+/// the prepared arguments and the metrics read.
+struct StreamingDispatch<'a> {
+    session: &'a McpToolSession<'a>,
+    format_registry: &'a FormatRegistry,
+    tx: &'a SseSender,
+    model_id: &'a str,
+    request_tools: &'a [ResponseTool],
+    request_user: Option<&'a str>,
+}
+
+/// One call of a streamed batch dispatched and recorded, the shape of
+/// [`dispatch_call`] with the stream's events around it: arguments the model
+/// wrote that are not JSON close the call on the wire with an error item and
+/// record it; otherwise the format's intermediate event goes out, the
+/// prepared arguments go to the session, the result is recorded with its
+/// metrics, and the call is closed on the wire with its item. Returns false
+/// when the client left.
+async fn dispatch_streaming_call(
+    call: FunctionCallInProgress,
+    dispatch: &StreamingDispatch<'_>,
+    state: &mut ToolLoopState,
+    sequence_number: &mut u64,
+) -> bool {
+    let StreamingDispatch {
+        session,
+        format_registry,
+        tx,
+        model_id,
+        request_tools,
+        request_user,
+    } = *dispatch;
+
+    info!(
+        "Executing tool call during streaming: {} ({})",
+        call.name, call.call_id
+    );
+
+    let args_str = if call.arguments_buffer.is_empty() {
+        "{}"
+    } else {
+        &call.arguments_buffer
+    };
+
+    let response_format = openai_bridge::lookup_tool_format(session, format_registry, &call.name);
+    let server_label = session.resolve_tool_server_label(&call.name);
+
+    let arguments = match prepared_arguments(args_str, response_format, request_tools, request_user)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(tool = %call.name, error = %e, "Failed to parse tool arguments as JSON");
+            let err_str = invalid_tool_arguments(&e);
+            record_parse_failure(model_id, &call.name);
+            let error_output = json!({ "error": &err_str });
+            let mcp_call_item = streaming_call_item(
+                build_transformed_mcp_call_item(
+                    &error_output,
+                    response_format,
+                    &call.call_id,
+                    &server_label,
+                    &call.name,
+                    &call.arguments_buffer,
+                ),
+                &call,
+                response_format,
+            );
+            return close_streaming_call(
+                call,
+                mcp_call_item,
+                error_output.to_string(),
+                response_format,
+                dispatch,
+                state,
+                sequence_number,
+            )
             .await;
+        }
+    };
 
-        record_tool_metrics(model_id, &tool_output);
+    if !send_tool_call_intermediate_event(tx, &call, response_format, sequence_number).await {
+        return false;
+    }
 
-        let output_str = tool_output.output.to_string();
-        let mut mcp_call_item = to_value(openai_bridge::transform_tool_output(
+    // Log the effective (post-merge) args so the log reflects what the
+    // MCP server actually receives, not the pre-merge string from the model.
+    debug!("Calling MCP tool '{}' with args: {}", call.name, arguments);
+    let tool_output = session
+        .execute_tool(ToolExecutionInput {
+            call_id: call.call_id.clone(),
+            tool_name: call.name.clone(),
+            arguments,
+        })
+        .await;
+
+    record_tool_metrics(model_id, &tool_output);
+
+    let output_str = tool_output.output.to_string();
+    let mcp_call_item = streaming_call_item(
+        to_value(openai_bridge::transform_tool_output(
             &tool_output,
             response_format,
         ))
         .unwrap_or_else(|e| {
             warn!(tool = %call.name, error = %e, "Failed to convert item to Value");
             json!({})
-        });
-        if let Some(obj) = mcp_call_item.as_object_mut() {
-            obj.insert(
-                "id".to_string(),
-                Value::String(stable_streaming_tool_item_id(&call, response_format)),
-            );
-        }
+        }),
+        &call,
+        response_format,
+    );
+    close_streaming_call(
+        call,
+        mcp_call_item,
+        output_str,
+        response_format,
+        dispatch,
+        state,
+        sequence_number,
+    )
+    .await
+}
 
-        if !send_tool_call_completion_events(
-            tx,
-            &call,
-            &mcp_call_item,
-            response_format,
-            sequence_number,
-        )
-        .await
-        {
-            return false;
-        }
-
-        state.record_call(
-            session.is_builtin_tool(&call.name),
-            call.call_id,
-            call.name,
-            call.arguments_buffer,
-            output_str,
-            mcp_call_item,
+/// A streamed call's item under the id the stream announced for it.
+fn streaming_call_item(
+    mut item: Value,
+    call: &FunctionCallInProgress,
+    response_format: ResponseFormat,
+) -> Value {
+    if let Some(obj) = item.as_object_mut() {
+        obj.insert(
+            "id".to_string(),
+            Value::String(stable_streaming_tool_item_id(call, response_format)),
         );
     }
+    item
+}
+
+/// A streamed call closed on the wire with its item (the format's completed
+/// event, then the item's `response.output_item.done`) and recorded in the
+/// loop's state, as the non-streamed loop records a call. Returns false when
+/// the client left.
+async fn close_streaming_call(
+    call: FunctionCallInProgress,
+    mcp_call_item: Value,
+    output_str: String,
+    response_format: ResponseFormat,
+    dispatch: &StreamingDispatch<'_>,
+    state: &mut ToolLoopState,
+    sequence_number: &mut u64,
+) -> bool {
+    if !send_tool_call_completion_events(
+        dispatch.tx,
+        &call,
+        &mcp_call_item,
+        response_format,
+        sequence_number,
+    )
+    .await
+    {
+        return false;
+    }
+    state.record_call(
+        dispatch.session.is_builtin_tool(&call.name),
+        call.call_id,
+        call.name,
+        call.arguments_buffer,
+        output_str,
+        mcp_call_item,
+    );
     true
 }
 
@@ -1115,7 +1188,7 @@ async fn dispatch_call(
         Ok(v) => v,
         Err(e) => {
             warn!(tool = %call.name, error = %e, "Failed to parse tool arguments as JSON");
-            let error_output = format!("Invalid tool arguments: {e}");
+            let error_output = invalid_tool_arguments(&e);
             let error_json = json!({ "error": &error_output });
             let transformed_item = build_transformed_mcp_call_item(
                 &error_json,
@@ -1126,18 +1199,14 @@ async fn dispatch_call(
                 &call.arguments,
             );
 
-            Metrics::record_mcp_tool_call(
-                &original_body.model,
-                &call.name,
-                metrics_labels::RESULT_ERROR,
-            );
+            record_parse_failure(&original_body.model, &call.name);
 
             state.record_call(
                 session.is_builtin_tool(&call.name),
                 call.call_id,
                 call.name,
                 call.arguments,
-                error_output,
+                error_json.to_string(),
                 transformed_item,
             );
             return None;
@@ -1223,6 +1292,18 @@ fn prepared_arguments(
     }
     prepare_hosted_dispatch_args(&mut arguments, response_format, request_tools, request_user);
     Ok(arguments)
+}
+
+/// The error a call records when the model's arguments are not JSON: the
+/// same text on the call's item in both loops.
+fn invalid_tool_arguments(e: &serde_json::Error) -> String {
+    format!("Invalid tool arguments: {e}")
+}
+
+/// A call that never ran because its arguments did not parse, counted as an
+/// errored call by model and tool, in both loops.
+fn record_parse_failure(model_id: &str, tool_name: &str) {
+    Metrics::record_mcp_tool_call(model_id, tool_name, metrics_labels::RESULT_ERROR);
 }
 
 /// A dispatched call's duration and result, by model and tool.
@@ -1518,6 +1599,8 @@ fn extract_function_calls(resp: &Value) -> Vec<ExtractedFunctionCall> {
 mod tests {
     use std::collections::HashSet;
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use openai_protocol::responses::ResponsesRequest;
     use serde_json::json;
     use smg_mcp::{
         BuiltinToolType, McpConfig, McpOrchestrator, McpServerBinding, McpServerConfig,
@@ -1530,7 +1613,10 @@ mod tests {
         is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit,
         not_executed_tool_call_item, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
     };
-    use crate::openai_bridge::ResponseFormat;
+    use crate::{
+        openai::mcp::test_support,
+        openai_bridge::{FormatRegistry, ResponseFormat},
+    };
 
     fn test_tool(name: &str) -> Tool {
         let mut schema = serde_json::Map::new();
@@ -1602,40 +1688,22 @@ mod tests {
 
     #[tokio::test]
     async fn internal_filter_keeps_builtin_passthrough_mcp_call_items() {
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(Some((
+            BuiltinToolType::WebSearchPreview,
+            "brave_web_search",
+        )))
+        .await;
 
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("brave_web_search"),
             ));
 
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
 
@@ -1650,46 +1718,28 @@ mod tests {
 
     #[tokio::test]
     async fn internal_filter_keeps_builtin_passthrough_mcp_call_items_with_mixed_tools() {
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(Some((
+            BuiltinToolType::WebSearchPreview,
+            "brave_web_search",
+        )))
+        .await;
 
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("brave_web_search"),
             ));
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("internal_non_builtin_tool"),
             ));
 
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
 
@@ -2383,6 +2433,187 @@ mod tests {
         assert_eq!(overwritten, json!({ "query": "weather", "user": "u-1" }));
         assert!(
             super::prepared_arguments("not json", ResponseFormat::Passthrough, &[], None).is_err()
+        );
+    }
+
+    /// The `output` of the one `function_call_output` item a loop recorded
+    /// for the model's next round.
+    fn function_call_output(state: &ToolLoopState) -> String {
+        let item = state
+            .conversation_history
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .expect("a function_call_output item");
+        item["output"]
+            .as_str()
+            .expect("the output is a string")
+            .to_string()
+    }
+
+    /// A call whose arguments are not JSON is counted as an errored call in
+    /// both loops (the streaming one counted nothing before), and both loops
+    /// word the error on the call's item the same way.
+    #[tokio::test]
+    async fn a_call_with_non_json_arguments_is_counted_and_worded_alike_in_both_loops() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (orchestrator, bindings) = function_tool_session().await;
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        let registry = FormatRegistry::new();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut state = ToolLoopState::new(Vec::new());
+        let mut sequence_number = 0u64;
+        let mut call = super::FunctionCallInProgress::new("call_1".to_string(), 0);
+        call.name = "wiki_search".to_string();
+        call.arguments_buffer = "not json".to_string();
+        let client_stayed = super::execute_streaming_tool_calls(
+            vec![call],
+            &session,
+            &registry,
+            &tx,
+            &mut state,
+            &mut sequence_number,
+            "m",
+            &[],
+            None,
+        )
+        .await;
+        assert!(client_stayed);
+        let streamed = state.mcp_call_items[0].to_string();
+        assert!(
+            streamed.contains("Invalid tool arguments: "),
+            "the streaming loop's item: {streamed}"
+        );
+        let streamed_output = function_call_output(&state);
+        drop(tx);
+        while rx.recv().await.is_some() {}
+
+        let mut state = ToolLoopState::new(Vec::new());
+        let body: ResponsesRequest =
+            serde_json::from_value(json!({ "model": "m", "input": "q" })).expect("a request");
+        let approval = super::dispatch_call(
+            super::ExtractedFunctionCall {
+                call_id: "call_2".to_string(),
+                item_id: "fc_2".to_string(),
+                name: "wiki_search".to_string(),
+                arguments: "not json".to_string(),
+            },
+            &mut state,
+            &session,
+            &registry,
+            &body,
+        )
+        .await;
+        assert!(approval.is_none());
+        let direct = state.mcp_call_items[0].to_string();
+        assert!(
+            direct.contains("Invalid tool arguments: "),
+            "the non-streaming loop's item: {direct}"
+        );
+        let direct_output = function_call_output(&state);
+        assert!(
+            direct_output.starts_with("{\"error\":\"Invalid tool arguments: ") && direct_output == streamed_output,
+            "the function_call_output the model reads back, both loops: {direct_output} vs {streamed_output}"
+        );
+
+        let series: Vec<String> = handle
+            .render()
+            .lines()
+            .filter(|line| {
+                line.contains("smg_mcp_tool_calls_total") && line.contains("wiki_search")
+            })
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(series.len(), 1, "one errored-call series: {series:?}");
+        assert!(
+            series[0].contains("result=\"error\"") && series[0].ends_with(" 2"),
+            "both loops counted: {}",
+            series[0]
+        );
+    }
+
+    /// A streamed call the session cannot run is closed on the wire the way
+    /// an executed one is: the format's completed event, then the item's
+    /// `response.output_item.done`, in sequence, under the id the stream
+    /// announced for the call; the loop's state records the call with its
+    /// error output and its errored-call metric counts it once.
+    #[tokio::test]
+    async fn a_streamed_call_is_closed_on_the_wire_under_its_announced_id_and_recorded() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (orchestrator, bindings) = function_tool_session().await;
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        let registry = FormatRegistry::new();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut state = ToolLoopState::new(Vec::new());
+        let mut sequence_number = 7u64;
+        let mut call = super::FunctionCallInProgress::new("call_9".to_string(), 3);
+        call.name = "not_exposed".to_string();
+        call.arguments_buffer = "{\"q\":1}".to_string();
+        let client_stayed = super::execute_streaming_tool_calls(
+            vec![call],
+            &session,
+            &registry,
+            &tx,
+            &mut state,
+            &mut sequence_number,
+            "m",
+            &[],
+            None,
+        )
+        .await;
+        assert!(client_stayed);
+        drop(tx);
+
+        let events = drain_channel(&mut rx);
+        let types: Vec<String> = events
+            .iter()
+            .map(|e| event_type_from_sse_block(e))
+            .collect();
+        assert_eq!(
+            types,
+            ["response.mcp_call.completed", "response.output_item.done"],
+            "the call's events, in order"
+        );
+        assert_eq!(sequence_number, 9, "one sequence number per event");
+        let done: serde_json::Value = events[1]
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .and_then(|data| serde_json::from_str(data).ok())
+            .expect("the done event's data");
+        assert_eq!(done["sequence_number"], 8);
+        assert_eq!(done["output_index"], 3);
+        assert_eq!(done["item"]["id"], "mcp_9", "the id the stream announced");
+        assert_eq!(done["item"]["type"], "mcp_call");
+        assert_eq!(done["item"]["status"], "failed");
+
+        assert_eq!(state.mcp_call_items.len(), 1);
+        assert_eq!(
+            state.mcp_call_items[0], done["item"],
+            "the recorded item is the streamed one"
+        );
+        assert!(
+            function_call_output(&state).contains("is not in this session's exposed tool map"),
+            "the output the model reads back: {}",
+            function_call_output(&state)
+        );
+        let series: Vec<String> = handle
+            .render()
+            .lines()
+            .filter(|line| {
+                line.contains("smg_mcp_tool_calls_total") && line.contains("not_exposed")
+            })
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(series.len(), 1, "one errored-call series: {series:?}");
+        assert!(
+            series[0].contains("result=\"error\"") && series[0].ends_with(" 1"),
+            "counted once: {}",
+            series[0]
         );
     }
 }

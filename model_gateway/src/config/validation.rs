@@ -1122,6 +1122,7 @@ impl ConfigValidator {
         }
     }
 
+    /// Validate listener settings and mode-specific serving constraints.
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
         if let Err(reason) = parse_bind_host(&config.host) {
             return Err(ConfigError::invalid_value("host", &config.host, reason));
@@ -1161,6 +1162,20 @@ impl ConfigValidator {
             ));
         }
 
+        if let Some(pd_readiness) = config.pd_readiness {
+            if !matches!(
+                config.mode,
+                RoutingMode::PrefillDecode { .. } | RoutingMode::EncodePrefillDecode { .. }
+            ) {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "PD readiness thresholds require --pd-disaggregation or --epd-disaggregation"
+                        .to_string(),
+                });
+            }
+
+            Self::validate_readiness_role("prefill", pd_readiness.prefill)?;
+            Self::validate_readiness_role("decode", pd_readiness.decode)?;
+        }
         // The admin listener: a port of 0 would be an unstable ephemeral one
         // (as for the probe listener), a host without a port names a listener
         // that does not exist, and the host must be a bind host.
@@ -1368,6 +1383,54 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// Reject invalid or incomplete per-role capacity thresholds.
+    fn validate_readiness_role(role: &str, threshold: ReadinessRoleConfig) -> ConfigResult<()> {
+        if threshold.min_healthy_workers == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: format!("pd_readiness.{role}.min_healthy_workers"),
+                value: "0".to_string(),
+                reason: "Must be > 0".to_string(),
+            });
+        }
+
+        if threshold.min_healthy_percent.is_some() && threshold.expected_workers.is_none() {
+            return Err(ConfigError::MissingRequired {
+                field: format!(
+                    "pd_readiness.{role}.expected_workers (required when a percentage is set)"
+                ),
+            });
+        }
+
+        if let Some(expected) = threshold.expected_workers {
+            if expected == 0 {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("pd_readiness.{role}.expected_workers"),
+                    value: "0".to_string(),
+                    reason: "Must be > 0".to_string(),
+                });
+            }
+            if threshold.min_healthy_workers > expected {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("pd_readiness.{role}.min_healthy_workers"),
+                    value: threshold.min_healthy_workers.to_string(),
+                    reason: format!("Must not exceed expected worker count ({expected})"),
+                });
+            }
+        }
+
+        if let Some(percent) = threshold.min_healthy_percent {
+            if !(1..=100).contains(&percent) {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("pd_readiness.{role}.min_healthy_percent"),
+                    value: percent.to_string(),
+                    reason: "Must be in 1..=100".to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     /// `cors_allowed_origins`: exact origins, or a lone `*` for the open
     /// policy. This is the one place the rule is checked, so the Python
     /// launcher and library callers (`RouterConfig::builder().build()`)
@@ -1544,6 +1607,7 @@ impl ConfigValidator {
             }
             DiscoveryConfig::File(file) => Self::validate_file_discovery(file, mode),
             DiscoveryConfig::Slurm(slurm) => Self::validate_slurm_discovery(slurm, mode),
+            DiscoveryConfig::Consul(consul) => Self::validate_consul_discovery(consul, mode),
         }
     }
 
@@ -1699,11 +1763,45 @@ impl ConfigValidator {
                 "File discovery needs a manifest path",
             ));
         }
+        Self::validate_record_discovery(discovery.check_interval_secs, mode)
+    }
 
-        if discovery.check_interval_secs == 0 {
+    /// Consul's address, ACL token and TLS settings are resolved, with the
+    /// environment, when discovery starts; each instance's metadata is checked
+    /// against the routing mode whenever Consul answers.
+    fn validate_consul_discovery(
+        discovery: &ConsulDiscoveryConfig,
+        mode: &RoutingMode,
+    ) -> ConfigResult<()> {
+        if discovery.service.is_empty() {
+            return Err(ConfigError::invalid_value(
+                "discovery.service",
+                String::new(),
+                "Consul discovery needs a service name",
+            ));
+        }
+        for (field, value) in [
+            ("discovery.address", &discovery.address),
+            ("discovery.datacenter", &discovery.datacenter),
+        ] {
+            if value.as_deref() == Some("") {
+                return Err(ConfigError::invalid_value(
+                    field,
+                    String::new(),
+                    "Must not be empty when given",
+                ));
+            }
+        }
+        Self::validate_record_discovery(discovery.check_interval_secs, mode)
+    }
+
+    /// What the file and Consul providers share: their records name their own
+    /// worker types, so any mode with worker pools can use them.
+    fn validate_record_discovery(check_interval_secs: u64, mode: &RoutingMode) -> ConfigResult<()> {
+        if check_interval_secs == 0 {
             return Err(ConfigError::invalid_value(
                 "discovery.check_interval_secs",
-                discovery.check_interval_secs,
+                check_interval_secs,
                 "Must be > 0",
             ));
         }
@@ -2220,6 +2318,57 @@ impl ConfigValidator {
 mod tests {
     use super::*;
     use crate::worker::ConnectionMode;
+
+    /// Serialized thresholds survive round trips and reject invalid values for either role.
+    #[test]
+    fn pd_readiness_config_round_trip_and_validation() {
+        let mut value = serde_json::to_value(RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: vec![],
+                decode_urls: vec![],
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(value.get("pd_readiness").is_none());
+        for role in ["prefill", "decode"] {
+            for (threshold, valid) in [
+                (serde_json::json!({"expected_workers": 8}), true),
+                (serde_json::json!({"min_healthy_workers": 0}), false),
+                (serde_json::json!({"expected_workers": 0}), false),
+                (serde_json::json!({"min_healthy_percent": 80}), false),
+                (
+                    serde_json::json!({"expected_workers": 8, "min_healthy_percent": 0}),
+                    false,
+                ),
+                (
+                    serde_json::json!({"expected_workers": 8, "min_healthy_percent": 101}),
+                    false,
+                ),
+                (
+                    serde_json::json!({"expected_workers": 8, "min_healthy_workers": 9}),
+                    false,
+                ),
+                (
+                    serde_json::json!({"expected_workers": 8, "min_healthy_percent": 100}),
+                    true,
+                ),
+            ] {
+                value["pd_readiness"] = serde_json::json!({role: threshold});
+                let config: RouterConfig = serde_json::from_value(value.clone()).unwrap();
+                let result = ConfigValidator::validate(&config);
+                assert_eq!(result.is_ok(), valid, "{value}");
+                if let Err(error) = result {
+                    assert!(error.to_string().contains(&format!("pd_readiness.{role}.")));
+                }
+                let restored: RouterConfig =
+                    serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+                assert_eq!(restored.pd_readiness, config.pd_readiness);
+            }
+        }
+    }
 
     /// The OTLP endpoint is validated as the URL the exporter dials, so an
     /// unbracketed IPv6 literal is a configuration error with the bracketed
@@ -3448,6 +3597,62 @@ mod tests {
             ..Default::default()
         };
         openai.discovery = file("/run/smg/workers.json", 30);
+        assert!(matches!(
+            ConfigValidator::validate(&openai),
+            Err(ConfigError::ValidationFailed { ref reason })
+                if reason.contains("does not support service discovery")
+        ));
+    }
+
+    #[test]
+    fn test_validate_consul_discovery() {
+        let consul = |service: &str, address: Option<&str>, datacenter: Option<&str>, check| {
+            Some(DiscoveryConfig::Consul(ConsulDiscoveryConfig {
+                service: service.to_string(),
+                address: address.map(str::to_string),
+                datacenter: datacenter.map(str::to_string),
+                check_interval_secs: check,
+            }))
+        };
+
+        let mut config = regular_mode_config();
+        for discovery in [
+            consul("smg-worker", None, None, 30),
+            consul("smg-worker", Some("https://consul:8501"), Some("dc2"), 30),
+        ] {
+            config.discovery = discovery;
+            assert!(ConfigValidator::validate(&config).is_ok());
+        }
+
+        for (discovery, field) in [
+            (consul("", None, None, 30), "discovery.service"),
+            (
+                consul("smg-worker", Some(""), None, 30),
+                "discovery.address",
+            ),
+            (
+                consul("smg-worker", None, Some(""), 30),
+                "discovery.datacenter",
+            ),
+            (
+                consul("smg-worker", None, None, 0),
+                "discovery.check_interval_secs",
+            ),
+        ] {
+            config.discovery = discovery;
+            assert!(matches!(
+                ConfigValidator::validate(&config),
+                Err(ConfigError::InvalidValue { field: ref actual, .. }) if actual == field
+            ));
+        }
+
+        let mut openai = RouterConfig {
+            mode: RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+            ..Default::default()
+        };
+        openai.discovery = consul("smg-worker", None, None, 30);
         assert!(matches!(
             ConfigValidator::validate(&openai),
             Err(ConfigError::ValidationFailed { ref reason })

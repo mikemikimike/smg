@@ -105,6 +105,9 @@ class FakeServerArgs:
     data_parallel_address: str = "127.0.0.1"
     data_parallel_rpc_port: int = 30500
     zmq_engine_index: int = 0
+    disaggregation_mode: str = "null"
+    disaggregation_bootstrap_port: int = 8998
+    disaggregation_transfer_backend: str = "mooncake"
 
 
 def test_package_exposes_the_flag_and_the_rust_entry_points():
@@ -184,7 +187,10 @@ def launcher(monkeypatch):
         if any(arg in ("-h", "--help") for arg in argv):
             print("usage: tokenspeed [--model MODEL] (TokenSpeed's own help)")
             raise SystemExit(0)
-        return FakeServerArgs(model=argv[argv.index("--model") + 1])
+        mode = "null"
+        if "--disaggregation-mode" in argv:
+            mode = argv[argv.index("--disaggregation-mode") + 1]
+        return FakeServerArgs(model=argv[argv.index("--model") + 1], disaggregation_mode=mode)
 
     _install(
         monkeypatch,
@@ -300,6 +306,9 @@ def test_model_facts_mirror_the_python_servicer(monkeypatch):
         "supports_multimodal": True,
         "supported_modalities": [1, 3],
         "mrope_positions": None,
+        "spatial_merge_size": None,
+        "image_token_id": None,
+        "video_token_id": None,
         "model_dtype": "bfloat16",
         "multimodal_encoder_dtype": "bfloat16",
         "constrained_decoding": "",
@@ -336,7 +345,7 @@ def test_server_facts_carry_labels_window_and_kv_events(monkeypatch):
     assert server_args["dp_size"] == 2
     assert server_args["pairing_protocol"] == "nixl"
     assert json.loads(facts["scheduler_info_json"]) == {"shm_namespace_id": "boot:7"}
-    assert facts["max_running_requests"] == 64
+    assert facts["max_running_requests"] == 32
     assert facts["data_parallel_size"] == 2
     assert (facts["kv_events_endpoint"], facts["kv_events_topic"]) == ("tcp://*:5600", "kv")
     assert facts["kv_events_replay_endpoint"] == "tcp://*:5601"
@@ -492,6 +501,141 @@ def test_kv_event_publishing_is_on_by_default_under_the_rust_servicer():
         kv_events_config = None
 
     assert rust.default_kv_events_config(Frozen(), environ={}) is None
+
+
+def _install_cache_vocabulary(monkeypatch, state_labels=("linear_attention",)):
+    """TokenSpeed's own word on which layer labels get a State group: the
+    cache recipes' vocabulary module, with nothing else of the engine."""
+    return _install(
+        monkeypatch,
+        "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec",
+        STATE_LAYER_TYPES=frozenset(state_labels),
+    )
+
+
+def _model_config_of(*labels, nested=False, attribute="layer_types"):
+    """A model config whose checkpoint labels its layers ``labels`` (on the
+    config itself, or on the text config nested in it), as TokenSpeed's
+    ``ModelConfig`` holds it; the facts' fields as well, for a launcher."""
+    text = SimpleNamespace(
+        eos_token_id=2,
+        model_type="m",
+        architectures=["MForCausalLM"],
+        pad_token_id=None,
+        bos_token_id=None,
+        **{attribute: list(labels)},
+    )
+    return SimpleNamespace(
+        hf_config=SimpleNamespace(text_config=text) if nested else text,
+        context_len=8192,
+        vocab_size=151936,
+        dtype="torch.bfloat16",
+        is_multimodal=False,
+    )
+
+
+def test_kv_event_publishing_stays_off_for_a_model_whose_cache_keeps_recurrent_state(
+    monkeypatch, caplog
+):
+    """TokenSpeed keeps a hybrid model's recurrent state in State groups,
+    which span no tokens, and its KV-event drain aborts the engine on such a
+    group: every prefill and decode worker of a Gated-DeltaNet model died at
+    its first request once the default turned the publisher on. The default
+    follows the engine's own vocabulary of which layer labels get a State
+    group, read off the model config the engine builds: the publisher stays
+    off for such a model, said once with what turns it on; a model whose
+    layers are all history is served as before, as is one on an engine
+    without that vocabulary; an explicit configuration and the opt-out are
+    not asked, and the model config is not read for them."""
+    _install_cache_vocabulary(monkeypatch)
+    hybrid = _model_config_of(
+        "linear_attention", "linear_attention", "linear_attention", "full_attention"
+    )
+    args = FakeServerArgs()
+    with caplog.at_level(logging.INFO, logger=rust_lifecycle.logger.name):
+        assert rust.default_kv_events_config(args, environ={}, model_config=hybrid) is None
+    assert args.kv_events_config is None
+    assert (
+        "KV event publishing left off: org/m keeps recurrent state in 3 of its 4 layers "
+        "(linear_attention): State groups of TokenSpeed's cache, which span no tokens, and "
+        "TokenSpeed's KV-event drain aborts the engine on a group with no token span; pass "
+        "--kv-events-config to turn the publisher on anyway"
+    ) in caplog.text
+    # The labels on the text config nested in a multimodal checkpoint's, and a
+    # checkpoint that declares its cache labels outright, read the same.
+    for config in (
+        _model_config_of("full_attention", "linear_attention", nested=True),
+        _model_config_of("linear_attention", attribute="cache_layer_types"),
+    ):
+        args = FakeServerArgs()
+        assert rust.default_kv_events_config(args, environ={}, model_config=config) is None
+        assert args.kv_events_config is None
+    # Layers that are all history, under any label the recipes know, a
+    # checkpoint that labels none (all full attention), and a config with no
+    # checkpoint config at all: the publisher is on, as before.
+    for config in (
+        _model_config_of("full_attention", "full_attention"),
+        _model_config_of("full_attention", "sliding_attention"),
+        _model_config_of("deepseek_sparse_attention"),
+        _model_config_of(),
+        SimpleNamespace(hf_config=None),
+    ):
+        args = FakeServerArgs()
+        assert rust.default_kv_events_config(args, environ={}, model_config=config) is not None
+        assert json.loads(args.kv_events_config)["enable_kv_cache_events"] is True
+    # Without a model config given (the Python servicer's entry point), the
+    # launcher's own is built, once the vocabulary says there is something to
+    # look for; an explicit configuration and the opt-out never build it.
+    monkeypatch.setattr(rust, "_model_config", lambda args: hybrid)
+    args = FakeServerArgs()
+    assert rust.default_kv_events_config(args, environ={}) is None and args.kv_events_config is None
+
+    def never(args):
+        raise AssertionError("the model config is not read when no default would apply")
+
+    monkeypatch.setattr(rust, "_model_config", never)
+    given = '{"enable_kv_cache_events": true, "publisher": "zmq", "endpoint": "tcp://*:5600"}'
+    args = FakeServerArgs(kv_events_config=given)
+    assert rust.default_kv_events_config(args, environ={}) is None
+    assert args.kv_events_config == given
+    args = FakeServerArgs()
+    assert rust.default_kv_events_config(args, environ={rust.KV_EVENTS_ENV: "0"}) is None
+    assert args.kv_events_config is None
+    # An engine without the vocabulary has no State groups: the publisher is
+    # on, and no model config is read for the decision.
+    monkeypatch.delitem(sys.modules, "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec")
+    args = FakeServerArgs()
+    assert rust.default_kv_events_config(args, environ={}) is not None
+    assert json.loads(args.kv_events_config)["enable_kv_cache_events"] is True
+
+
+def test_the_launcher_builds_the_model_config_once_for_the_default_and_the_facts(monkeypatch):
+    """The Rust launcher reads the KV-events decision and the model facts off
+    one ``ModelConfig``, built on first use and kept on the instance."""
+    _install_cache_vocabulary(monkeypatch)
+    _stub_servicer_module(monkeypatch)
+    builds: list[str] = []
+
+    def build(args):
+        builds.append(args.model)
+        return _model_config_of("linear_attention", "full_attention")
+
+    monkeypatch.setattr(rust, "_model_config", build)
+    launcher = rust.TokenSpeedLauncher()
+    args = FakeServerArgs()
+    assert launcher.kv_events_default(args) is None and args.kv_events_config is None
+    facts = launcher.facts(args)
+    assert facts["model_path"] == "org/m" and facts["kv_events_endpoint"] == ""
+    assert builds == ["org/m"]
+    # A dense model under a fresh launcher: on, at a free port, and the facts
+    # carry the endpoint the relay dials.
+    monkeypatch.setattr(rust, "_model_config", lambda args: _model_config_of("full_attention"))
+    launcher = rust.TokenSpeedLauncher()
+    args = FakeServerArgs()
+    assert launcher.kv_events_default(args) == args.kv_events_config
+    assert (
+        launcher.facts(args)["kv_events_endpoint"] == json.loads(args.kv_events_config)["endpoint"]
+    )
 
 
 @pytest.fixture
@@ -803,7 +947,10 @@ def test_serve_rust_starts_the_scheduler_ranks_from_this_process(
         init_servicer_tracing=lambda level=None: None,
     )
     monkeypatch.setattr(rust.multiprocessing, "get_context", lambda method: pytest.fail(method))
-    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model})
+    monkeypatch.setattr(rust, "_model_config", lambda args: SimpleNamespace(hf_config=None))
+    monkeypatch.setattr(
+        rust, "model_facts", lambda args, model_config=None: {"model_path": args.model}
+    )
     monkeypatch.setattr(
         rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
     )
@@ -850,7 +997,10 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
             self.address = bind_address
 
     _install_fake_servicer(monkeypatch, FakeServer)
-    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model})
+    monkeypatch.setattr(rust, "_model_config", lambda args: SimpleNamespace(hf_config=None))
+    monkeypatch.setattr(
+        rust, "model_facts", lambda args, model_config=None: {"model_path": args.model}
+    )
     monkeypatch.setattr(
         rust,
         "server_facts",
@@ -874,6 +1024,8 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_DRAIN_SECS", "1.5")
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS", "42")
     monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS", "0")
+    monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_SILENCE_TIMEOUT_SECS", "900")
+    monkeypatch.setenv("SMG_TOKENSPEED_SERVICER_PREFILL_TOKENS_PER_SEC", "1000")
 
     assert asyncio.run(rust.serve_rust(FakeServerArgs(port=50123))) == 0
 
@@ -885,6 +1037,8 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert server["tokenizer_dir"] == str(tmp_path)
     assert server["engine_startup_timeout_secs"] == 42.0
     assert server["engine_startup_ceiling_secs"] == 0.0  # 0 lifts the ceiling
+    assert server["engine_silence_timeout_secs"] == 900.0
+    assert server["engine_prefill_tokens_per_sec"] == 1000
     assert server["model_path"] == "org/m"
     headless = recorded["headless"]
     assert headless.zmq_msgpack is True and headless.skip_tokenizer_init is True
@@ -907,11 +1061,21 @@ def _run_serve_rust(monkeypatch, tmp_path) -> dict:
     scheduler launch and the supervisor stubbed; the keywords the server was
     constructed with."""
     created: dict = {}
+    recorded: dict = {}
 
     class FakeServer:
         def __init__(self, **kwargs):
             created.update(kwargs)
             self.address = kwargs["bind_address"]
+            self.serving: list[bool] = []
+            self.ready: list[bool] = []
+            recorded["server"] = self
+
+        def set_serving(self, serving: bool) -> None:
+            self.serving.append(serving)
+
+        def set_ready(self, ready: bool) -> None:
+            self.ready.append(ready)
 
     _install_fake_servicer(monkeypatch, FakeServer)
     _stub_servicer_module(monkeypatch)
@@ -930,13 +1094,208 @@ def _run_serve_rust(monkeypatch, tmp_path) -> dict:
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.setattr(rust, "launch_scheduler_ranks", lambda headless: "engine-handle")
 
-    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
+    async def fake_supervise(server, engine, *, drain_secs, **kwargs):
+        recorded["supervise_kwargs"] = kwargs
         return 0
 
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
     assert asyncio.run(rust.serve_rust(FakeServerArgs(port=50123))) == 0
+    _run_serve_rust.recorded = recorded
     return created
+
+
+class _FakeBootstrapServer:
+    """The engine's KV bootstrap server as the launcher drives it: built on a
+    port (which starts it), closed once."""
+
+    built: list[_FakeBootstrapServer] = []
+
+    def __init__(self, port: int) -> None:
+        self.port = port
+        self.closed = 0
+        _FakeBootstrapServer.built.append(self)
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def _install_fake_pd_utils(monkeypatch) -> dict:
+    """``tokenspeed.runtime.pd.utils`` as the launcher reads it: the transfer
+    backend and class-type enums and the registry that hands out the
+    bootstrap server class; records what was asked for."""
+    import enum
+
+    asked: dict = {}
+
+    class TransferBackend(enum.Enum):
+        MOONCAKE = "mooncake"
+
+    class KVClassType(enum.Enum):
+        MANAGER_PREFILL = "manager_prefill"
+        BOOTSTRAP_SERVER = "bootstrap_server"
+
+    def get_kv_class(backend, class_type):
+        asked["backend"], asked["class_type"] = backend, class_type
+        assert class_type is KVClassType.BOOTSTRAP_SERVER
+        return _FakeBootstrapServer
+
+    _install(
+        monkeypatch,
+        "tokenspeed.runtime.pd.utils",
+        TransferBackend=TransferBackend,
+        KVClassType=KVClassType,
+        get_kv_class=get_kv_class,
+    )
+    _FakeBootstrapServer.built = []
+    return asked
+
+
+def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str) -> dict:
+    """``serve_rust`` for a launch in disaggregation ``mode`` against the
+    recording fakes: when the ranks were launched relative to the bootstrap
+    server, and the supervisor's end."""
+    recorded: dict = {"launched_with_servers": None}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            self.address = kwargs["bind_address"]
+
+        def set_ready(self, ready: bool) -> None:
+            pass
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    monkeypatch.setattr(rust, "_model_config", lambda args: SimpleNamespace(hf_config=None))
+    monkeypatch.setattr(
+        rust, "model_facts", lambda args, model_config=None: {"model_path": args.model}
+    )
+    monkeypatch.setattr(
+        rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
+    )
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
+
+    def fake_launch(headless):
+        # The ranks register with the bootstrap server when they start: it
+        # must already be up.
+        recorded["launched_with_servers"] = [
+            (server.port, server.closed) for server in _FakeBootstrapServer.built
+        ]
+        return "engine-handle"
+
+    async def fake_supervise(server, engine, *, drain_secs, **kwargs):
+        recorded["supervised"] = engine
+        return 0
+
+    monkeypatch.setattr(rust, "launch_scheduler_ranks", fake_launch)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
+    with caplog.at_level("INFO", logger=rust.logger.name):
+        recorded["exit"] = asyncio.run(
+            rust.serve_rust(FakeServerArgs(port=50123, disaggregation_mode=mode))
+        )
+    return recorded
+
+
+def test_a_prefill_launch_starts_the_engines_kv_bootstrap_server_before_the_ranks(
+    monkeypatch, tmp_path, caplog
+):
+    """The prefill side hosts the rendezvous the decode side discovers its KV
+    at. The engine's frontend starts it on the Python path; here the
+    launcher starts the same class, through the engine's registry for the
+    transfer backend, on the configured port, before the ranks (each
+    registers with it once), logs it, and closes it when it ends."""
+    asked = _install_fake_pd_utils(monkeypatch)
+    recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, "prefill")
+    assert recorded["exit"] == 0 and recorded["supervised"] == "engine-handle"
+    assert recorded["launched_with_servers"] == [(8998, 0)]
+    assert asked["backend"].value == "mooncake"
+    assert asked["class_type"].value == "bootstrap_server"
+    (server,) = _FakeBootstrapServer.built
+    assert server.closed == 1
+    assert (
+        "Bootstrap server started for disaggregation mode on port 8998 (mooncake transfer)"
+        in caplog.text
+    )
+
+
+@pytest.mark.parametrize("mode", ["null", "decode"])
+def test_a_decode_or_aggregated_launch_starts_no_bootstrap_server(
+    monkeypatch, tmp_path, caplog, mode
+):
+    """Only the prefill side hosts the rendezvous: the other roles start
+    nothing and never reach for the engine's PD registry."""
+    _install_fake_pd_utils(monkeypatch)
+    recorded = _serve_rust_role(monkeypatch, tmp_path, caplog, mode)
+    assert recorded["exit"] == 0
+    assert recorded["launched_with_servers"] == []
+    assert _FakeBootstrapServer.built == []
+    assert "Bootstrap server started" not in caplog.text
+
+
+def test_an_encode_launch_is_refused_under_the_rust_path(launcher, monkeypatch, caplog):
+    """The EPD encode role takes its requests over the engine's in-process
+    channel, which this path does not build: such a launch under an explicit
+    rust is a configuration error before any scheduler starts (exit code 2,
+    one line naming the way out), never a servicer that reports SERVING and
+    encodes nothing. The prefill and decode roles pass."""
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD encode role"):
+        rust.refuse_encode_role(FakeServerArgs(disaggregation_mode="encode"))
+    for mode in ("null", "prefill", "decode"):
+        rust.refuse_encode_role(FakeServerArgs(disaggregation_mode=mode))
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="EPD encode role"):
+        asyncio.run(rust.serve_rust(FakeServerArgs(disaggregation_mode="encode")))
+
+    module, calls = launcher
+    caplog.set_level(logging.ERROR)
+    monkeypatch.setattr(module, "serve_rust", rust.serve_rust)
+    with pytest.raises(SystemExit) as raised:
+        module.main(
+            ["--servicer-impl", "rust", "--model", "org/m", "--disaggregation-mode", "encode"]
+        )
+    assert raised.value.code == 2 and calls["served"] is None
+    assert "does not serve the EPD encode role" in caplog.text
+    assert "--servicer-impl python" in caplog.text
+
+
+def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_path):
+    """With a warm-up planned (the default knob, a generation model whose
+    facts carry a vocabulary and a context), the server's readiness is held
+    before the scheduler starts (the health-only setter: admission stays open
+    for the pass's own requests, never the drain switch) and the supervisor is
+    handed the pass, which flips SERVING when it ran; with the knob off,
+    neither happens."""
+    _run_serve_rust(monkeypatch, tmp_path)
+    recorded = _run_serve_rust.recorded
+    assert recorded["server"].ready == [False] and recorded["server"].serving == []
+    assert callable(recorded["supervise_kwargs"]["warmup"])
+
+    monkeypatch.setenv(rust.WARMUP_ENV, "off")
+    _run_serve_rust(monkeypatch, tmp_path)
+    recorded = _run_serve_rust.recorded
+    assert recorded["server"].ready == [] and recorded["server"].serving == []
+    assert recorded["supervise_kwargs"] == {}
+
+
+def test_serve_rust_refuses_a_warm_up_knob_it_cannot_read_before_the_server_binds(
+    monkeypatch, tmp_path
+):
+    created: dict = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    monkeypatch.setenv(rust.WARMUP_ENV, "warm")
+    with pytest.raises(
+        rust_lifecycle.ServicerConfigError, match="SMG_TOKENSPEED_SERVICER_WARMUP='warm'"
+    ):
+        asyncio.run(rust.serve_rust(FakeServerArgs(port=50123)))
+    assert created == {}
 
 
 def test_serve_rust_defaults_both_startup_bounds(monkeypatch, tmp_path):
@@ -944,9 +1303,13 @@ def test_serve_rust_defaults_both_startup_bounds(monkeypatch, tmp_path):
     defaults for the silence bound and the ceiling."""
     monkeypatch.delenv(rust.STARTUP_TIMEOUT_SECS_ENV, raising=False)
     monkeypatch.delenv(rust.STARTUP_CEILING_SECS_ENV, raising=False)
+    monkeypatch.delenv(rust.SILENCE_TIMEOUT_SECS_ENV, raising=False)
+    monkeypatch.delenv(rust.PREFILL_TOKENS_PER_SEC_ENV, raising=False)
     created = _run_serve_rust(monkeypatch, tmp_path)
     assert created["engine_startup_timeout_secs"] == rust.DEFAULT_STARTUP_TIMEOUT_SECS
     assert created["engine_startup_ceiling_secs"] == rust.DEFAULT_STARTUP_CEILING_SECS
+    assert created["engine_silence_timeout_secs"] == rust.DEFAULT_SILENCE_TIMEOUT_SECS
+    assert created["engine_prefill_tokens_per_sec"] == rust.DEFAULT_PREFILL_TOKENS_PER_SEC
 
 
 def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkeypatch, tmp_path):
@@ -1146,7 +1509,10 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
             events.append(f"stop:{timeout}")
 
     _install_fake_servicer(monkeypatch, FakeServer)
-    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model})
+    monkeypatch.setattr(rust, "_model_config", lambda args: SimpleNamespace(hf_config=None))
+    monkeypatch.setattr(
+        rust, "model_facts", lambda args, model_config=None: {"model_path": args.model}
+    )
     monkeypatch.setattr(
         rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
     )
@@ -1189,6 +1555,40 @@ def test_model_facts_carry_the_engines_constrained_decoding_policy(monkeypatch):
     args = SimpleNamespace(model="org/m", constrained_decoding="requested")
     assert rust.model_facts(args, model_config=declared)["constrained_decoding"] == "requested"
     assert "constrained_decoding" not in rust.server_facts(FakeServerArgs())
+
+
+def test_mrope_layout_facts_are_read_as_the_engines_input_processor_reads_them():
+    # A Qwen3.5 checkpoint: the merge size on the vision config, the
+    # placeholder ids at the top level (the engine's compute_mrope_positions
+    # reads hf_config.vision_config.spatial_merge_size and hf_config.image_token_id).
+    qwen35 = SimpleNamespace(
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        image_token_id=248056,
+        video_token_id=248057,
+    )
+    assert rust.mrope_layout(qwen35) == {
+        "spatial_merge_size": 2,
+        "image_token_id": 248056,
+        "video_token_id": 248057,
+    }
+    # A dict-shaped config reads the same; a checkpoint without a vision
+    # config or the ids ships None for each (the Rust rule then refuses the
+    # item instead of guessing).
+    assert rust.mrope_layout({"vision_config": {"spatial_merge_size": 2}, "image_token_id": 5}) == {
+        "spatial_merge_size": 2,
+        "image_token_id": 5,
+        "video_token_id": None,
+    }
+    assert rust.mrope_layout(SimpleNamespace(image_token_id="x")) == {
+        "spatial_merge_size": None,
+        "image_token_id": None,
+        "video_token_id": None,
+    }
+    assert rust.mrope_layout(None) == {
+        "spatial_merge_size": None,
+        "image_token_id": None,
+        "video_token_id": None,
+    }
 
 
 def test_mrope_positions_are_read_off_the_text_rope_config():

@@ -11,9 +11,6 @@
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's emissions land in the rendered text.
 
-#[path = "common/mod.rs"]
-mod common;
-
 use std::{future::Future, time::Duration};
 
 use common::grpc_harness::{
@@ -28,6 +25,7 @@ use smg::{
     worker::{RuntimeType, WorkerType},
 };
 use smg_grpc_client::vllm_proto as proto;
+use smg_test_harness as common;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -100,6 +98,20 @@ fn produce_after(tx: GenerateTx, delay: Duration) {
 
 #[tonic::async_trait]
 impl proto::vllm_engine_server::VllmEngine for DelayedEngine {
+    async fn start_profile(
+        &self,
+        _request: Request<smg_grpc_client::common_proto::StartProfileRequest>,
+    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    async fn stop_profile(
+        &self,
+        _request: Request<smg_grpc_client::common_proto::StopProfileRequest>,
+    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
     type GenerateStream = ReceiverStream<Result<proto::GenerateResponse, Status>>;
 
     async fn generate(

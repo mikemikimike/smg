@@ -431,6 +431,30 @@ def test_the_python_servicer_turns_the_kv_event_publisher_on_by_default_too(
     # An encode worker runs the vision tower only: no KV cache, nothing to turn on.
     assert serve(lambda args: setattr(args, "disaggregation_mode", "encode")) == (None, None)
     assert "KV event publishing" not in caplog.text
+    # A hybrid model keeps recurrent state in State groups, which span no
+    # tokens, and TokenSpeed's KV-event drain aborts the engine on them: the
+    # engine's own vocabulary of which layer labels get a State group, read
+    # off the model config built here as the launcher builds it, leaves the
+    # publisher off for such a model, and the operator reads why once.
+    monkeypatch.setitem(
+        sys.modules,
+        "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec",
+        _module(
+            "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec",
+            STATE_LAYER_TYPES=frozenset({"linear_attention"}),
+        ),
+    )
+    hybrid = SimpleNamespace(
+        hf_config=SimpleNamespace(layer_types=["linear_attention", "full_attention"])
+    )
+    monkeypatch.setattr(tokenspeed_rust, "_model_config", lambda args: hybrid)
+    assert serve(lambda args: setattr(args, "model", "org/hybrid")) == (None, None)
+    assert (
+        "KV event publishing left off: org/hybrid keeps recurrent state in 1 of its 2 layers "
+        "(linear_attention): State groups of TokenSpeed's cache, which span no tokens, and "
+        "TokenSpeed's KV-event drain aborts the engine on a group with no token span; pass "
+        "--kv-events-config to turn the publisher on anyway"
+    ) in caplog.text
 
 
 def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_too(
@@ -461,3 +485,48 @@ def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_t
     assert raised.value.code == 2
     assert refusal in caplog.text and "--kv-events-config" in caplog.text
     launched.assert_not_called()
+
+
+def test_a_failed_planned_warm_up_still_flips_the_worker_to_serving(
+    monkeypatch, server_mod, caplog
+):
+    """The planned pass is an optimisation: when it raises past its own
+    guards, the one-token warm-up still counts and the health flips to
+    SERVING (a raise would otherwise leave the warm-up thread before it)."""
+    caplog.set_level(logging.ERROR)
+    final = Mock()
+    final.HasField.return_value = True
+    stub = Mock()
+    stub.GetModelInfo.return_value = SimpleNamespace(max_context_length=4096, vocab_size=32000)
+    stub.Generate.return_value = [final]
+    channel = Mock()
+    monkeypatch.setattr(server_mod.grpc, "insecure_channel", Mock(return_value=channel))
+    monkeypatch.setattr(
+        server_mod.tokenspeed_scheduler_pb2_grpc, "TokenSpeedSchedulerStub", lambda _channel: stub
+    )
+    monkeypatch.setattr(
+        server_mod,
+        "tokenspeed_scheduler_pb2",
+        SimpleNamespace(
+            GetModelInfoRequest=lambda: None,
+            GenerateRequest=lambda **kwargs: SimpleNamespace(**kwargs),
+            TokenizedInput=lambda **kwargs: SimpleNamespace(**kwargs),
+            SamplingParams=lambda **kwargs: SimpleNamespace(**kwargs),
+        ),
+    )
+
+    def broken(_server_args, _facts):
+        raise AttributeError("no such argument on this engine release")
+
+    monkeypatch.setattr(server_mod, "warmup_inputs", broken)
+    health = SimpleNamespace(set_serving=Mock())
+    server_args = SimpleNamespace(host="127.0.0.1", port=30000, disaggregation_mode="null")
+
+    server_mod._wait_and_warmup(server_args, health)
+
+    health.set_serving.assert_called_once_with()
+    channel.close.assert_called_once()
+    assert any(
+        "The planned warm-up failed; the server serves without it" in r.getMessage()
+        for r in caplog.records
+    )

@@ -14,7 +14,7 @@ use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
     helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
-    pd_protocol::{DpPlacement, PdDispatch, PdProtocol},
+    pd_protocol::{PdDispatch, PdProtocol},
 };
 use crate::{
     observability::{
@@ -29,6 +29,7 @@ use crate::{
                 mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             pd_admission,
+            pd_failure::{PdSide, SidePhase},
             retry::mark_non_retryable,
         },
         error,
@@ -46,7 +47,7 @@ use crate::{
                 ProtoResponseVariant, ProtoStream,
             },
             utils::{
-                account_pd_side_failure,
+                account_pd_side_failure, mark_error_reason,
                 stream_failure::UpstreamClass,
                 tonic_ext::{TonicResultExt, TonicStatusExt},
             },
@@ -65,45 +66,6 @@ type StreamResult = Result<ProtoStream, tonic::Status>;
 /// selection) so the side still in flight when its partner fails can be moved
 /// off the request path — see [`retire_pd_side`].
 type SideDispatch = Pin<Box<dyn Future<Output = StreamResult> + Send>>;
-
-/// Which side of a disaggregated dispatch a result belongs to. The error code
-/// and message are part of the client contract, so they live per side here
-/// rather than being reconstructed at each call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PdSide {
-    Prefill,
-    Decode,
-}
-
-impl PdSide {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Prefill => metrics_labels::WORKER_PREFILL,
-            Self::Decode => metrics_labels::WORKER_DECODE,
-        }
-    }
-
-    fn error_code(self) -> &'static str {
-        match self {
-            Self::Prefill => "prefill_worker_failed_to_start",
-            Self::Decode => "decode_worker_failed_to_start",
-        }
-    }
-
-    fn error_message(self) -> &'static str {
-        match self {
-            Self::Prefill => "Prefill worker failed to start",
-            Self::Decode => "Decode worker failed to start",
-        }
-    }
-
-    fn partner(self) -> Self {
-        match self {
-            Self::Prefill => Self::Decode,
-            Self::Decode => Self::Prefill,
-        }
-    }
-}
 
 /// How the two parallel sides resolved.
 #[expect(
@@ -516,27 +478,10 @@ async fn execute_pd_dispatch(
         }
         PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
             Some(n) => {
-                execute_fanout_pd(
-                    proto_request,
-                    n,
-                    clients,
-                    workers,
-                    protocol,
-                    prefill_guard,
-                    ledger,
-                )
-                .await
+                execute_fanout_pd(proto_request, n, clients, workers, prefill_guard, ledger).await
             }
             None => {
-                execute_parallel_pd(
-                    proto_request,
-                    clients,
-                    workers,
-                    protocol,
-                    prefill_guard,
-                    ledger,
-                )
-                .await
+                execute_parallel_pd(proto_request, clients, workers, prefill_guard, ledger).await
             }
         },
     }?;
@@ -598,7 +543,6 @@ async fn execute_fanout_pd(
     n: u32,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
-    protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
@@ -616,9 +560,7 @@ async fn execute_fanout_pd(
     let guards = prefill_guard.replicate_to(subs.len());
     let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
         let mut clients = clients.clone();
-        async move {
-            execute_parallel_pd(sub, &mut clients, workers, protocol, guard, ledger).await
-        }
+        async move { execute_parallel_pd(sub, &mut clients, workers, guard, ledger).await }
     });
     let results = try_join_all(dispatches).await?;
 
@@ -887,6 +829,19 @@ fn start_failure_response(
         mark_non_retryable(&mut response);
         return response;
     }
+    // The engine could not continue the request under its constraint (see
+    // `TonicStatusExt::constraint_failure_response`): the request's outcome,
+    // not the worker's failure, and final (a replay runs the same tokens into
+    // the same grammar).
+    if let Some(response) = e.constraint_failure_response() {
+        warn!(
+            function = function,
+            error = %e,
+            "{}: the engine could not continue the request under its constraint",
+            description
+        );
+        return response;
+    }
     if e.http_status().is_client_error() {
         warn!(function = function, error = %e, "{}: engine rejected the request", description);
     } else {
@@ -984,7 +939,6 @@ async fn execute_parallel_pd(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
-    protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
@@ -994,7 +948,7 @@ async fn execute_parallel_pd(
         .unwrap_or("");
     let (prefill_client, decode_client) =
         clients.disaggregated_or_mismatch("execute_parallel_pd")?;
-    let (prefill_request, decode_request) = parallel_pd_requests(proto_request, workers, protocol);
+    let (prefill_request, decode_request) = parallel_pd_requests(proto_request, workers);
 
     // `generate` only establishes the prefill stream here (SMG does not drain
     // it on this path), so prefill duration cannot be measured — only TTFT,
@@ -1038,7 +992,9 @@ async fn execute_parallel_pd(
     let decode_dispatch: SideDispatch =
         Box::pin(async move { decode_client.generate(decode_request).await });
 
-    match dispatch_pd_sides(prefill_dispatch, decode_dispatch).await {
+    // The prefill worker's handoffs are watched for only where its side has a bound.
+    let handoff_to = bound.as_ref().and(prefill_worker);
+    match dispatch_pd_sides(prefill_dispatch, decode_dispatch, handoff_to).await {
         PdDispatchOutcome::Both(prefill_result, decode_result) => {
             parallel_sides_answered(
                 &sides,
@@ -1067,11 +1023,10 @@ async fn execute_parallel_pd(
 
 /// The parallel dispatch's two requests from the client's: the prefill side is
 /// the request itself, the decode side its pixel-free clone, each pinned to its
-/// worker's DP rank where the engine reads placement from the request.
+/// worker's selected DP rank.
 fn parallel_pd_requests(
     proto_request: ProtoGenerateRequest,
     workers: &WorkerSelection,
-    protocol: PdProtocol,
 ) -> (ProtoGenerateRequest, ProtoGenerateRequest) {
     // Decode consumes the KV handoff from prefill, but TokenSpeed still
     // needs multimodal metadata to pad placeholders and compute MRoPE in
@@ -1081,17 +1036,11 @@ fn parallel_pd_requests(
     let mut prefill_request = proto_request;
     let mut decode_request = prefill_request.clone_without_mm_pixels();
     decode_request.clear_encode_bootstrap_info();
-    // Pin each side's DP rank only when the engine reads placement from
-    // the request field; `RoomResidue` engines take it from the bootstrap
-    // room minted in maybe_inject_pd_rendezvous, ignore the pin, and spam
-    // conflict warnings on a mismatched decode-side pin.
-    if protocol.dp_placement == DpPlacement::PinField {
-        if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
-            prefill_request.set_data_parallel_rank(rank as i32);
-        }
-        if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
-            decode_request.set_data_parallel_rank(rank as i32);
-        }
+    if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
+        prefill_request.set_data_parallel_rank(rank as i32);
+    }
+    if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
+        decode_request.set_data_parallel_rank(rank as i32);
     }
     (prefill_request, decode_request)
 }
@@ -1122,7 +1071,7 @@ async fn parallel_sides_answered(
         .map_err(|e| pd_side_error(PdSide::Prefill, sides.prefill_label, &e, workers));
     let decode =
         decode_result.map_err(|e| pd_side_error(PdSide::Decode, sides.decode_label, &e, workers));
-    let (prefill_stream, decode_stream) = match (prefill, decode) {
+    let (prefill_stream, mut decode_stream) = match (prefill, decode) {
         (Ok(prefill), Ok(decode)) => (prefill, decode),
         // A prefill given up on for a silence verdict (its own, or
         // its stalled decode partner's) may yet start the handoff
@@ -1156,7 +1105,9 @@ async fn parallel_sides_answered(
         &mut prefill_stream,
         bound,
         prefill_worker,
-        workers.decode_worker(),
+        workers
+            .decode_worker()
+            .map(|decode| (decode, &mut decode_stream)),
         sides.prefill_label,
         &sides.request_id,
         sides.prompt_tokens,
@@ -1273,9 +1224,15 @@ fn parallel_side_failed_first(
 /// timeout into a 300 s decode transfer timeout for the client, with the
 /// pair's slot held throughout. A side that has already answered is never
 /// discarded, so the success path is byte-for-byte what a join produced.
+///
+/// While the prefill side is still dispatching, the decode side's first item
+/// is pulled ahead and held for its reader as it was: output is a handoff of
+/// `handoff_to`'s, the prefill worker the side's silence rule judges (see
+/// [`liveness::prefill_side_reprieve`]).
 async fn dispatch_pd_sides(
     mut prefill: SideDispatch,
     mut decode: SideDispatch,
+    handoff_to: Option<&Arc<dyn Worker>>,
 ) -> PdDispatchOutcome {
     /// One turn of the dispatch loop. The `select!` handlers may only
     /// classify — moving a still-pending side out happens after the macro's
@@ -1287,6 +1244,9 @@ async fn dispatch_pd_sides(
         Decode(StreamResult),
         /// This side failed while its partner was still dispatching.
         Alone(PdSide, tonic::Status),
+        /// The decode side's first item came while the prefill side was
+        /// still dispatching: whether it was output, a handoff.
+        Witnessed(bool),
     }
 
     // At most one of these is `Some` at the top of the loop: the second
@@ -1294,20 +1254,36 @@ async fn dispatch_pd_sides(
     // `select!` branches from being disabled at once.
     let mut prefill_result: Option<StreamResult> = None;
     let mut decode_result: Option<StreamResult> = None;
+    let mut watching = handoff_to.is_some();
 
     loop {
+        let witnessing = watching && prefill_result.is_none() && decode_result.is_some();
+        // Biased: the decode side's first item, then the decode side, then
+        // the prefill side, so a decode answer (and the item a servicer that
+        // holds its headers sends with it) landing in the wakeup of the
+        // prefill side's deadline is credited before the side is judged.
+        // Each comes once, so neither starves the prefill side.
         let step = tokio::select! {
-            result = &mut prefill, if prefill_result.is_none() => match result {
-                Err(error) if decode_result.is_none() => DispatchStep::Alone(PdSide::Prefill, error),
-                result => DispatchStep::Prefill(result),
-            },
+            biased;
+            handed_off = decode_handed_off(decode_result.as_mut().and_then(|r| r.as_mut().ok())),
+                if witnessing => DispatchStep::Witnessed(handed_off),
             result = &mut decode, if decode_result.is_none() => match result {
                 Err(error) if prefill_result.is_none() => DispatchStep::Alone(PdSide::Decode, error),
                 result => DispatchStep::Decode(result),
             },
+            result = &mut prefill, if prefill_result.is_none() => match result {
+                Err(error) if decode_result.is_none() => DispatchStep::Alone(PdSide::Prefill, error),
+                result => DispatchStep::Prefill(result),
+            },
         };
 
         match step {
+            DispatchStep::Witnessed(handed_off) => {
+                watching = false;
+                if let Some(worker) = handoff_to.filter(|_| handed_off) {
+                    worker.note_prefill_handoff();
+                }
+            }
             DispatchStep::Alone(side, error) => {
                 let partner = match side {
                     PdSide::Prefill => decode,
@@ -1328,6 +1304,19 @@ async fn dispatch_pd_sides(
                 None => decode_result = Some(result),
             },
         }
+    }
+}
+
+/// Whether the parallel decode side's first item, pulled ahead of its reader
+/// (see [`ProtoStream::first_item_ahead`]), is output: the decode engine
+/// producing from the KV its prefill worker handed off. Never completes
+/// without a stream.
+async fn decode_handed_off(decode: Option<&mut ProtoStream>) -> bool {
+    match decode {
+        Some(decode) => {
+            matches!(decode.first_item_ahead().await, Some(Ok(response)) if response.is_output())
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -1356,8 +1345,8 @@ fn pd_side_error(
     start_failure_response(
         error,
         "execute_parallel_pd",
-        side.error_message(),
-        side.error_code(),
+        side.description(SidePhase::Start),
+        side.code(SidePhase::Start),
     )
 }
 
@@ -1558,7 +1547,9 @@ struct PrefillSilence {
 /// answered takes (see [`liveness::prefill_side_reprieve`]). One WARN naming
 /// the worker, the request, how long the side waited, how long the worker
 /// had answered nothing against which window and how long ago it last
-/// answered anything, the worker-error counter under the timeout class, and
+/// answered anything or showed a decode side a handoff (a handoff only
+/// reprieves, so the silence a verdict names is the worker's own), the
+/// worker-error counter under the timeout class, and
 /// the status the side's failure is reported with. Nothing else bounds this
 /// wait below the request's own timeout: the engine's health probes keep
 /// passing, the queue timeout ended at worker selection, and the admission
@@ -1574,9 +1565,11 @@ fn prefill_side_silent(
     phase: &'static str,
 ) -> tonic::Status {
     let millis = |span: Duration| u64::try_from(span.as_millis()).unwrap_or(u64::MAX);
-    let worker_last_answer = worker
-        .prefill_answered_ago()
-        .map_or_else(|| "never".to_string(), |ago| format!("{ago:.1?} ago"));
+    let ago = |ago: Option<Duration>| {
+        ago.map_or_else(|| "never".to_string(), |ago| format!("{ago:.1?} ago"))
+    };
+    let worker_last_answer = ago(worker.prefill_answered_ago());
+    let worker_last_handoff = ago(worker.prefill_handed_off_ago());
     warn!(
         request_id = %request_id,
         worker = worker.url(),
@@ -1588,6 +1581,7 @@ fn prefill_side_silent(
         worker_silent_ms = silence.silent.map(millis),
         window_ms = millis(silence.window),
         worker_last_answer = %worker_last_answer,
+        worker_last_handoff = %worker_last_handoff,
         "PD prefill side produced nothing past its silence bound, and its worker answered no other side for its silence window; giving up on it"
     );
     Metrics::record_worker_error(
@@ -1691,9 +1685,10 @@ fn is_decode_silence(status: &tonic::Status) -> bool {
 /// alone (the prefill stays selectable) and the answer stands when no other
 /// decode worker is available.
 fn decode_silence_response(status: &tonic::Status, decode: &Arc<dyn Worker>) -> Response {
-    let mut response = error::gateway_timeout(
-        "decode_worker_silent",
-        format!("Decode worker silent: {}", status.message()),
+    let mut response = PdSide::Decode.answer(
+        SidePhase::Silent,
+        http::StatusCode::GATEWAY_TIMEOUT,
+        status.message(),
     );
     mark_failed_side(&mut response, decode.as_ref());
     response
@@ -1752,9 +1747,10 @@ fn record_silence_outcome(
 /// stays selectable) and the answer stands when no other prefill worker is
 /// available (see `attempt_ledger::FailedSide`).
 fn prefill_silence_response(status: &tonic::Status, prefill: &Arc<dyn Worker>) -> Response {
-    let mut response = error::gateway_timeout(
-        "prefill_worker_silent",
-        format!("Prefill worker silent: {}", status.message()),
+    let mut response = PdSide::Prefill.answer(
+        SidePhase::Silent,
+        http::StatusCode::GATEWAY_TIMEOUT,
+        status.message(),
     );
     mark_failed_side(&mut response, prefill.as_ref());
     response
@@ -1865,12 +1861,15 @@ async fn dispatch_prefill_within(
 /// was. The item stays on the stream for its reader; past the bound, with
 /// the worker silent, the silence verdict (the caller drops the side, which
 /// aborts its room). Without a bound nothing is pulled ahead and the side
-/// counts as answered, as its dispatch did.
+/// counts as answered, as its dispatch did. The decode `partner` comes with
+/// its stream: its first output, pulled ahead once, is a handoff of the
+/// prefill worker's (see [`dispatch_pd_sides`]); an item its dispatch already
+/// pulled was credited then, not again.
 async fn first_prefill_response_within(
     stream: &mut ProtoStream,
     bound: Option<PrefillBound>,
     worker: Option<&Arc<dyn Worker>>,
-    partner: Option<&Arc<dyn Worker>>,
+    partner: Option<(&Arc<dyn Worker>, &mut ProtoStream)>,
     connection: &'static str,
     request_id: &str,
     prompt_tokens: u64,
@@ -1878,14 +1877,30 @@ async fn first_prefill_response_within(
     let (Some(bound), Some(worker)) = (bound, worker) else {
         return Ok(FirstItem::Response);
     };
+    let partner_worker = partner.as_ref().map(|(partner, _)| *partner);
+    let mut decode = partner
+        .map(|(_, decode)| decode)
+        .filter(|decode| !decode.holds_item_ahead());
     let mut deadline = bound.deadline;
     loop {
-        if let Ok(first) = stream.first_response_within(deadline).await {
-            return Ok(first);
+        tokio::select! {
+            biased;
+            handed_off = decode_handed_off(decode.as_deref_mut()), if decode.is_some() => {
+                if handed_off {
+                    worker.note_prefill_handoff();
+                }
+                decode = None;
+                continue;
+            }
+            first = stream.first_response_within(deadline) => {
+                if let Ok(first) = first {
+                    return Ok(first);
+                }
+            }
         }
         let more = judge_prefill_side(
             worker,
-            partner,
+            partner_worker,
             &bound,
             connection,
             request_id,
@@ -2079,8 +2094,8 @@ fn sequential_decode_failure(
     start_failure_response(
         e,
         "execute_sequential_pd",
-        PdSide::Decode.error_message(),
-        PdSide::Decode.error_code(),
+        PdSide::Decode.description(SidePhase::Start),
+        PdSide::Decode.code(SidePhase::Start),
     )
 }
 
@@ -2106,8 +2121,8 @@ fn sequential_prefill_failure(
     start_failure_response(
         e,
         "execute_sequential_pd",
-        PdSide::Prefill.error_message(),
-        PdSide::Prefill.error_code(),
+        PdSide::Prefill.description(SidePhase::Start),
+        PdSide::Prefill.code(SidePhase::Start),
     )
 }
 
@@ -2588,10 +2603,10 @@ async fn sequential_prefill_side(
                 );
                 account_pd_side_failure(metrics_labels::WORKER_PREFILL, &e);
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
-                return Err(e.to_http_error(
-                    "prefill_stream_error",
-                    format!("Prefill stream error: {}", e.message()),
-                ));
+                let mut response =
+                    PdSide::Prefill.answer(SidePhase::Stream, e.http_status(), e.message());
+                mark_error_reason(&mut response, e.error_reason());
+                return Err(response);
             }
         }
     }
@@ -2930,6 +2945,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tokenspeed_parallel_pd_forwards_selected_ranks_without_changing_the_room() {
+        for (p_rank, p_size, d_rank, d_size) in [
+            (Some(0), 1, Some(7), 16),
+            (Some(3), 16, Some(7), 16),
+            (Some(3), 8, Some(11), 16),
+            (None, 1, None, 1),
+        ] {
+            let worker = |url, role, rank, size| -> Arc<dyn Worker> {
+                let mut builder = BasicWorkerBuilder::new(url)
+                    .worker_type(role)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .connection_mode(ConnectionMode::Grpc);
+                if let Some(rank) = rank {
+                    builder = builder.dp_config(rank, size);
+                }
+                Arc::new(builder.build())
+            };
+            let workers = WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill: worker("grpc://prefill:30000", WorkerType::Prefill, p_rank, p_size),
+                decode: worker("grpc://decode:30000", WorkerType::Decode, d_rank, d_size),
+                runtime_type: RuntimeType::TokenSpeed,
+            };
+            let mut request = tokenspeed_request(1, None);
+            maybe_inject_pd_rendezvous(&mut request, &workers);
+            let ProtoGenerateRequest::TokenSpeed(original) = &request else {
+                panic!("expected TokenSpeed request");
+            };
+            let bootstrap = original.kv_bootstrap_info.clone();
+            let (prefill, decode) = parallel_pd_requests(request, &workers);
+            let (
+                ProtoGenerateRequest::TokenSpeed(prefill),
+                ProtoGenerateRequest::TokenSpeed(decode),
+            ) = (prefill, decode)
+            else {
+                panic!("expected TokenSpeed requests");
+            };
+            assert_eq!(prefill.data_parallel_rank, p_rank.map(|r| r as i32));
+            assert_eq!(decode.data_parallel_rank, d_rank.map(|r| r as i32));
+            assert_eq!(prefill.kv_bootstrap_info, bootstrap);
+            assert_eq!(decode.kv_bootstrap_info, bootstrap);
+            if let Some(rank) = p_rank {
+                assert_eq!(
+                    bootstrap.unwrap().bootstrap_room % p_size as i64,
+                    rank as i64
+                );
+            }
+        }
+    }
+
     /// A side whose dispatch fails with the engine's rendezvous verdict is
     /// counted under the rendezvous family, by side and phase; any other
     /// dispatch failure of a side is not.
@@ -3014,8 +3080,8 @@ mod tests {
         let cancelled = start_failure_response(
             &tonic::Status::cancelled("operation was canceled"),
             "execute_sequential_pd",
-            PdSide::Decode.error_message(),
-            PdSide::Decode.error_code(),
+            PdSide::Decode.description(SidePhase::Start),
+            PdSide::Decode.code(SidePhase::Start),
         );
         assert_eq!(cancelled.status(), http::StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -3045,8 +3111,8 @@ mod tests {
             let failed = start_failure_response(
                 &status,
                 "execute_parallel_pd",
-                PdSide::Prefill.error_message(),
-                PdSide::Prefill.error_code(),
+                PdSide::Prefill.description(SidePhase::Start),
+                PdSide::Prefill.code(SidePhase::Start),
             );
             assert_eq!(failed.status(), http::StatusCode::BAD_GATEWAY, "{reason:?}");
             assert!(is_retryable_response(&failed), "{reason:?}");
@@ -3238,7 +3304,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_prefill_answers_without_waiting_for_the_decode_side() {
         let started = tokio::time::Instant::now();
-        let outcome = dispatch_pd_sides(fails_now("bootstrap timeout"), never_answers()).await;
+        let outcome =
+            dispatch_pd_sides(fails_now("bootstrap timeout"), never_answers(), None).await;
 
         assert_eq!(
             started.elapsed(),
@@ -3261,6 +3328,7 @@ mod tests {
         let outcome = dispatch_pd_sides(
             answers_after(Duration::from_secs(120)),
             fails_now("decode refused"),
+            None,
         )
         .await;
 
@@ -3271,6 +3339,27 @@ mod tests {
             }
             PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
         }
+    }
+
+    /// While the prefill side dispatches, the decode side's first item is
+    /// pulled ahead and held for its reader, booked on nothing; only output
+    /// is a handoff of the prefill worker's (an end is not).
+    #[tokio::test(start_paused = true)]
+    async fn the_decode_sides_first_item_is_pulled_ahead_while_the_prefill_dispatches() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let ends: SideDispatch =
+            Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) });
+        let prefill_dispatch = answers_after(Duration::from_secs(1));
+        match dispatch_pd_sides(prefill_dispatch, ends, Some(&prefill)).await {
+            PdDispatchOutcome::Both(_, Ok(decode)) => assert!(decode.holds_item_ahead()),
+            _ => panic!("both sides answered"),
+        }
+        assert_eq!(
+            prefill.prefill_handed_off_ago(),
+            None,
+            "an end is no handoff"
+        );
     }
 
     /// The failure a dispatch ended with (a stream has no `Debug`).
@@ -3570,12 +3659,16 @@ mod tests {
     async fn a_prefill_dispatch_on_a_frozen_worker_is_given_up_on_once_its_backlog_had_its_time() {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        // Taken before the run's first prompt is booked: the rule counts
+        // its window on the worker's clock, in whole milliseconds from
+        // that booking, so real time since here reads up to a millisecond
+        // short of the window when the verdict is given.
+        let started = Instant::now();
         for _ in 0..2 {
             prefill.note_prefill_started(10_000, true);
         }
         let bound = Duration::from_secs(1);
         let backlog = Duration::from_secs(2);
-        let started = Instant::now();
         let arrivals = async {
             tokio::time::sleep(bound + Duration::from_millis(500)).await;
             loop {
@@ -3596,11 +3689,20 @@ mod tests {
             () = arrivals => unreachable!("the arrivals never end on their own"),
         };
         let elapsed = started.elapsed();
+        // The run's silence as the rule read it, on the worker's clock;
+        // real time since before the first booking bounds the verdict from
+        // below, a millisecond of the worker's clock allowed, and from
+        // above.
+        let silent = prefill
+            .prefill_unanswered_run()
+            .expect("the run never answered");
         let status = failure(result);
         assert!(is_prefill_silence(&status), "{status:?}");
         assert!(
-            elapsed >= backlog && elapsed < backlog + bound,
-            "given up on once the backlog had its time: {elapsed:?}"
+            silent >= backlog
+                && elapsed + Duration::from_millis(1) >= backlog
+                && elapsed < backlog + bound,
+            "given up on once the backlog had its time, no later than a bound after: silent {silent:?}, {elapsed:?} since before the first prompt"
         );
         assert!(
             status.message().contains("of a 2.0s window"),

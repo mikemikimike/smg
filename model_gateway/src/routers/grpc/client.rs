@@ -60,6 +60,12 @@ pub struct GenerateRequestBuildOptions {
     pub multimodal_inputs: Option<MultimodalData>,
     pub tool_constraints: Option<(String, String)>,
     pub require_reasoning: bool,
+    /// `tool_constraints` was led with the model's thought and its close for
+    /// a worker whose engine starts the grammar at the first generated token:
+    /// the request says so where its dialect has a switch for the gate behind
+    /// the engine's reasoning parser
+    /// (`ProtoGenerateRequest::set_grammar_from_first_token`).
+    pub first_token_grammar: bool,
 }
 
 impl GrpcClient {
@@ -255,7 +261,8 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => client.start_profile(req).await,
             Self::TokenSpeed(client) => client.start_profile(req).await,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
+            Self::Vllm(client) => client.start_profile(req).await,
+            Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "StartProfile RPC not supported for this backend",
             )),
         }
@@ -267,7 +274,8 @@ impl GrpcClient {
         match self {
             Self::Sglang(client) => client.stop_profile().await,
             Self::TokenSpeed(client) => client.stop_profile().await,
-            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
+            Self::Vllm(client) => client.stop_profile().await,
+            Self::Trtllm(_) | Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "StopProfile RPC not supported for this backend",
             )),
         }
@@ -536,6 +544,7 @@ impl GrpcClient {
             multimodal_inputs,
             tool_constraints,
             require_reasoning,
+            first_token_grammar,
         } = options;
         let EngineBuilders {
             sglang,
@@ -544,7 +553,7 @@ impl GrpcClient {
             mlx,
             tokenspeed,
         } = builders;
-        match self {
+        let mut request = match self {
             Self::Sglang(client) => {
                 let sglang_mm = engine_multimodal(multimodal_inputs, |mm| match mm {
                     MultimodalData::Sglang(data) => Some(data.into_proto()),
@@ -624,7 +633,9 @@ impl GrpcClient {
                     )
                 })
             }
-        }
+        }?;
+        request.set_grammar_from_first_token(first_token_grammar);
+        Ok(request)
     }
 
     /// The per-engine dispatch of a request kind with neither multimodal inputs
@@ -878,6 +889,8 @@ impl ServerInfo {
                 if let Some(ref args) = info.server_args {
                     pick_prost_fields(&mut labels, args, TOKENSPEED_GRPC_KEYS);
                 }
+                // TokenSpeed's global request window is shared by its attention-DP ranks.
+                labels.insert("enable_dp_attention".to_string(), "true".to_string());
                 if !info.tokenspeed_version.is_empty() {
                     labels.insert("version".to_string(), info.tokenspeed_version.clone());
                 }

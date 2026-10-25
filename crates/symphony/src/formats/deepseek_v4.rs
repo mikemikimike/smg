@@ -62,7 +62,7 @@ mod tests {
     use super::*;
     use crate::{
         ids::CallIds,
-        testing::{arguments_of, bytes, content, drive, reasoning},
+        testing::{arguments_of, bytes, content, drive, drive_to, reasoning},
     };
 
     fn ids() -> CallIds {
@@ -260,12 +260,15 @@ mod tests {
 
     #[test]
     fn a_stream_cut_inside_an_invoke_ends_the_call_with_its_arguments_cut() {
-        let events = run(
+        let output = concat!(
+            "</think>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n",
+            "<｜DSML｜parameter name=\"x\" string=\"false\">1"
+        );
+        let events = drive_to(
+            &mut Engine::with_call_ids(Arc::new(deepseek_v4()), Declared::default(), ids()),
             "<think>",
-            &[concat!(
-                "</think>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n",
-                "<｜DSML｜parameter name=\"x\" string=\"false\">1"
-            )],
+            &[output],
+            EngineFinish::Length,
         );
         assert!(events.iter().any(|event| matches!(
             event,
@@ -278,10 +281,21 @@ mod tests {
             event,
             Event::ToolCallEnd { index: 0, source } if source.text.is_empty()
         )));
+        // Cut by the token limit, the held value is the call's own, as written.
+        assert_eq!(arguments_of(&events, 0), r#"{"x": 1"#);
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+        // The model's own end of output there ends the call as its closing tag would: the value
+        // held for its close is reported, the object closes without it, and one word says the
+        // stop closed the call.
+        let stopped = run("<think>", &[output]);
+        assert_eq!(arguments_of(&stopped, 0), "{}");
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
     }
 
     #[test]
@@ -872,6 +886,68 @@ mod tests {
             assert!(
                 matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
                 "cut at {cut}"
+            );
+        }
+    }
+
+    /// A parameter tag the model wrote without its `<` (seen live: the third of four parallel
+    /// calls lost its `action` this way): the invoke is read without that member, and the bytes
+    /// of the slip, `｜DSML｜` and the closing tag included, are refused as the model's failed call,
+    /// counted and never content, where they reached the client as content before.
+    #[test]
+    fn a_parameter_tag_without_its_angle_bracket_is_refused_never_content() {
+        const OUTPUT: &str = concat!(
+            "Let me estimate.</think>\n\n<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name=\"emission_estimator\">\n",
+            "<｜DSML｜parameter name=\"current_emissions\" string=\"false\">10</｜DSML｜parameter>\n",
+            "｜DSML｜parameter name=\"action\" string=\"true\">plant trees</｜DSML｜parameter>\n",
+            "<｜DSML｜parameter name=\"duration\" string=\"false\">1</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        const SLIP: &str =
+            "｜DSML｜parameter name=\"action\" string=\"true\">plant trees</｜DSML｜parameter>";
+        for pieces in [vec![OUTPUT], OUTPUT.split_inclusive(' ').collect()] {
+            let events = run("<｜Assistant｜><think>", &pieces);
+            assert_eq!(bytes(&events), OUTPUT, "{pieces:?}");
+            assert_eq!(calls_of(&events), [(0, "emission_estimator".to_string())]);
+            assert_eq!(
+                arguments_of(&events, 0),
+                r#"{"current_emissions": 10, "duration": 1}"#,
+                "{pieces:?}"
+            );
+            // What a chat client reads: content and malformed text alike. Nothing.
+            let shown: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(shown, "", "{pieces:?}: {events:?}");
+            let refused: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(refused, SLIP, "{pieces:?}");
+            let reasons: Vec<MalformedReason> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Malformed { why, .. } => Some(*why),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                reasons.iter().all(|why| matches!(
+                    why,
+                    MalformedReason::TextBetweenTags | MalformedReason::TagOutOfPlace
+                )) && reasons.contains(&MalformedReason::TagOutOfPlace),
+                "{pieces:?}: {reasons:?}"
             );
         }
     }
